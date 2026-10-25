@@ -1,0 +1,26 @@
+# swaylock-effects: a blurred, darkened screenshot with a plain grey ring
+screenshots
+effect-blur=8x3
+effect-vignette=0.4:0.4
+clock
+timestr=%H:%M
+datestr=%a %d %b
+font=Inter
+indicator
+indicator-radius=90
+indicator-thickness=6
+ring-color=2c2e33
+key-hl-color=8f949c
+bs-hl-color=c9736f
+inside-color=17181bcc
+line-color=00000000
+separator-color=00000000
+text-color=dcdcd8
+ring-ver-color=8f949c
+inside-ver-color=17181bcc
+text-ver-color=dcdcd8
+ring-wrong-color=c9736f
+inside-wrong-color=17181bcc
+text-wrong-color=c9736f
+fade-in=0.15
+grace=2

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Super+Y: open btop as a floating system monitor, or close it if it's already open
+if hyprctl clients -j | jq -e '.[] | select(.class == "sysmon")' >/dev/null; then
+    kill $(hyprctl clients -j | jq '.[] | select(.class == "sysmon") | .pid')
+else
+    exec kitty --class sysmon --title "System Monitor" -e btop
+fi

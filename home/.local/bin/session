@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Reopen the apps you had open, on the same workspaces, when you log back in.
+
+  session save      remember the open apps now (run by the logout/shutdown buttons)
+  session watch     remember them every minute, in case the power button is used
+  session restore   start them again (run once at login)
+
+The list lives in ~/.local/state/session/windows.json.
+"""
+import glob
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+
+STATE = os.path.expanduser("~/.local/state/session/windows.json")
+FROZEN = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "session-frozen")
+# helpers and pop-ups that start on their own or shouldn't come back
+SKIP = {"", "xwaylandvideobridge", "com.gabm.satty", "hyprland-share-picker", "wlogout",
+        "hyprpolkitagent", "org.kde.polkit-kde-authentication-agent-1", "nm-connection-editor",
+        "sddm-greeter-qt6", "hyprshutdown"}
+APP_DIRS = [os.path.expanduser("~/.local/share/applications"), "/usr/share/applications",
+            "/var/lib/flatpak/exports/share/applications",
+            os.path.expanduser("~/.local/share/flatpak/exports/share/applications")]
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True, timeout=5)
+
+
+def desktop_entries():
+    entries = {}
+    for d in APP_DIRS:
+        for path in glob.glob(os.path.join(d, "*.desktop")):
+            app_id = os.path.basename(path)[:-8]
+            wm_class, exe = "", ""
+            try:
+                with open(path, errors="replace") as f:
+                    in_main = False
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("["):
+                            in_main = line == "[Desktop Entry]"
+                        elif in_main and line.startswith("StartupWMClass="):
+                            wm_class = line.split("=", 1)[1]
+                        elif in_main and line.startswith("Exec=") and not exe:
+                            exe = os.path.basename(shlex.split(line.split("=", 1)[1] or "x")[0])
+            except (OSError, ValueError):
+                continue
+            entries.setdefault(app_id, (app_id, wm_class, exe))
+    return entries.values()
+
+
+def find_desktop(cls, argv0, entries):
+    cls_l, exe = cls.lower(), os.path.basename(argv0)
+    for test in (lambda e: e[0].lower() == cls_l,
+                 lambda e: e[1].lower() == cls_l,
+                 lambda e: e[0].lower().endswith("." + cls_l),
+                 lambda e: exe and e[2] == exe):
+        for e in entries:
+            if test(e):
+                return e[0]
+    return None
+
+
+def shell_cwd(pid):
+    # a terminal's working folder is its shell's, one process down
+    try:
+        kids = open(f"/proc/{pid}/task/{pid}/children").read().split()
+        return os.readlink(f"/proc/{kids[0]}/cwd") if kids else os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+
+
+def snapshot():
+    out = hyprctl("clients", "-j")
+    if out.returncode != 0:
+        return None
+    entries = list(desktop_entries())
+    apps, seen_pids = [], set()
+    for c in sorted(json.loads(out.stdout), key=lambda c: c.get("focusHistoryID", 0), reverse=True):
+        cls = c.get("initialClass") or c.get("class") or ""
+        if cls in SKIP or c["pid"] in seen_pids or c["workspace"]["id"] == -1 and not c["workspace"]["name"].startswith("special"):
+            continue
+        seen_pids.add(c["pid"])
+        try:
+            argv = [a for a in open(f"/proc/{c['pid']}/cmdline", "rb").read().decode(errors="replace").split("\0") if a]
+        except OSError:
+            continue
+        if not argv:
+            continue
+        if cls == "kitty":
+            cwd = shell_cwd(c["pid"])
+            launch = ["kitty"] + (["--directory", cwd] if cwd else [])
+        else:
+            app_id = find_desktop(cls, argv[0], entries)
+            launch = ["uwsm", "app", "--", app_id + ".desktop"] if app_id else argv
+        apps.append({"class": cls, "workspace": c["workspace"]["name"], "launch": launch})
+    return apps
+
+
+def write(apps):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"saved": time.strftime("%Y-%m-%d %H:%M:%S"), "apps": apps}, f, indent=2)
+    os.replace(tmp, STATE)
+
+
+def save():
+    apps = snapshot()
+    if apps is not None:
+        write(apps)
+    open(FROZEN, "w").close()   # stop `watch` from saving apps as they close
+
+
+def watch():
+    while True:
+        # sleep first: at login the list must not be overwritten before `restore` has reopened it
+        time.sleep(60)
+        if not os.path.exists(FROZEN):
+            apps = snapshot()
+            if apps is not None:
+                write(apps)
+
+
+def windows():
+    out = hyprctl("clients", "-j")
+    return json.loads(out.stdout) if out.returncode == 0 else []
+
+
+def cpu_busy(interval=0.5):
+    def sample():
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:9]]
+        return sum(v), v[3] + v[4]   # all time, idle + iowait
+    total, idle = sample()
+    time.sleep(interval)
+    total2, idle2 = sample()
+    return 1 - (idle2 - idle) / max(total2 - total, 1)
+
+
+def restore():
+    try:
+        os.remove(FROZEN)
+    except FileNotFoundError:
+        pass
+    try:
+        apps = json.load(open(STATE))["apps"]
+    except (OSError, ValueError, KeyError):
+        return
+    running = {c.get("initialClass") for c in windows()}
+    for app in apps:
+        if app["class"] != "kitty" and app["class"] in running:
+            continue
+        before = {c["address"] for c in windows()}
+        cmd = shlex.join(app["launch"])
+        ws = app["workspace"]
+        hyprctl("dispatch", f"hl.dsp.exec_cmd([[{cmd}]], {{ workspace = [[{ws} silent]] }})")
+        running.add(app["class"])
+        # one app at a time (two browsers starting together is what made logging in stutter):
+        # wait for its window, then for the CPU to calm down, before starting the next
+        deadline = time.time() + 10
+        while time.time() < deadline and not any(
+                c["address"] not in before and (c.get("initialClass") or c.get("class")) == app["class"]
+                for c in windows()):
+            time.sleep(0.25)
+        deadline = time.time() + 4
+        while time.time() < deadline and cpu_busy() > 0.5:
+            pass
+
+
+if __name__ == "__main__":
+    {"save": save, "watch": watch, "restore": restore}.get(
+        sys.argv[1] if len(sys.argv) > 1 else "", lambda: sys.exit(__doc__))()

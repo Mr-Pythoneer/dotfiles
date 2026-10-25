@@ -1,0 +1,9 @@
+#!/bin/sh
+# Airplane-mode key: turns Wi-Fi and Bluetooth off, or back on
+if rfkill -n -o SOFT | grep -q '^unblocked'; then
+    rfkill block all
+    notify-send -a System -i airplane-mode-symbolic "Airplane mode on" "Wi-Fi and Bluetooth are off"
+else
+    rfkill unblock all
+    notify-send -a System -i network-wireless-symbolic "Airplane mode off" "Wi-Fi and Bluetooth are back on"
+fi

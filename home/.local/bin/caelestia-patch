@@ -1,0 +1,23 @@
+#!/bin/sh
+# Re-sync the user copy of the Caelestia shell from the system package and
+# re-apply local patches (notifications/toasts top-right with close buttons,
+# macOS-style notification centre opened from the top-right bump, with a power button,
+# live video wallpapers, OSD follows the brightness keys, no frame edge or click band
+# along the bottom where the rice bar sits, drawers open above it).
+# Run this after updating caelestia-shell.
+set -e
+src=/etc/xdg/quickshell/caelestia
+dst="$HOME/.config/quickshell/caelestia"
+rm -rf "$dst.new"
+cp -a "$src" "$dst.new"
+for p in "$HOME"/.config/caelestia/patches/*.patch; do
+    patch -d "$dst.new" -p1 --forward < "$p"
+done
+rm -rf "$dst"
+mv "$dst.new" "$dst"
+pkill -x qs || true
+sleep 1
+setsid -f caelestia shell -d >/dev/null 2>&1
+# the pkill above also stopped the rice bar (its own shell next to Caelestia), so bring it back
+[ -f "$HOME/.config/quickshell/rice/shell.qml" ] && setsid -f qs -c rice -d >/dev/null 2>&1
+echo "Caelestia shell patched and restarted."

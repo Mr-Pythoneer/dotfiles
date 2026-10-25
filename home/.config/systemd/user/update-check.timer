@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for updates every morning at 7:00 (or on wake, if asleep at 7:00)
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+# if the laptop was off at 7:00, run as soon as it's next on
+Persistent=true
+
+[Install]
+WantedBy=timers.target

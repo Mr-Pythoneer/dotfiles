@@ -1,0 +1,11 @@
+%YAML 1.3
+---
+# Thumb (gesture) button -> Super+Q (close window, like Cmd+Q on Mac)
+- Key: [Mouse Gesture Button, pressed]
+- KeyPress: [Super_L, q]
+...
+---
+# Scroll-wheel mode button -> Super+Space (launcher)
+- Key: [Smart Shift, pressed]
+- KeyPress: [Super_L, space]
+...

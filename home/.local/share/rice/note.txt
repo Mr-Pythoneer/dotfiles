@@ -1,0 +1,40 @@
+My Futu Simulated (Paper) Account: Setup Info for a New Device
+Personal file. Contains account identifiers but NO passwords and NO private key. Generated 2026-10-14. Do not post this publicly.
+
+1. Account
+Item	Value
+Futu / moomoo ID (login)	7191475
+Owner label	feng
+SMS 2FA phone	52239998
+Login password	(you know it; not included)
+Gateway name in my system	FUTU_2 (currently hosted on K402)
+Simulation needs no separate token. It is the same Futu login; you switch the trading environment to SIMULATE (REST: sim-trade group, trd_env=SIM).
+
+2. REST API credential
+Item	Value
+app_key_id	daa0785f54678eb72bc2b118fd85b059
+Scopes	quote:read quote:write trade:read trade:write
+Authorized account ids (accid)	281756477938711269, 281756494449965291, 281756473603379330
+Created via	tools/futu_appkey_provision.py via K402
+Expires	2027-10-05
+Private key	file futu_FUTU_2.pem (NOT included here, see section 3)
+3. Get the private key onto the new device safely
+Do not paste it into chat or email. From a machine that can reach the host, copy it directly:
+
+scp <host>:/home/goalfelix/AquaX/json/secrets/futu_FUTU_2.pem  ./futu_FUTU_2.pem
+scp <host>:/home/goalfelix/AquaX/json/secrets/futu_FUTU_2.json ./futu_FUTU_2.json
+chmod 600 futu_FUTU_2.pem futu_FUTU_2.json
+(<host> is the node holding the secrets, e.g. twd or K402.) Keep one copy per device. Better still, register a fresh app key for the new device so the old one can be revoked independently.
+
+4. Legacy OpenD mode (only if not using REST)
+Real port 11112, simulated port 12112, telnet 21112, sim slot sim1. Log in to OpenD with the Futu ID above and your password, finish the SMS check, then use TrdEnv.SIMULATE for orders.
+
+5. Network
+Futu rejects trading from mainland China. Use a Hong Kong exit. If the app key has an IP allow list, add the new device's public IP.
+
+6. Verify
+List accounts; a SIMULATE account must be present.
+Query simulated cash and positions.
+Place a far-from-market limit order in SIMULATE, see it active, cancel it.
+7. Optional: AI-client (MCP) token
+Separate credential, file futu_mcp_FUTU_2.json on the host. Its refresh token lapses about 14 days after last use (around 2026-10-19) and must be re-approved in the Futu app.

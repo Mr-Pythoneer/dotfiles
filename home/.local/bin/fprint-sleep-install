@@ -1,0 +1,38 @@
+#!/bin/sh
+# Root half of the lock screen fingerprint fix: stops fprintd just before the laptop sleeps.
+#   sudo fprint-sleep-install          install
+#   sudo fprint-sleep-install --undo   remove
+# Sleeping while the lock screen scans makes fprintd suspend the reader mid-scan. The lock
+# screen lets go of it at the same moment, fprintd can't close a suspended reader, and every
+# scan after resume then fails ("already open") until fprintd restarts. With fprintd stopped
+# before sleep, the lock screen's scan after resume starts a fresh one.
+set -e
+[ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+unit=/etc/systemd/system/fprintd-sleep-stop.service
+
+if [ "$1" = --undo ]; then
+    systemctl disable fprintd-sleep-stop.service 2>/dev/null || true
+    rm -f "$unit"
+    systemctl daemon-reload
+    echo "fprintd sleep fix removed."
+    exit 0
+fi
+
+cat > "$unit" <<'EOF'
+[Unit]
+Description=Stop fprintd before sleep so the fingerprint reader works after resume
+# Starting this stops fprintd; the next scan D-Bus-activates a fresh one.
+Conflicts=fprintd.service
+After=fprintd.service
+Before=sleep.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+
+[Install]
+WantedBy=sleep.target
+EOF
+systemctl daemon-reload
+systemctl enable fprintd-sleep-stop.service
+echo "Installed: fprintd now stops before every sleep."

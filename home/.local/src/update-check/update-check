@@ -1,0 +1,2007 @@
+#!/usr/bin/env python3
+"""update-check — tell me whether the system needs updating, and what to watch out for.
+
+  update-check            check now and print the report (then offer to run arch-update)
+  update-check --login    what Hyprland runs at login: check quietly, then one notification
+  update-check --daily    what the 7:00 systemd timer runs (also right after waking the laptop if
+                          it slept through 7:00): skips if already checked today, waits for unlock
+  update-check --show     print the last report (what the notification's buttons open)
+  update-check --after    post-update check + self-test: what changed since you last looked, what may
+                          have broken, and whether everything the desktop runs is there (offline, read-only)
+  update-check --after --fix   the same, then fix it all: each fix, the follow-ups it needs (e.g. caelestia-patch
+                          after a rebuild), then a re-check. Never reboots without asking. --ask: confirm each fix
+  update-check --selftest [--fix]   only the self-test
+  update-check --history [FILE]     snapshots of your configs/scripts; one file's versions (--history REV FILE prints one)
+  update-check --restore FILE [REV] put a file back as it was (default: the last check that found nothing wrong)
+  update-check --snapshot MESSAGE   snapshot your files now (arch-update does this before updating)
+  update-check --undo [RUN]         put back what Claude's last (or that) repair run changed
+
+Problems no built-in fix covers go to Claude Code afterwards ([ai] in the config): it may edit only your
+config folders (snapshotted first, so --undo works), never sudo/deletes/installs, and the report says
+why each thing broke and what it did.
+
+When something's broken, the login/7:00 run fixes what needs nothing from you (restarting your own
+services, caelestia-patch, starting the shell) and opens a terminal for fixes that need your password
+or a rebuild. A plain `update-check` fixes everything it finds, in the terminal.
+
+It never installs anything. Updating is still done by `arch-update`, which also rebuilds
+the pieces of this desktop that are tied to exact Qt/Hyprland versions.
+
+Checks:
+  - official repo updates (like checkupdates: a private copy of the package database, no sudo)
+  - AUR updates (yay) and Flatpak updates
+  - Arch Linux news posted since the last full upgrade (these are the "manual intervention" posts)
+  - things the update will need from you: reboot, log out, rebuilds, caelestia-patch, .pacnew files
+  - things already wrong: kernel updated but not rebooted, failed services, arch-update --check problems
+  - after an update (read from /var/log/pacman.log): reboot needed, error count in the journal,
+    packages needing a rebuild (checkrebuild), your own builds listed in
+    ~/.config/update-check/config.toml (missing libraries, built against an older Qt), broken package files
+  - self-test: every program/file the Hyprland config starts or names exists and the Lua parses; your
+    user services' programs exist; scripts in ~/.local/bin parse and the commands they run are installed;
+    Caelestia's JSON settings parse; the patched Caelestia copy is exactly the package + your patches;
+    Quickshell matches Qt; every shell Hyprland starts is running and didn't log load errors; Hyprland's
+    own config errors; Python scripts' imports; launchers/autostart entries; programs you built
+  - every problem says why it broke: your files (a private history in ~/.local/state/update-check) and
+    packages changed since the last check that found nothing wrong
+"""
+import email.utils
+import glob
+import html
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.request
+import warnings
+import xml.etree.ElementTree as ET
+from collections import Counter, namedtuple
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import smart  # noqa: E402  (history of your files, why things broke, Claude for what no built-in fix covers)
+
+HOME = Path.home()
+CACHE = HOME / ".cache/update-check"
+DB = CACHE / "db"
+REPORT = CACHE / "report.txt"
+LAST_RUN = CACHE / "last-run"  # date of the last automatic check, so login + 7:00 don't both notify
+# package names that are also ordinary words in news posts; matching them means nothing
+COMMON_WORDS = {"linux", "pacman", "arch", "base", "filesystem", "which", "less", "file", "make", "patch",
+                "time", "sed", "grep", "gzip", "tar", "git", "sudo", "man", "info", "words", "zip"}
+NEWS_URL = "https://archlinux.org/feeds/news/"
+BIN = HOME / ".local/bin"
+# Fail on every boot on this machine (firmware TPM: "NvPCRs failed to initialize"); harmless.
+HARMLESS_UNITS = re.compile(r"systemd-(pcr|tpm2-setup)")
+
+STATE = HOME / ".local/state/update-check"
+LAST_SEEN = STATE / "last-seen-update"  # time of the newest package change already reported
+CONFIG = HOME / ".config/update-check/config.toml"
+CONFIG_EXAMPLE = Path(__file__).resolve().parent / "config.example.toml"
+PACMAN_LOG = Path("/var/log/pacman.log")
+# [2026-10-09T21:08:32-0400] [ALPM] upgraded qt6-base (6.11.1-1 -> 6.11.2-3)
+ALPM_LINE = re.compile(r"^\[([^\]]+)\] \[ALPM\] (upgraded|downgraded|installed|reinstalled|removed) (\S+) \(([^)]*)\)")
+FULL_UPGRADE = re.compile(r"^\[([^\]]+)\] \[PACMAN\] starting full system upgrade")
+# Updated after boot, these keep running as the old copy until a reboot
+REBOOT_PKGS = [
+    (r"^(systemd|systemd-libs|glibc|dbus|dbus-broker)$", "Core system"),
+    (r"^(mesa|vulkan-|nvidia|lib32-nvidia|libdrm$|wayland$|intel-ucode|amd-ucode|linux-firmware)", "Graphics stack / firmware"),
+]
+KERNEL_FLAVOURS = ("lts", "zen", "hardened", "rt")
+REBOOT = "systemctl reboot"
+
+Change = namedtuple("Change", "time action name old new")
+# what: the problem; fix: a command that fixes it (None: nothing to run); why: what that command does;
+# then: follow-ups needed once the fix worked (each runs once, after all the fixes);
+# verify: re-checks afterwards, True when it's fixed (None: can't be re-checked);
+# cause: why it broke, in plain words (filled in from what changed since the last good check when not known);
+# repairable: False for things that are only news, not breakage (Claude isn't asked about those)
+Problem = namedtuple("Problem", "what fix why then verify cause repairable", defaults=(None, None, (), None, None, True))
+FIX_LOG = CACHE / "fix.log"  # what the background fixes printed
+# Fixes that ask for a password or questions, or take a while: these run in a terminal, never in the background
+NEEDS_TERMINAL = re.compile(r"(^|[\s;&|(])(sudo|pkexec|pacdiff|arch-update|makepkg|yay -S|reboot)\b")
+
+# Updating one of these means... (checked in order; each matching package lists once under its advice)
+ADVICE = [
+    (r"^linux(-lts|-zen|-hardened)?$|^linux-firmware", "Reboot afterwards (new kernel / firmware)."),
+    (r"^(nvidia|mesa|vulkan-|intel-ucode|amd-ucode)", "Reboot afterwards (graphics driver / microcode)."),
+    (r"^(systemd|glibc|dbus)", "Reboot afterwards (core system library)."),
+    (r"^qt6-base$", "Qt changes: arch-update rebuilds Quickshell + Caelestia (~10 min), then run caelestia-patch and log out/in."),
+    (r"^hyprland$", "Hyprland changes: arch-update rebuilds the overview plugin; log out and back in afterwards."),
+    (r"^(caelestia|quickshell)", "Caelestia changes: run caelestia-patch afterwards so your patched shell copy is refreshed."),
+    (r"^(pacman|pambase|filesystem|shadow|sudo|openssh)$", "May leave .pacnew config files in /etc to merge (pacdiff)."),
+    (r"^pipewire|^wireplumber", "Audio stack changes: log out/in (or restart pipewire) if sound acts up."),
+]
+
+
+def run(cmd, timeout=180, env=None):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+
+
+def online(wait):
+    deadline = time.time() + wait
+    while True:
+        try:
+            urllib.request.urlopen("https://archlinux.org", timeout=10)
+            return True
+        except Exception:
+            if time.time() > deadline:
+                return False
+            time.sleep(10)
+
+
+def repo_updates():
+    """Same trick as checkupdates: sync a private db copy with fakeroot, then ask it."""
+    DB.mkdir(parents=True, exist_ok=True)
+    local = DB / "local"
+    if not local.is_symlink():
+        local.symlink_to("/var/lib/pacman/local")
+    sync = DB / "sync"
+    if not sync.exists():
+        shutil.copytree("/var/lib/pacman/sync", sync)
+    rc, _, err = run(["fakeroot", "--", "pacman", "-Sy", "--disable-sandbox", "--dbpath", str(DB), "--logfile", "/dev/null"])
+    if rc != 0:
+        return None, err.strip().splitlines()[-1:] or ["pacman -Sy failed"]
+    _, out, _ = run(["pacman", "-Qu", "--dbpath", str(DB)])
+    return [l for l in out.splitlines() if l.strip()], None
+
+
+def aur_updates():
+    if not shutil.which("yay"):
+        return []
+    _, out, _ = run(["yay", "-Qua"])
+    return [l for l in out.splitlines() if l.strip()]
+
+
+def flatpak_updates():
+    if not shutil.which("flatpak"):
+        return []
+    _, installed, _ = run(["flatpak", "list", "--columns=application"])
+    if not installed.strip():
+        return []
+    _, out, _ = run(["flatpak", "remote-ls", "--updates", "--columns=application,version"])
+    return [l.replace("\t", " ").strip() for l in out.splitlines() if l.strip()]
+
+
+def last_full_upgrade():
+    last = None
+    try:
+        with open("/var/log/pacman.log", errors="replace") as f:
+            for line in f:
+                if "starting full system upgrade" in line:
+                    last = line
+    except OSError:
+        return None
+    m = last and re.match(r"\[([^\]]+)\]", last)
+    if not m:
+        return None
+    try:
+        return datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def news_since(since, installed):
+    try:
+        data = urllib.request.urlopen(NEWS_URL, timeout=20).read()
+    except Exception as e:
+        return None, str(e)
+    items = []
+    for it in ET.fromstring(data).iter("item"):
+        date = email.utils.parsedate_to_datetime(it.findtext("pubDate"))
+        if since and date <= since:
+            continue
+        if not since and (datetime.now(timezone.utc) - date).days > 30:
+            continue
+        title = it.findtext("title", "")
+        text = re.sub(r"<[^>]+>", " ", html.unescape(it.findtext("description", "")))
+        text = re.sub(r"\s+", " ", text).strip()
+        words = set(re.findall(r"[a-z0-9][a-z0-9+._-]+", (title + " " + text).lower()))
+        mine = sorted((words & installed) - COMMON_WORDS)
+        items.append((date, title, it.findtext("link", ""), text, mine))
+    return items, None
+
+
+def health():
+    """arch-update --check, minus what the self-test checks more exactly (Quickshell vs Qt, the Hyprland
+    config: its checker crashes with the Lua config)."""
+    found = []
+    if (BIN / "arch-update").exists():
+        _, out, _ = run([str(BIN / "arch-update"), "--check"], timeout=120)
+        out = re.sub(r"\x1b\[[0-9;]*m", "", out)
+        for l in out.splitlines():
+            if "PROBLEM" not in l:
+                continue
+            what = "arch-update --check: " + l.split("PROBLEM", 1)[1].strip()
+            if "Quickshell needs rebuilding" in what or "Hyprland config" in what:
+                continue
+            if "Overview plugin" in what:
+                found.append(Problem(what, "arch-update --build-hymission", "Rebuilds the overview plugin for the "
+                                     "installed Hyprland. It's loaded when you log in, so log out and back in afterwards."))
+            elif "run: arch-update" in what:
+                found.append(Problem(what, "arch-update", "Updates and rebuilds the pieces tied to exact Qt/Hyprland versions."))
+            else:
+                found.append(Problem(what))
+        if "Good news" in out:
+            found.append(Problem("Official Caelestia now has the top-bar setting: you can switch with arch-update --official-caelestia.",
+                                 repairable=False))
+    return found
+
+
+# ---- post-update check: everything below is offline and read-only ----
+
+def parse_time(s):
+    try:
+        t = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.astimezone()  # old pacman logs: local time, no offset
+
+
+def parse_pacman_log(lines):
+    """pacman.log -> (package changes, start times of full system upgrades), oldest first."""
+    changes, upgrades = [], []
+    for line in lines:
+        m = ALPM_LINE.match(line)
+        t = m and parse_time(m.group(1))
+        if t:
+            action, vers = m.group(2), m.group(4).split(" -> ")
+            if len(vers) == 2:
+                old, new = vers
+            elif action == "installed":
+                old, new = "", vers[0]
+            elif action == "removed":
+                old, new = vers[0], ""
+            else:
+                old = new = vers[0]
+            changes.append(Change(t, action, m.group(3), old, new))
+            continue
+        m = FULL_UPGRADE.match(line)
+        t = m and parse_time(m.group(1))
+        if t:
+            upgrades.append(t)
+    return changes, upgrades
+
+
+def read_pacman_log():
+    try:
+        with open(PACMAN_LOG, errors="replace") as f:
+            return parse_pacman_log(f)
+    except OSError:
+        return None
+
+
+def new_changes(changes, upgrades, seen):
+    """Changes after `seen` (the newest one already reported). Never reported before: the last
+    full system upgrade, plus anything after it (rebuilds arch-update installs with makepkg)."""
+    if seen is None:
+        starts = [u for u in upgrades if changes and u <= changes[-1].time]
+        return [c for c in changes if c.time >= starts[-1]] if starts else []
+    return [c for c in changes if c.time > seen]
+
+
+def read_seen():
+    try:
+        return parse_time(LAST_SEEN.read_text().strip())
+    except OSError:
+        return None
+
+
+def mark_seen(new):
+    if new:
+        STATE.mkdir(parents=True, exist_ok=True)
+        LAST_SEEN.write_text(max(c.time for c in new).isoformat() + "\n")
+
+
+def kernel_package(release):
+    """uname -r -> the package it came from: 7.2.8-arch1-2 -> linux, 6.12.50-1-lts -> linux-lts."""
+    flavour = release.rsplit("-", 1)[-1]
+    return f"linux-{flavour}" if flavour in KERNEL_FLAVOURS else "linux"
+
+
+def kernel_release(pkg, version):
+    """Package version -> the uname -r it boots as: linux 7.2.8.arch1-2 -> 7.2.8-arch1-2,
+    linux-lts 6.12.50-1 -> 6.12.50-1-lts."""
+    return re.sub(r"\.(?=[a-z])", "-", version, count=1) + pkg[len("linux"):]
+
+
+def reboot_reasons(running, kernels, changes, booted):
+    """Why a reboot is needed (empty: it isn't).
+    running: uname -r; kernels: installed kernel package -> version; booted: boot time or None."""
+    reasons = []
+    pkg = kernel_package(running)
+    if pkg in kernels and kernel_release(pkg, kernels[pkg]) != running:
+        reasons.append(f"running kernel {running}, but {pkg} {kernels[pkg]} is installed")
+    if booted:
+        for pattern, what in REBOOT_PKGS:
+            hit = sorted({c.name for c in changes if c.time > booted and c.action != "removed" and re.search(pattern, c.name)})
+            if hit:
+                reasons.append(f"{what} updated since boot: {', '.join(hit[:6])}{', …' if len(hit) > 6 else ''}")
+    return reasons
+
+
+def boot_time():
+    try:
+        line = next(l for l in Path("/proc/stat").read_text().splitlines() if l.startswith("btime "))
+        return datetime.fromtimestamp(int(line.split()[1]), timezone.utc)
+    except (OSError, StopIteration, ValueError):
+        return None
+
+
+def pkg_date(pkg, field):
+    """A date from pacman -Qi ("Install Date", "Build Date"), or None."""
+    _, out, _ = run(["pacman", "-Qi", pkg], env={**os.environ, "LC_ALL": "C"})
+    m = re.search(rf"^{field}\s*:\s*(.+)$", out, re.M)
+    if not m:
+        return None
+    _, ts, _ = run(["date", "-d", m.group(1).strip(), "+%s"])
+    return datetime.fromtimestamp(int(ts), timezone.utc) if ts.strip().isdigit() else None
+
+
+def reboot_problems(changes):
+    running = os.uname().release
+    kernels = {}
+    for pkg in {"linux", "linux-lts", kernel_package(running)}:
+        rc, out, _ = run(["pacman", "-Q", pkg])
+        if rc == 0 and len(out.split()) == 2:
+            kernels[pkg] = out.split()[1]
+    reasons = reboot_reasons(running, kernels, changes, boot_time())
+    if not reasons:
+        return []
+    return [Problem("Reboot needed: " + "; ".join(reasons) + ".", REBOOT,
+                    "Restarts the computer so the new kernel and libraries are the ones running "
+                    "(until then USB, sound or Wi-Fi modules may fail to load). Save your work first.")]
+
+
+def config_file_problems():
+    _, out, _ = run(["find", "/etc", "-name", "*.pacnew", "-o", "-name", "*.pacsave"], timeout=30)
+    files = [l for l in out.splitlines() if l.strip()]
+    if not files:
+        return []
+    what = f"{len(files)} config file(s) from updates waiting to be merged: " + ", ".join(files)
+    if not shutil.which("pacdiff"):
+        return [Problem(what + "  (the usual tool for this, pacdiff, is in pacman-contrib: sudo pacman -S pacman-contrib)")]
+    return [Problem(what, "sudo DIFFPROG='nvim -d' pacdiff",
+                    "Goes through each .pacnew/.pacsave file and asks what to do: view the differences, "
+                    "merge them, or keep yours. Nothing changes unless you choose it there.",
+                    verify=lambda: not config_file_problems())]
+
+
+def failed_unit_problems():
+    found = []
+    for scope in ([], ["--user"]):
+        rc, out, err = run(["systemctl", *scope, "--failed", "--no-legend", "--plain"])
+        if rc != 0 and not out:
+            continue  # no systemd user instance (e.g. under sudo): nothing to report
+        for unit in (l.split()[0] for l in out.splitlines() if l.strip()):
+            if HARMLESS_UNITS.match(unit):
+                continue
+            sc = "systemctl --user" if scope else "systemctl"
+            found.append(Problem(f"{'Your' if scope else 'System'} service failed: {unit}  (why: {sc} status {unit})",
+                                 f"{sc} restart {unit}" if scope else f"sudo {sc} restart {unit}",
+                                 f"Starts it again. If it fails again, the reason is in: journalctl {'--user ' if scope else ''}-b -u {unit}",
+                                 verify=lambda scope=scope, unit=unit: run(["systemctl", *scope, "is-failed", "--quiet", unit])[0] != 0))
+    return found
+
+
+def journal_summary():
+    """One line: how many error-level messages this boot, and from what."""
+    rc, out, err = run(["journalctl", "-b", "-p", "err", "-q", "--no-pager", "-o", "json",
+                        "--output-fields=SYSLOG_IDENTIFIER,_COMM,MESSAGE"], timeout=60)
+    if rc != 0 and not out:
+        return f"Journal: couldn't read it ({(err.strip().splitlines() or ['journalctl failed'])[-1]})"
+    counts, sample = Counter(), {}
+    for line in out.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        who = e.get("SYSLOG_IDENTIFIER") or e.get("_COMM") or "?"
+        counts[who] += 1
+        msg = e.get("MESSAGE")
+        sample.setdefault(who, " ".join(msg.split()) if isinstance(msg, str) else "(binary message)")
+    if not counts:
+        return "Journal: no error messages since boot."
+    top = "; ".join(f"{who} {n} (e.g. \"{sample[who][:70]}\")" for who, n in counts.most_common(4))
+    text = f"Journal: {sum(counts.values())} error messages since boot — {top}. All of them: journalctl -b -p err"
+    if "not seeing messages" in err:
+        text += " (only your own: you can't read the system journal)"
+    return text
+
+
+def is_prebuilt(pkg):
+    """-bin packages repackage upstream's binaries: rebuilding one changes nothing, only a newer release can."""
+    return pkg.endswith("-bin")
+
+
+def newer_version_cmd(pkg):
+    """Read-only: does the AUR have a newer version of pkg? (needs internet, installs nothing)"""
+    q = shlex.quote(pkg)
+    return f"yay -Qua | awk -v p={q} '$1 == p {{print; f=1}} END {{if (!f) print \"No newer \" p \" in the AUR yet.\"}}'"
+
+
+def newer_version_why(pkg):
+    return (f"Asks the AUR whether a newer {pkg} is out (needs internet; installs nothing). {pkg} ships prebuilt "
+            "binaries, so rebuilding it would only repackage the same files. If a newer version is listed, update "
+            "(arch-update); if not, its maintainer has to catch up: see the comments on its AUR page.")
+
+
+def rebuild_cmd(pkg, custom):
+    return custom.get(pkg, {}).get("rebuild") or f"yay -S --rebuild {pkg}"
+
+
+def ldd_missing(paths, own=frozenset()):
+    """Libraries ldd can't find: {library: first file that needs it}.
+    own: names of files that ship alongside. Those aren't missing, just not where ldd looks: e.g. Zen's
+    DRM plugin in gmp-clearkey/0.1/ needs libmozsqlite3.so, which is two folders up and already loaded
+    by the browser when it loads the plugin."""
+    missing = {}
+    for f in paths:
+        _, out, _ = run(["ldd", str(f)], timeout=30)
+        for lib in re.findall(r"^\s*(\S+) => not found", out, re.M):
+            if lib not in own:
+                missing.setdefault(lib, str(f))
+    return missing
+
+
+def describe_missing(missing):
+    return ", ".join(f"{lib} (needed by {f})" for lib, f in sorted(missing.items()))
+
+
+def package_files(pkg):
+    _, out, _ = run(["pacman", "-Qlq", pkg])
+    return [Path(l) for l in out.splitlines() if l and not l.endswith("/")]
+
+
+def elf_files(files):
+    return [f for f in files if f.is_file() and not f.is_symlink() and is_elf(f)]
+
+
+def package_elves(pkg):
+    return elf_files(package_files(pkg))
+
+
+def missing_libs(pkg):
+    """-> (libraries pkg really lacks, True if ldd only lacks ones pkg ships itself)"""
+    files = package_files(pkg)
+    found = ldd_missing(elf_files(files))
+    real = {lib: f for lib, f in found.items() if lib not in {f.name for f in files}}
+    return real, bool(found) and not real
+
+
+def checkrebuild_problems(custom):
+    """custom: your own builds from the config, package name -> its entry."""
+    if not shutil.which("checkrebuild"):
+        return [], ["checkrebuild isn't installed, so packages needing a rebuild after a library update weren't checked "
+                    "(it's in rebuild-detector: sudo pacman -S rebuild-detector)"]
+    rc, out, err = run(["checkrebuild"], timeout=600)
+    if rc != 0 and not out:
+        return [], [f"checkrebuild failed: {(err.strip().splitlines() or ['no output'])[-1]}"]
+    found, notes = [], []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        repo, pkg = parts[0], parts[1]
+        missing, shipped_only = missing_libs(pkg)
+        if shipped_only:
+            notes.append(f"checkrebuild flags {pkg}, but the only libraries it can't find ship with {pkg} itself "
+                         "(the app loads them before the part that needs them), so that's fine.")
+            continue
+        if repo == "foreign" and is_prebuilt(pkg) and pkg not in custom:
+            found.append(Problem(f"{pkg} (prebuilt, AUR) " + (f"is missing {describe_missing(missing)}." if missing else
+                                 "is linked to a library version that's gone (checkrebuild), though ldd finds nothing "
+                                 "missing; it may only fail when that part is used."),
+                                 newer_version_cmd(pkg), newer_version_why(pkg)))
+        elif repo == "foreign":
+            found.append(Problem(f"{pkg} (AUR / self-built) is linked to a library version that's gone: needs a rebuild.",
+                                 rebuild_cmd(pkg, custom), f"Rebuilds {pkg} against the libraries now installed.",
+                                 tuple(custom.get(pkg, {}).get("after", ())),
+                                 lambda pkg=pkg: not missing_libs(pkg)[0]))
+        else:
+            found.append(Problem(f"{pkg} (from [{repo}]) is linked to a library version that's gone. Arch usually ships "
+                                 "a rebuild within days; if it's still here after the next update, report it on the Arch bug tracker."))
+    return found, notes
+
+
+def is_elf(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def load_config():
+    try:
+        with open(CONFIG, "rb") as f:
+            return tomllib.load(f), None
+    except FileNotFoundError:
+        return {}, f"No {CONFIG}, so your own builds weren't checked (example: {CONFIG_EXAMPLE})"
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return {}, f"Couldn't read {CONFIG}: {e}"
+
+
+def qt_arrived(changes):
+    """When the installed qt6-base version arrived (pacman.log, else pacman -Qi), or None."""
+    for c in reversed(changes):
+        if c.name == "qt6-base" and c.action in ("upgraded", "downgraded", "installed"):
+            return c.time
+    return pkg_date("qt6-base", "Install Date")
+
+
+def custom_problems(entries, changes):
+    """Your own builds: missing shared libraries, built against an older Qt than the one installed."""
+    found, notes = [], []
+    rc, out, _ = run(["pacman", "-Q", "qt6-base"])
+    qt = out.split()[1].split("-")[0] if rc == 0 and len(out.split()) == 2 else None
+    qt_minor = int(qt.split(".")[1]) if qt and qt.count(".") >= 1 and qt.split(".")[1].isdigit() else None
+    qt_since = qt_arrived(changes) if qt else None
+    if not shutil.which("readelf"):
+        notes.append("readelf isn't installed, so Qt versions weren't checked (it's in binutils)")
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        pkg = e.get("package")
+        files = [Path(os.path.expanduser(f)) for f in e.get("files", [])]
+        name = e.get("name") or pkg or ", ".join(map(str, files))
+        fix = e.get("rebuild") or (f"yay -S --rebuild {pkg}" if pkg else None)
+        why = f"Rebuilds {name} against the libraries now installed."
+        if pkg and is_prebuilt(pkg) and not e.get("rebuild"):  # an explicit rebuild in the config still wins
+            fix, why = newer_version_cmd(pkg), newer_version_why(pkg)
+        then = tuple(e.get("after", ()))
+        verify = lambda e=e: not custom_problems([e], changes)[0]
+
+        def problem(what):
+            return Problem(what, fix, why, then, verify)
+
+        built = None
+        if pkg:
+            rc, out, _ = run(["pacman", "-Qlq", pkg])
+            if rc != 0:
+                notes.append(f"{pkg} is listed in {CONFIG} but isn't installed")
+                continue
+            files += [Path(l) for l in out.splitlines() if l and not l.endswith("/")]
+            built = pkg_date(pkg, "Build Date")
+        gone = [str(f) for f in files if not f.exists()]
+        if gone and not pkg:
+            found.append(problem(f"{name} is missing: {', '.join(gone)}"))
+            continue
+        elves = [f for f in files if f.is_file() and not f.is_symlink() and is_elf(f)]
+        if not pkg and elves:
+            built = datetime.fromtimestamp(max(f.stat().st_mtime for f in elves), timezone.utc)
+        missing, uses_qt, private, needs_minor = ldd_missing(elves, {f.name for f in files}), False, False, 0
+        for f in elves:
+            _, out, _ = run(["ldd", str(f)], timeout=30)
+            uses_qt |= "libQt6" in out
+            if shutil.which("readelf"):
+                _, out, _ = run(["readelf", "-V", "--wide", str(f)], timeout=30)
+                private |= "Qt_6_PRIVATE_API" in out
+                needs_minor = max([needs_minor, *map(int, re.findall(r"\bQt_6\.(\d+)\b", out))])
+        if missing:
+            found.append(problem(f"{name} can't load: missing {describe_missing(missing)}"))
+        if e.get("check") and subprocess.call(e["check"], shell=True, stdin=subprocess.DEVNULL,
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+            found.append(problem(f"{name}: its check failed ({e['check']})"))
+        if not uses_qt or not qt:
+            continue
+        if qt_minor is not None and needs_minor > qt_minor:
+            found.append(problem(f"{name} needs Qt 6.{needs_minor}, but Qt {qt} is installed."))
+        elif built and qt_since and built < qt_since:
+            older = f"{name} was built {built.astimezone():%d %b}, before Qt {qt} arrived ({qt_since.astimezone():%d %b})"
+            if private:
+                found.append(problem(older + ", and it uses Qt's private API, so it will probably crash or not start."))
+            else:
+                notes.append(older + "; it only uses Qt's public API, so it should keep working (rebuild if it misbehaves: "
+                             + (fix or "rebuild it") + ")")
+    return found, notes
+
+
+def reinstall_problems(pkgs):
+    """How to put back missing files without ever downgrading: reinstall only the exact installed version."""
+    found, same = [], []
+    for pkg in pkgs:
+        verify = lambda pkg=pkg: not missing_package_files([pkg])[0]
+        _, local, _ = run(["pacman", "-Q", pkg])
+        _, sync, _ = run(["pacman", "-Si", pkg], env={**os.environ, "LC_ALL": "C"})
+        local = local.split()[1] if len(local.split()) == 2 else ""
+        m = re.search(r"^Version\s*:\s*(\S+)", sync, re.M)
+        if m and m.group(1) == local:
+            same.append(pkg)
+            continue
+        cached = sorted(glob.glob(f"/var/cache/pacman/pkg/{glob.escape(pkg)}-{glob.escape(local)}-*.pkg.tar.*"))
+        cached = [c for c in cached if not c.endswith(".sig")]
+        if cached:
+            found.append(Problem(f"{pkg} {local} has missing files.", f"sudo pacman -U {cached[0]}",
+                                 f"Reinstalls {pkg} {local} from pacman's cache (the same version, so nothing is downgraded).", verify=verify))
+        elif not m and is_prebuilt(pkg):
+            # yay keeps what it built; reinstalling that exact file puts the binaries back as they were
+            built = [c for c in sorted(glob.glob(str(HOME / f".cache/yay/{glob.escape(pkg)}/{glob.escape(pkg)}-{glob.escape(local)}-*.pkg.tar.*")))
+                     if not c.endswith(".sig")]
+            if built:
+                found.append(Problem(f"{pkg} {local} has missing files.", f"sudo pacman -U {built[0]}",
+                                     f"Reinstalls {pkg} {local} from yay's cache (the same version, so nothing is downgraded).", verify=verify))
+            else:
+                found.append(Problem(f"{pkg} {local} (prebuilt, AUR) has missing files and yay's cache doesn't have it.",
+                                     newer_version_cmd(pkg), newer_version_why(pkg)))
+        elif not m:
+            found.append(Problem(f"{pkg} {local} has missing files (AUR / self-built).", f"yay -S --rebuild {pkg}",
+                                 f"Rebuilds and reinstalls {pkg}.", verify=verify))
+        else:
+            found.append(Problem(f"{pkg} {local} has missing files. The repos have {m.group(1)} and the cache doesn't have "
+                                 f"{local}, so update first (arch-update); that reinstalls it."))
+    if same:
+        found.insert(0, Problem(f"Packages with missing files: {', '.join(same)}", f"sudo pacman -S {' '.join(same)}",
+                                "Reinstalls them (the same version the repos have, so nothing is downgraded).",
+                                verify=lambda: not missing_package_files(same)[0]))
+    return found
+
+
+def missing_package_files(pkgs=()):
+    """pacman -Qkq -> ({package: [missing files]}, files that couldn't be checked, error or None)."""
+    rc, out, err = run(["pacman", "-Qkq", *pkgs], timeout=300)
+    if rc != 0 and not out and err.strip():
+        return {}, 0, (err.strip().splitlines() or ["no output"])[-1]
+    broken, unreadable = {}, 0
+    for line in out.splitlines():
+        pkg, _, path = line.partition(" ")
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            broken.setdefault(pkg, []).append(path)
+        except OSError:
+            unreadable += 1  # e.g. /boot is root-only: pacman can't see the file, it isn't missing
+    return broken, unreadable, None
+
+
+def package_file_problems():
+    broken, unreadable, err = missing_package_files()
+    if err:
+        return [], [f"pacman -Qkq failed: {err}"]
+    notes = [f"{unreadable} package file(s) couldn't be checked without root (e.g. under /boot); that's normal"] if unreadable else []
+    if not broken:
+        return [], notes
+    detail = "; ".join(f"{p}: {len(f)} file(s), e.g. {f[0]}" for p, f in sorted(broken.items())[:6])
+    return [Problem("Package files are missing — " + detail)] + reinstall_problems(sorted(broken)), notes
+
+
+# ---- self-test: is everything this desktop starts and runs actually there? ----
+
+HYPR = HOME / ".config/hypr"
+UNITS = HOME / ".config/systemd/user"
+CAELESTIA_SRC = Path("/etc/xdg/quickshell/caelestia")
+CAELESTIA_COPY = HOME / ".config/quickshell/caelestia"
+CAELESTIA_PATCHES = HOME / ".config/caelestia/patches"
+# two Quickshell shells run: Caelestia, and the rice bar next to it, so match each by its command line
+QS_CONFIGS = HOME / ".config/quickshell"
+# what each shell is for, in the report (any other Quickshell config is "your Quickshell config NAME")
+SHELL_NAMES = {"caelestia": "The Caelestia shell (notifications, launcher, lock screen, wallpaper)",
+               "rice": "The bar (the rice shell, with its dashboard, control centre and to-do panel)"}
+# Quickshell lines that mean part of a shell didn't load (an API that changed under it), not passing noise
+QS_LOAD_ERROR = re.compile(r"is not a type|is not installed|module \"[^\"]+\" (is not installed|version)|"
+                           r"Cannot assign to non-existent property|Type \S+ unavailable|plugin cannot be loaded|"
+                           r"Non-existent attached object|Invalid property assignment|Failed to load|"
+                           r"No such file or directory.*\.qml", re.I)
+BACKUP_NAME = re.compile(r"\.(bak|orig|archinstall|old)\b|~$")
+SH_NOT_COMMANDS = set("""if then else elif fi for while until do done case esac in function select time ! [[ ]] [ test
+    { } ( ) echo printf read cd export local return exit set unset shift source . eval exec trap wait true false
+    break continue declare typeset readonly let getopts command type hash ulimit umask kill pwd alias unalias
+    builtin mapfile readarray pushd popd dirs disown jobs fg bg suspend shopt enable caller compgen complete""".split())
+# commands that run another command: wrapper -> its options that take a value (sudo -u USER cmd)
+SH_WRAPPERS = {"sudo": {"-u", "-g", "-C", "-D", "-p", "-r", "-t", "-U", "-h"}, "env": {"-u", "-C", "-S"},
+               "timeout": {"-s", "-k"}, "nice": {"-n"}, "exec": {"-a"}, "nohup": set(), "setsid": set(),
+               "command": set(), "time": set(), "xargs": {"-I", "-n", "-P", "-d", "-a", "-E", "-L", "-s"}}
+COMMAND = re.compile(r"^([A-Za-z_][\w.+-]*|~?/[\w./+-]+)$")
+PY_CALL = re.compile(r"(?:run|call|Popen|check_output|check_call)\(\s*\[\s*[\"']([\w.+-]+)[\"']")
+LUA_STR = r'"(?:[^"\\\n]|\\.)*"' + r"|'(?:[^'\\\n]|\\.)*'"
+LUA_UNKNOWN = "$lua"  # a value only known when Hyprland runs; not checked
+
+
+def shell_skeleton(text):
+    """A shell script with comments, quoted text, heredoc bodies and arithmetic removed, so only the
+    commands are left; $(...) is kept, also inside double quotes."""
+    out, i, n = [], 0, len(text)
+    stack, depth, heredocs = ["code"], [0], []
+    while i < n:
+        c = text[i]
+        if stack[-1] == "dq":
+            if c == "\\":
+                i += 2
+            elif c == '"':
+                stack.pop()
+                out.append('"')
+                i += 1
+            elif text.startswith("$((", i):
+                j = text.find("))", i)
+                i = n if j < 0 else j + 2
+            elif text.startswith("$(", i):
+                stack.append("code")
+                depth.append(0)
+                out.append(" $( ")
+                i += 2
+            else:
+                i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "#" and (i == 0 or text[i - 1] in " \t\n;"):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            out.append("''")
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            stack.append("dq")
+            out.append('"')
+            i += 1
+            continue
+        if text.startswith("$((", i) or text.startswith("((", i):
+            j = text.find("))", i)
+            out.append(" 0 ")
+            i = n if j < 0 else j + 2
+            continue
+        if text.startswith("$(", i):
+            stack.append("code")
+            depth.append(0)
+            out.append(" $( ")
+            i += 2
+            continue
+        if c == "(":
+            depth[-1] += 1
+        elif c == ")":
+            if depth[-1] == 0 and len(stack) > 1:
+                stack.pop()
+                depth.pop()
+                out.append(" ) ")
+                i += 1
+                continue
+            depth[-1] -= 1
+        m = re.match(r"<<-?\s*(['\"]?)(\w+)\1", text[i:i + 40])
+        if m:
+            heredocs.append(m.group(2))
+            out.append(" ")
+            i += m.end()
+            continue
+        if c == "\n" and heredocs:
+            out.append("\n")
+            for d in heredocs:  # skip each heredoc body, up to its closing line
+                m = re.compile(rf"^\s*{re.escape(d)}\s*$", re.M).search(text, i + 1)
+                i = n if not m else m.end()
+            heredocs = []
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def shell_commands(text):
+    """Commands a shell script (or command line) runs: {command: line}."""
+    funcs = set(re.findall(r"^\s*(?:function\s+)?([\w.-]+)\s*\(\)", text, re.M))
+    funcs |= set(re.findall(r"^\s*function\s+([\w.-]+)", text, re.M))
+    guarded = set(re.findall(r"(?:command -v|which|type -p|hash)\s+([\w.+-]+)", text))  # optional ones
+    cmds = {}
+    for n, line in enumerate(shell_skeleton(text).splitlines(), 1):
+        line = re.sub(r"^\s*\(?[^\s()]+\)\s", " ", line)  # case pattern:  foo|bar)  cmd
+        line = re.sub(r"\b\w+\+?=\([^)]*\)", " ", line)  # array assignment:  dirs=(/a /b) holds values, not commands
+        for part in re.split(r"\$\(|;|&&|\|\||\||\bthen\b|\bdo\b|\belse\b|\{|\(|!|&", line):
+            words = part.split()
+            while words and re.match(r"^\w+(\[[^]]*\])?\+?=", words[0]):  # VAR=value cmd
+                words.pop(0)
+            while words and words[0] in SH_WRAPPERS:  # sudo -u x cmd, timeout 5 cmd, ...
+                takes_value = SH_WRAPPERS[words.pop(0)]
+                while words and (words[0].startswith("-") or words[0][:1].isdigit() or "=" in words[0]):
+                    if words.pop(0) in takes_value and words:
+                        words.pop(0)
+            if words and COMMAND.match(words[0]) and words[0] not in SH_NOT_COMMANDS | funcs | guarded:
+                cmds.setdefault(words[0], n)
+    return cmds
+
+
+def py_commands(text):
+    """Commands a Python script runs through subprocess: {command: line}; ones it checks with which() are optional."""
+    guarded = set(re.findall(r"which\(\s*[\"']([\w.+-]+)", text))
+    cmds = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        for c in PY_CALL.findall(line):
+            if c not in guarded:
+                cmds.setdefault(c, n)
+    return cmds
+
+
+def command_exists(c):
+    if c.startswith(("/", "~")):
+        p = Path(os.path.expanduser(c))
+        return p.is_file() and os.access(p, os.X_OK)
+    return shutil.which(c) is not None
+
+
+def provider(c):
+    """The repo package that has /usr/bin/<c>, or None (needs pacman's file lists: sudo pacman -Fy)."""
+    if c.startswith(("/", "~")) or not glob.glob("/var/lib/pacman/sync/*.files"):
+        return None
+    rc, out, _ = run(["pacman", "-Fq", f"/usr/bin/{c}"], timeout=30)
+    return out.split()[0].split("/")[-1] if rc == 0 and out.strip() else None
+
+
+def missing_commands(cmd):
+    """Commands in a command line that aren't installed, including inside sh -c '...'."""
+    names = list(shell_commands(cmd))
+    for m in re.finditer(r"\b(?:ba)?sh\s+-c\s+(['\"])(.*?)\1", cmd):
+        names += shell_commands(m.group(2))
+    return [c for c in dict.fromkeys(names) if not command_exists(c)]
+
+
+def lua_config_files():
+    """hyprland.lua and every file it require()s: (files found, files missing)."""
+    files, missing, todo = [], [], [HYPR / "hyprland.lua"]
+    while todo:
+        f = todo.pop(0)
+        if f in files or f in missing:
+            continue
+        if not f.is_file():
+            missing.append(f)
+            continue
+        files.append(f)
+        for m in re.finditer(r"^[^-\n]*\brequire\s*\(?\s*[\"']([\w.]+)[\"']", f.read_text(errors="replace"), re.M):
+            todo.append(HYPR / (m.group(1).replace(".", "/") + ".lua"))
+    return files, missing
+
+
+def lua_comment_start(line):
+    """Where a Lua -- comment starts on this line (len(line) if none); -- inside a string doesn't count."""
+    for m in re.finditer(rf"{LUA_STR}|--", line):
+        if m.group(0) == "--":
+            return m.start()
+    return len(line)
+
+
+def lua_exec_commands(text):
+    """[(line, command)] for each exec_cmd(...) in Hyprland's Lua config, with local string variables filled in."""
+    names = {m.group(1): m.group(2)[1:-1]
+             for m in re.finditer(rf"^\s*local\s+(\w+)\s*=\s*({LUA_STR})\s*(?:--.*)?$", text, re.M)}
+    found = []
+    for m in re.finditer(rf"exec_cmd\(\s*((?:{LUA_STR}|\w+|\s*\.\.\s*)+?)\s*[,)]", text):
+        start = text.rfind("\n", 0, m.start()) + 1
+        end = text.find("\n", m.start())
+        line = text[start:end if end >= 0 else len(text)]
+        if lua_comment_start(line) < m.start() - start:
+            continue  # commented out
+        parts = re.findall(rf"{LUA_STR}|\w+", m.group(1))
+        cmd = "".join(p[1:-1] if p[0] in "\"'" else names.get(p, f" {LUA_UNKNOWN} ") for p in parts)
+        found.append((text.count("\n", 0, m.start()) + 1, cmd))
+    return found
+
+
+def lua_path_literals(text):
+    """[(line, path)] for file paths written in the Lua config (outside exec_cmd, which is checked as a command)."""
+    found = []
+    for n, line in enumerate(text.splitlines(), 1):
+        code = line[:lua_comment_start(line)]
+        if "exec_cmd(" in code:
+            continue
+        for m in re.finditer(LUA_STR, code):
+            s = m.group(0)[1:-1]
+            if re.fullmatch(r"(~|/home|/etc|/usr|/opt)/[^\s'\"$]*", s):
+                found.append((n, s))
+    return found
+
+
+def startup_problems():
+    """Every program the Hyprland config starts or binds to a key, and every file it names, must exist."""
+    files, gone = lua_config_files()
+    if not files:
+        return [], 0
+    found = [Problem(f"hyprland.lua loads {f.name}, which is missing.") for f in gone]
+    checked, missing = 0, {}
+    luac = shutil.which("luac")
+    for f in files:
+        text = f.read_text(errors="replace")
+        if luac:
+            rc, _, err = run([luac, "-p", str(f)], timeout=30)
+            if rc != 0:
+                found.append(Problem(f"{f.name} has a syntax error: {(err.strip().splitlines() or ['?'])[-1]}"))
+        for line, cmd in lua_exec_commands(text):
+            checked += 1
+            for c in missing_commands(cmd):
+                missing.setdefault(c, []).append(f"{f.name}:{line}")
+        by_line = {}
+        for line, path in lua_path_literals(text):
+            by_line.setdefault(line, []).append(path)
+        for line, paths in by_line.items():
+            checked += 1
+            # several paths on one line are alternatives (use whichever exists): fine if any of them does
+            if not any(Path(os.path.expanduser(p)).exists() for p in paths):
+                found.append(Problem(f"{f.name}:{line} refers to {' / '.join(paths)}, which doesn't exist."))
+    for c, where in missing.items():
+        pkg = provider(c)
+        what = f"{', '.join(where[:3])} starts `{c}`, which " + ("doesn't exist." if c.startswith(("/", "~")) else "isn't installed.")
+        found.append(Problem(what, f"sudo pacman -S {pkg}", f"Installs {pkg}, which provides {c}.", verify=lambda c=c: command_exists(c))
+                     if pkg else Problem(what))
+    return found, checked
+
+
+def unit_problems():
+    """Your systemd user services: the programs they run exist, and nothing enabled points at a deleted unit."""
+    found, checked = [], 0
+    for f in sorted(UNITS.glob("*.service")):
+        for line in f.read_text(errors="replace").splitlines():
+            m = re.match(r"^\s*Exec\w*\s*=\s*[-@:+!|]*(\S+)", line)
+            if not m:
+                continue
+            c = m.group(1).replace("%h", str(HOME))
+            if "%" in c or "$" in c:
+                continue
+            checked += 1
+            if not command_exists(c):
+                found.append(Problem(f"Your service {f.name} runs {c}, which doesn't exist."))
+    for link in sorted(UNITS.glob("*.wants/*")):
+        checked += 1
+        if link.is_symlink() and not link.exists():
+            found.append(Problem(f"{link.name} is enabled ({link.parent.name}) but its unit file is gone: {os.readlink(link)}"))
+    return found, checked
+
+
+def script_problems():
+    """Your scripts in ~/.local/bin: the interpreter exists, they parse, and the commands they run are installed."""
+    found, checked = [], 0
+    try:
+        scripts = sorted(BIN.iterdir())
+    except OSError:
+        return [], 0
+    for f in scripts:
+        if BACKUP_NAME.search(f.name) or not f.is_file() or is_elf(f):
+            continue
+        try:
+            text = f.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not text.startswith("#!"):
+            continue
+        checked += 1
+        shebang = text.split("\n", 1)[0][2:].split()
+        interp = shebang[1] if len(shebang) > 1 and shebang[0].endswith("/env") else (shebang[0] if shebang else "")
+        if not command_exists(interp):
+            found.append(Problem(f"{f.name}: its interpreter {interp} isn't installed."))
+            continue
+        kind = Path(interp).name
+        if kind.startswith("python"):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    compile(text, str(f), "exec", dont_inherit=True)
+            except (SyntaxError, ValueError) as e:
+                found.append(Problem(f"{f.name} has a syntax error (line {getattr(e, 'lineno', '?')}): {getattr(e, 'msg', e)}"))
+                continue
+            cmds = py_commands(text)
+        elif kind in ("sh", "bash", "dash"):
+            rc, _, err = run([interp, "-n", str(f)], timeout=30)
+            if rc != 0:
+                found.append(Problem(f"{f.name} has a syntax error: {(err.strip().splitlines() or ['?'])[-1]}"))
+                continue
+            cmds = shell_commands(text)
+        else:
+            continue
+        for c, line in cmds.items():
+            if not command_exists(c):
+                pkg = provider(c)
+                found.append(Problem(f"{f.name} (line {line}) runs `{c}`, which isn't installed"
+                                     + (f"; it's in {pkg}: sudo pacman -S {pkg}" if pkg else "") + "."))
+    return found, checked
+
+
+def config_problems():
+    """Config files that must parse: Caelestia's JSON settings and this tool's own config."""
+    found, checked = [], 0
+    for f in sorted((HOME / ".config/caelestia").glob("*.json")):
+        checked += 1
+        try:
+            json.loads(f.read_text())
+        except (OSError, ValueError) as e:
+            found.append(Problem(f"{f} isn't valid JSON ({e}), so Caelestia ignores your settings in it."))
+    if CONFIG.exists():
+        checked += 1
+        _, err = load_config()
+        if err:
+            found.append(Problem(err))
+    return found, checked
+
+
+def patched_files(patch_text):
+    """Files a -p1 patch writes to (its +++ b/... lines)."""
+    return [m.group(1) for m in re.finditer(r"^\+\+\+ [^/\s]+/(\S+)", patch_text, re.M)]
+
+
+def caelestia_copy_problems():
+    """The patched Caelestia copy the shell runs from must equal what caelestia-patch would make now:
+    the installed Caelestia with your patches applied. Checked exactly, by building that in a temp dir."""
+    patches = sorted(CAELESTIA_PATCHES.glob("*.patch"))
+    if not CAELESTIA_SRC.is_dir() or not (patches or CAELESTIA_COPY.is_dir()):
+        return [], 0  # not this setup
+
+    def problem(what):
+        return Problem(what, "caelestia-patch", "Copies the installed Caelestia again, re-applies your patches "
+                       "and restarts the shell.", verify=lambda: not caelestia_copy_problems()[0])
+
+    if not CAELESTIA_COPY.is_dir():
+        return [problem(f"Your patched Caelestia copy ({CAELESTIA_COPY}) is missing, so the shell runs without your patches.")], 1
+    shipped = {str(p.relative_to(CAELESTIA_SRC)) for p in CAELESTIA_SRC.rglob("*") if p.is_file()}
+    touched = {f for p in patches for f in patched_files(p.read_text(errors="replace"))}
+    found, differ = [], []
+    for rel in sorted(shipped - touched):
+        try:
+            same = (CAELESTIA_SRC / rel).read_bytes() == (CAELESTIA_COPY / rel).read_bytes()
+        except OSError:
+            same = False
+        if not same:
+            differ.append(rel)
+    if touched and shutil.which("patch"):
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel in touched & shipped:
+                Path(tmp, rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(CAELESTIA_SRC / rel, Path(tmp, rel))
+            broken = []
+            for p in patches:
+                try:
+                    with open(p, "rb") as f:
+                        rc = subprocess.run(["patch", "-d", tmp, "-p1", "--forward", "-s", "-f"], stdin=f,
+                                            capture_output=True, timeout=30).returncode
+                except (OSError, subprocess.TimeoutExpired):
+                    rc = 1
+                if rc != 0:
+                    broken.append(p.name)
+            if broken:
+                found.append(Problem(f"Your patch(es) {', '.join(broken)} no longer apply to the installed Caelestia, so "
+                                     "caelestia-patch would stop (your current copy stays as it is). They need redoing "
+                                     f"by hand against {CAELESTIA_SRC}."))
+            else:
+                for rel in sorted(touched):
+                    try:
+                        same = Path(tmp, rel).read_bytes() == (CAELESTIA_COPY / rel).read_bytes()
+                    except OSError:
+                        same = False
+                    if not same:
+                        differ.append(rel)
+    if differ:
+        found.append(problem(f"{len(differ)} file(s) in your patched Caelestia copy aren't what the installed Caelestia "
+                             f"plus your patches gives (e.g. {', '.join(differ[:3])}): Caelestia changed since the copy was made, "
+                             "or a patch isn't applied."))
+    return found, len(shipped) + len(patches)
+
+
+def running_shells():
+    """Quickshell instances running now: {config folder name: pid}. Asks Quickshell itself, because after a
+    crash it restarts the shell in place and the process is then just /usr/bin/quickshell."""
+    rc, out, _ = run(["qs", "list", "--all", "--json"], timeout=15)
+    try:
+        items = json.loads(out) if rc == 0 else []
+    except ValueError:
+        items = []
+    return {Path(i["config_path"]).parent.name: i["pid"] for i in items if i.get("config_path")}
+
+
+def autostarted_shells():
+    """Quickshell configs your Hyprland config starts: {config name: (file:line, command)}."""
+    found = {}
+    for f in lua_config_files()[0]:
+        for line, cmd in lua_exec_commands(f.read_text(errors="replace")):
+            m = re.search(r"\b(?:qs|quickshell)\b(?=.*\s-c\s+([\w.-]+))", cmd) or re.search(r"\bcaelestia shell\b()", cmd)
+            if m and "ipc" not in cmd.split():
+                name = m.group(1) or "caelestia"
+                if (QS_CONFIGS / name / "shell.qml").is_file():
+                    found.setdefault(name, (f"{f.name}:{line}", cmd))
+    return found
+
+
+def start_shell_cmd(name, cmd=None):
+    """Start a shell the way login does (through Hyprland, so it lives in the session like the rest), and
+    never as a second copy: -n makes Quickshell refuse when that config is already running."""
+    cmd = cmd or ("caelestia shell -d" if name == "caelestia" else f"qs -c {name} -d")
+    if re.search(r"\b(qs|quickshell)\b", cmd) and not re.search(r"\s-n\b|--no-duplicate", cmd):
+        cmd = re.sub(r"\s-c\s+(\S+)", r" -c \1 -n", cmd, count=1)
+    lua = cmd.replace("\\", "\\\\").replace('"', '\\"')
+    return f"hyprctl eval 'hl.exec_cmd(\"{lua}\")' >/dev/null"
+
+
+def shell_log_errors(pid):
+    """Distinct lines in a running shell's log saying part of it failed to load."""
+    rc, out, _ = run(["qs", "log", "--pid", str(pid)], timeout=30)
+    seen = []
+    for line in re.sub(r"\x1b\[[0-9;]*m", "", out).splitlines():
+        if QS_LOAD_ERROR.search(line):
+            msg = re.sub(r"\s+", " ", line.split(":", 1)[-1]).strip()
+            if msg not in seen:
+                seen.append(msg)
+    return seen
+
+
+def shell_problems(custom):
+    """Quickshell matches the installed Qt; every shell your Hyprland config starts is running; and no
+    running shell logged that part of it failed to load (only checked inside the desktop session)."""
+    found, checked = [], 0
+    qs = shutil.which("quickshell")
+    if qs:
+        checked += 1
+        if run([qs, "--private-check-compat"], timeout=30)[0] != 0:
+            owner = run(["pacman", "-Qoq", qs])[1].strip()
+            e = custom.get(owner, {})
+            found.append(Problem(f"Quickshell ({owner or qs}) was built for a different Qt than the one installed, so the shell "
+                                 "will probably crash.", e.get("rebuild") or "arch-update",
+                                 "Rebuilds Quickshell for the Qt now installed.", tuple(e.get("after", ())),
+                                 lambda: run([qs, "--private-check-compat"], timeout=30)[0] == 0))
+    if not (os.environ.get("WAYLAND_DISPLAY") and qs):
+        return found, checked
+    running = running_shells()
+    for name, (where, cmd) in autostarted_shells().items():
+        checked += 1
+        if name not in running:
+            label = SHELL_NAMES.get(name, f"Your Quickshell config \"{name}\"")
+            found.append(Problem(f"{label} isn't running (it's started at login by {where}).", start_shell_cmd(name, cmd),
+                                 "Starts it again, the way login does (only if it isn't running already).",
+                                 verify=lambda name=name: time.sleep(4) or name in running_shells()))
+    for name, pid in running.items():
+        checked += 1
+        errors = shell_log_errors(pid)
+        if errors:
+            label = SHELL_NAMES.get(name, f"Your Quickshell config \"{name}\"").split(" (")[0]
+            found.append(Problem(f"{label} logged that part of it failed to load since it started (pid {pid}): "
+                                 + " | ".join(short(e, 140) for e in errors[:3])
+                                 + (f" (+{len(errors) - 3} more)" if len(errors) > 3 else "")))
+    return found, checked
+
+
+def hypr_config_problems():
+    """Errors Hyprland itself reports in its config (after a Hyprland update, renamed or removed options)."""
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return [], 0
+    rc, out, _ = run(["hyprctl", "configerrors", "-j"], timeout=15)
+    try:
+        errors = [e.strip() for e in json.loads(out) if isinstance(e, str) and e.strip()] if rc == 0 else []
+    except ValueError:
+        errors = []
+    if not errors:
+        return [], 1
+    return [Problem("Hyprland reports error(s) in your config, so those settings aren't applied: "
+                    + " | ".join(short(e, 160) for e in errors[:4]) + (f" (+{len(errors) - 4} more)" if len(errors) > 4 else ""),
+                    verify=lambda: not hypr_config_problems()[0])], 1
+
+
+def python_imports(text):
+    """Top-level modules a Python script imports, except ones inside try/except ImportError (optional)."""
+    import ast
+    tree = ast.parse(text)
+    optional = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try) and any(
+                isinstance(h.type, ast.Name) and h.type.id in ("ImportError", "ModuleNotFoundError")
+                or isinstance(h.type, ast.Tuple) and any(getattr(e, "id", "") in ("ImportError", "ModuleNotFoundError") for e in h.type.elts)
+                for h in node.handlers):
+            optional |= {id(n) for b in node.body for n in ast.walk(b)}
+    mods = {}
+    for node in ast.walk(tree):
+        if id(node) in optional:
+            continue
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                mods.setdefault(a.name.split(".")[0], node.lineno)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            mods.setdefault(node.module.split(".")[0], node.lineno)
+    return mods
+
+
+def python_import_problems():
+    """Your Python scripts in ~/.local/bin can import what they use (a Python upgrade drops modules
+    installed with pip for the old version; a removed package takes its module with it)."""
+    found, checked = [], 0
+    try:
+        scripts = sorted(BIN.iterdir())
+    except OSError:
+        return [], 0
+    for f in scripts:
+        if BACKUP_NAME.search(f.name) or not f.is_file() or is_elf(f):
+            continue
+        try:
+            text = f.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        first = text.split("\n", 1)[0]
+        if not (first.startswith("#!") and "python" in first):
+            continue
+        shebang = first[2:].split()
+        interp = shebang[1] if len(shebang) > 1 and shebang[0].endswith("/env") else shebang[0]
+        try:
+            mods = python_imports(text)
+        except (SyntaxError, ValueError):
+            continue  # script_problems reports the syntax error
+        here = f.resolve().parent  # a script symlinked from a repo imports its neighbours there
+        mods = {m: line for m, line in mods.items()
+                if not (here / f"{m}.py").exists() and not (here / m / "__init__.py").exists()}
+        if not mods:
+            continue
+        checked += 1
+        probe = ("import importlib.util,sys\n"
+                 "print(' '.join(m for m in sys.argv[1:] if importlib.util.find_spec(m) is None))")
+        rc, out, _ = run([interp, "-I", "-c", probe, *mods], timeout=30)
+        for m in out.split() if rc == 0 else []:
+            found.append(Problem(f"{f.name} (line {mods[m]}) imports the Python module {m}, which isn't installed "
+                                 f"for {interp}, so the script stops there."))
+    return found, checked
+
+
+def desktop_entry_problems():
+    """App launchers you made (~/.local/share/applications) and things that start at login
+    (~/.config/autostart): the program each one runs exists."""
+    found, checked = [], 0
+    for d in (HOME / ".local/share/applications", HOME / ".config/autostart"):
+        for f in sorted(d.glob("*.desktop")):
+            try:
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            main = text.split("\n[", 1)[0]
+            if re.search(r"^Hidden\s*=\s*true", main, re.M | re.I):
+                continue
+            m = re.search(r"^(TryExec|Exec)\s*=\s*(.+)$", main, re.M)
+            if not m:
+                continue
+            try:
+                words = [w for w in shlex.split(m.group(2)) if not re.match(r"^[A-Za-z_]\w*=", w)]
+            except ValueError:
+                continue
+            words = [w for w in words if w not in ("env",)]
+            if not words or words[0].startswith("%"):
+                continue
+            checked += 1
+            c = os.path.expanduser(words[0])
+            if not command_exists(c):
+                pkg = provider(c) if "/" not in c else None
+                where = "starts at login" if d.name == "autostart" else "is in your app launcher"
+                found.append(Problem(f"{f.name} ({where}) runs {c}, which " + ("isn't installed" if "/" not in c else "doesn't exist")
+                                     + (f"; it's in {pkg}: sudo pacman -S {pkg}" if pkg else "") + "."))
+    return found, checked
+
+
+def own_binary_problems():
+    """Programs and plugins you built that aren't packages (~/.local/bin, ~/.local/lib): their libraries
+    are all still there (an update can remove or rename one; then they need rebuilding)."""
+    found, checked = [], 0
+    files = []
+    for d in (BIN, HOME / ".local/lib"):
+        if d.is_dir():
+            files += [p for p in d.rglob("*") if p.is_file() and not p.is_symlink() and is_elf(p)]
+    for f in files[:200]:
+        checked += 1
+        missing = ldd_missing([f])
+        if missing:
+            found.append(Problem(f"{f} needs {describe_missing(missing)}, which is gone (an update removed or renamed it), "
+                                 "so it won't start or load until it's rebuilt."))
+    return found, checked
+
+
+def selftest(custom):
+    """Is everything this desktop starts and runs actually there? -> (problems, one-line summary)"""
+    found, parts = [], []
+    for label, (probs, n) in (("startup commands/files in the Hyprland config", startup_problems()),
+                              ("service commands", unit_problems()),
+                              ("scripts", script_problems()),
+                              ("config files", config_problems()),
+                              ("Caelestia files/patches", caelestia_copy_problems()),
+                              ("shell checks", shell_problems(custom)),
+                              ("Hyprland's own config check", hypr_config_problems()),
+                              ("Python scripts' imports", python_import_problems()),
+                              ("app launchers/autostart entries", desktop_entry_problems()),
+                              ("programs/plugins you built", own_binary_problems())):
+        found += probs
+        if n:
+            parts.append(f"{n} {label}")
+    summary = "Self-test: checked " + (", ".join(parts) or "nothing")
+    return found, summary + (f" — {len(found)} problem{'s' * (len(found) != 1)}." if found else " — everything's there.")
+
+
+def update_running():
+    """pacman/yay is mid-update: files are being swapped, so libraries can look missing for a moment."""
+    if Path("/var/lib/pacman/db.lck").exists():
+        return True
+    rc, _, _ = run(["pgrep", "-x", "pacman|yay|paru|makepkg"], timeout=10)
+    return rc == 0
+
+
+def after_update(full=False):
+    """What changed since the last report, and what may have broken. Offline and read-only.
+    Without full, the slower checks only run when there's been an update since the last report."""
+    log = read_pacman_log()
+    changes, upgrades = log or ([], [])
+    new = new_changes(changes, upgrades, read_seen())
+    notes = [] if log else [f"Couldn't read {PACMAN_LOG}, so updates since boot weren't checked."]
+    if update_running():
+        notes.insert(0, "An update is running right now, so some of this may be wrong (files are mid-swap). "
+                        "Check again when it's finished: update-check --after")
+    config, err = load_config()
+    entries = [e for e in config.get("custom", []) if isinstance(e, dict)]
+    custom = {e["package"]: e for e in entries if e.get("package")}
+    problems = reboot_problems(changes) + config_file_problems() + failed_unit_problems()
+    journal = None
+    if full or new:
+        notes += [err] if err and not CONFIG.exists() else []  # a broken config is a self-test problem
+        for found, more in (custom_problems(entries, changes), checkrebuild_problems(custom), package_file_problems()):
+            problems += found
+            notes += more
+        journal = journal_summary()
+    found, tested = selftest(custom)
+    return new, with_causes(one_per_fix(problems + found), changes, new), notes, journal, tested
+
+
+def with_causes(problems, changes, new):
+    """Fill in why each problem appeared, from what changed since the last check that found nothing wrong:
+    your files (the history snapshot taken now) and packages (pacman.log)."""
+    if not problems:
+        return problems
+    smart.snapshot("check")
+    good_at = smart.tag_time("good")
+    files = smart.changed_since()
+    pkgs = changes if good_at else new  # no good check yet: only what's new since the last report
+    return [p if p.cause else p._replace(cause=smart.explain(p.what, pkgs, files, good_at)) for p in problems]
+
+
+def all_good(problems):
+    """Nothing left but a reboot or news: remember this state as the last one that worked."""
+    if not any(p.repairable and p.fix != REBOOT for p in problems):
+        smart.mark_good()
+
+
+def one_per_fix(problems):
+    """Two checks can find the same breakage (Quickshell vs Qt, say): one entry per fix, with both findings."""
+    out, by_fix = [], {}
+    for p in problems:
+        if p.fix and p.fix in by_fix:
+            i = by_fix[p.fix]
+            out[i] = out[i]._replace(what=out[i].what + " Also: " + p.what)
+            continue
+        if p.fix:
+            by_fix[p.fix] = len(out)
+        out.append(p)
+    return out
+
+
+def render_problems(problems, outcomes=None):
+    """outcomes: {id(problem): what happened when it was fixed automatically}"""
+    lines = []
+    for p in problems:
+        lines.append("  * " + p.what)
+        if p.cause:
+            lines.append("      why: " + p.cause)
+        if p.fix:
+            lines.append("      fix: " + p.fix)
+        if outcomes and id(p) in outcomes:
+            lines.append("      -> " + outcomes[id(p)])
+    return lines
+
+
+def render_changes(new, limit=40):
+    if not new:
+        return []
+    word = {"upgraded": "", "installed": "new ", "removed": "removed ", "reinstalled": "reinstalled ", "downgraded": "DOWNGRADED "}
+    lines = [f"== What changed ({len(new)}, {new[0].time.astimezone():%a %d %b %H:%M} – {new[-1].time.astimezone():%a %d %b %H:%M}) =="]
+    for c in new[:limit]:
+        vers = f"{c.old} -> {c.new}" if c.old and c.new and c.old != c.new else (c.new or c.old)
+        lines.append(f"  {word[c.action]}{c.name} {vers}")
+    if len(new) > limit:
+        lines.append(f"  … and {len(new) - limit} more (all of them: /var/log/pacman.log)")
+    return lines + [""]
+
+
+def after_report(new, problems, notes, journal, tested):
+    reboot = any(p.fix == REBOOT for p in problems)
+    lines = [f"Post-update check — {datetime.now():%a %d %b %H:%M}"]
+    if new:
+        lines.append(f"Updated since last check: yes, {len(new)} package change{'s' * (len(new) != 1)} "
+                     f"(newest {new[-1].time.astimezone():%a %d %b %H:%M})")
+    else:
+        lines.append("Updated since last check: no")
+    lines.append(f"Reboot needed: {'yes' if reboot else 'no'}")
+    lines.append(f"Problems found: {len(problems)}")
+    lines.append(tested)
+    lines.append("")
+    if problems:
+        lines.append("== Problems ==")
+        lines += render_problems(problems)
+        lines.append("")
+    if journal or notes:
+        lines.append("== Worth knowing ==")
+        lines += ["  * " + n for n in notes + ([journal] if journal else [])]
+        lines.append("")
+    lines += render_changes(new)
+    if any(p.fix and p.fix != REBOOT for p in problems):
+        lines.append("Fix all of it: update-check --after --fix   (runs each fix and what it needs afterwards, "
+                     "then checks again; add --ask to confirm each one)")
+    return "\n".join(lines) + "\n"
+
+
+def needs_terminal(cmd):
+    return bool(NEEDS_TERMINAL.search(cmd))
+
+
+def short(what, n=90):
+    return what if len(what) <= n else what[:n - 1].rstrip() + "…"
+
+
+def execute(cmd, headless):
+    """Run a fix: in the terminal you're looking at, or (headless) quietly, logged to FIX_LOG.
+    -> (exit code, last line it printed when headless)"""
+    if not headless:
+        return subprocess.call(cmd, shell=True), ""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with open(FIX_LOG, "a") as log:
+        log.write(f"\n[{datetime.now():%F %T}] $ {cmd}\n")
+        try:
+            p = subprocess.run(cmd, shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1800)
+        except subprocess.TimeoutExpired:
+            log.write("(gave up after 30 minutes)\n")
+            return 124, "gave up after 30 minutes"
+        log.write(p.stdout + p.stderr)
+    return p.returncode, ((p.stdout + p.stderr).strip().splitlines() or [""])[-1]
+
+
+def confirm(prompt):
+    try:
+        return input(prompt).strip().lower() == "y"
+    except EOFError:
+        return False
+
+
+def run_fixes(problems, headless=False, ask=False, say=print):
+    """Run every fix, then each follow-up they need (once, and only if its fix worked), then re-check each one.
+    Never reboots. headless: only fixes that need no password, rebuild or answers; the rest are returned.
+    -> ([(problem, outcome)], [problems left for a terminal])"""
+    todo, left = [], []
+    for p in problems:
+        if not p.fix or p.fix == REBOOT:
+            continue
+        (left if headless and needs_terminal(p.fix) else todo).append(p)
+    results, then = [], []
+    for i, p in enumerate(todo, 1):
+        say(f"\n[{i}/{len(todo)}] {p.what}")
+        if p.why:
+            say(f"  What the fix does: {p.why}")
+        say(f"  Command: {p.fix}")
+        if ask and not confirm("  Run it? [y/N] "):
+            results.append((p, "skipped"))
+            continue
+        rc, last = execute(p.fix, headless)
+        if rc != 0:
+            results.append((p, f"the fix failed (exit code {rc}{': ' + last if last else ''})"))
+            say(f"  It failed (exit code {rc}).")
+            continue
+        results.append((p, last))
+        then += [t for t in p.then if t not in then]
+    for t in then:
+        if headless and needs_terminal(t):
+            continue
+        say(f"\nFollow-up: {t}")
+        rc, _ = execute(t, headless)
+        if rc != 0:
+            say(f"  It failed (exit code {rc}).")
+    final = []
+    for p, outcome in results:
+        if outcome == "skipped" or outcome.startswith("the fix failed"):
+            final.append((p, outcome))
+            continue
+        try:
+            ok = p.verify() if p.verify else None
+        except Exception as e:  # a re-check that breaks shouldn't hide the other results
+            ok, outcome = None, f"couldn't re-check ({e})"
+        final.append((p, "fixed" if ok else "STILL BROKEN after the fix" if ok is False
+                      else "done" + (f" ({outcome})" if outcome else "")))
+    if final:
+        say("\n== Results ==")
+        for p, outcome in final:
+            say(f"  {'✓' if outcome == 'fixed' else '•'} {short(p.what)}\n      {outcome}")
+    return final, left
+
+
+def repairable_left(problems, final, left=()):
+    """What's still broken after the built-in fixes, for Claude: problems with no fix, and fixes that
+    failed or didn't hold. Not reboots, news, or fixes still waiting for a terminal."""
+    failed = {id(p): o for p, o in final if o.startswith(("the fix failed", "STILL BROKEN"))}
+    waiting = {id(p) for p in left}
+    return [{"what": p.what, "cause": p.cause, "tried": p.fix, "outcome": failed.get(id(p))}
+            for p in problems if p.repairable and p.fix != REBOOT and id(p) not in waiting
+            and (not p.fix or id(p) in failed)]
+
+
+def _match(text, candidates):
+    """The candidate Claude's entry is about (it may reword the problem a little)."""
+    import difflib
+    best = max(candidates, key=lambda c: difflib.SequenceMatcher(None, text, c).ratio(), default=None)
+    return best if best and difflib.SequenceMatcher(None, text, best).ratio() > 0.5 else None
+
+
+def claude_repair(problems, final, left=(), say=print):
+    """Hand what the built-in fixes left to Claude, then check everything again.
+    -> (run or None, why there's no run, problems found by the re-check)"""
+    todo = repairable_left(problems, final, left)
+    if not todo:
+        return None, "", problems
+    config, _ = load_config()
+    changes = (read_pacman_log() or ([], []))[0]
+    good_at = smart.tag_time("good")
+    since = [c for c in changes if good_at is None or c.time >= good_at][-200:]
+    run_, why = smart.ai_fix(todo, since, smart.changed_since(), config,
+                             newest_change=changes[-1].time if changes else None, say=say)
+    if not run_:
+        return None, why, problems
+    _, again, _, _, _ = after_update()
+    still = [p.what for p in again]
+    asked = run_["problems"]
+    for entry in run_["fixes"] + run_["needs_you"]:
+        entry["about"] = _match(entry["problem"], asked) or entry["problem"]
+        entry["gone"] = _match(entry["about"], still) is None
+    for entry in run_["fixes"]:
+        entry["verified"] = bool(entry.get("fixed")) and entry["gone"]
+    (smart.RUNS / f"{run_['id']}.json").write_text(json.dumps(run_, indent=1))
+    return run_, "", again
+
+
+def render_repair(run_):
+    """Claude's part of the report: for each problem, why it broke, what was done, and whether it held."""
+    lines = []
+    for f in run_["fixes"]:
+        lines.append(f"  {'✓' if f.get('verified') else '•'} {short(f.get('about') or f['problem'], 160)}")
+        lines.append(f"      why it broke: {f['cause']}")
+        lines.append(f"      what was done: {f['did']}")
+        if f.get("files"):
+            lines.append(f"      files changed: {', '.join(f['files'][:6])}")
+        lines.append("      result: " + ("fixed, and the re-check confirms it" if f.get("verified")
+                                         else "Claude thinks it's fixed, but the re-check still finds it" if f.get("fixed")
+                                         else "not fixed"))
+    for n in run_["needs_you"]:
+        lines.append(f"  ! {short(n.get('about') or n['problem'], 160)}")
+        lines.append(f"      why it broke: {n['cause']}")
+        lines.append(f"      needs you (a password or a rebuild): {n['command']}")
+        lines.append(f"      what that does: {n['why']}")
+    if run_.get("error"):
+        lines.append(f"  Claude couldn't finish: {short(run_['error'], 300)}")
+    if run_["files_changed"]:
+        lines.append(f"  Undo everything Claude changed: update-check --undo {run_['id']}")
+    return lines
+
+
+def pending_needs_you(problems):
+    """Commands Claude said need you (from its last run, within 2 days) for problems that are still there."""
+    runs = sorted(smart.RUNS.glob("*.json")) if smart.RUNS.is_dir() else []
+    if not runs:
+        return []
+    try:
+        run_ = json.loads(runs[-1].read_text())
+        age = datetime.now() - datetime.fromisoformat(run_["time"])
+    except (OSError, ValueError, KeyError):
+        return []
+    if age.days >= 2:
+        return []
+    current = [p.what for p in problems]
+    return [n for n in run_.get("needs_you", []) if _match(n.get("about") or n["problem"], current)]
+
+
+def fix_here(problems, ask=False):
+    """--fix in a terminal: run everything (sudo asks for your password as usual), then offer the reboot."""
+    if not any(p.fix or p.repairable for p in problems):
+        print("Nothing to fix.")
+        return
+    headless = not sys.stdin.isatty()
+    print("== Fixing ==", flush=True)
+    final, left = run_fixes(problems, headless=headless, ask=ask)
+    run_, why, problems = claude_repair(problems, final, left)
+    if run_:
+        print("\n== What Claude found and did ==")
+        print("\n".join(render_repair(run_)))
+    elif why:
+        print(f"\n(Claude wasn't asked: {why}.)")
+    needs = (run_ or {}).get("needs_you") or pending_needs_you(problems)
+    if needs and not headless:
+        print("\n== These need you ==")
+        for n in needs:
+            print(f"\n  {n['problem']}\n  Why: {n['cause']}\n  Command: {n['command']}\n  What it does: {n['why']}")
+            if confirm("  Run it? [y/N] "):
+                subprocess.call(n["command"], shell=True)
+    if left:
+        print(f"\n{len(left)} fix(es) need a terminal (a password, a rebuild or questions). Run: update-check --after --fix")
+    if any(p.fix == REBOOT for p in problems) and not headless and confirm("\nA reboot is still needed. Reboot now? [y/N] "):
+        subprocess.call(REBOOT, shell=True)
+
+
+def after(do_fix, ask=False, pause=False):
+    print("Checking what changed and what may have broken (offline)…", flush=True)
+    new, problems, notes, journal, tested = after_update(full=True)
+    print("\n" + after_report(new, problems, notes, journal, tested))
+    mark_seen(new)
+    all_good(problems)
+    if do_fix:
+        fix_here(problems, ask)
+        all_good(after_update()[1])
+    if pause:
+        confirm("\nDone. Press Enter to close.")
+
+
+def fullscreen():
+    """Is a fullscreen window (a game, a video) in front right now?"""
+    rc, out, _ = run(["hyprctl", "activewindow", "-j"], timeout=10)
+    try:
+        return rc == 0 and bool(json.loads(out or "{}").get("fullscreen"))
+    except ValueError:
+        return False
+
+
+def open_fix_terminal():
+    subprocess.Popen(["kitty", "--class", "update-check", "-T", "Fixing", "-e", str(BIN / "update-check"),
+                      "--after", "--fix", "--pause"], start_new_session=True)
+
+
+def fix_later():
+    """--fix-later: open the fix terminal once nothing is fullscreen (a terminal behind a game would sit
+    there waiting for your password unseen). Gives up after 12 hours; the next check finds it all again."""
+    deadline = time.time() + 12 * 3600
+    while fullscreen():
+        if time.time() > deadline:
+            return
+        time.sleep(30)
+    open_fix_terminal()
+
+
+def auto_fix(problems):
+    """Background (login / 7:00): run the fixes that need nothing from you; hand the rest to a terminal,
+    opened now, or once you leave fullscreen. -> ({id(problem): outcome}, problems handed to the terminal)"""
+    final, left = run_fixes(problems, headless=True, say=lambda *a: None)
+    run_, _, _ = claude_repair(problems, final, left, say=lambda *a: None)
+    if run_:
+        for p in problems:
+            hit = next((f for f in run_["fixes"] if f.get("about") == p.what), None)
+            if hit and hit.get("verified"):
+                final = [(q, o) for q, o in final if q is not p] + [(p, "fixed by Claude: " + short(hit["did"], 200))]
+        left = left + [p for p in problems if p not in left and any(n.get("about") == p.what for n in run_["needs_you"])]
+    where = "a terminal opened for it"
+    if left and fullscreen():
+        subprocess.Popen([str(BIN / "update-check"), "--fix-later"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        where = "a terminal opens for it once you leave fullscreen"
+    elif left:
+        open_fix_terminal()
+    outcomes = {id(p): o for p, o in final}
+    for p in left:
+        outcomes[id(p)] = f"needs your password, a rebuild or answers: {where}"
+    return outcomes, left, run_
+
+
+def build_report(wait, autofix=False):
+    lines, todo = [], []
+    stamp = datetime.now().strftime("%a %d %b %H:%M")
+    if not online(wait):
+        return f"Update check — {stamp}\n\nNo internet, so nothing was checked.", "offline", "", [], []
+
+    _, out, _ = run(["pacman", "-Qq"])
+    installed = set(out.split())
+    repo, repo_err = repo_updates()
+    aur, flat = aur_updates(), flatpak_updates()
+    since = last_full_upgrade()
+    news, news_err = news_since(since, installed)
+    new, problems, notes, journal, tested = after_update()
+    problems = one_per_fix(problems + health())
+    fixed, outcomes, handed, repair = [], {}, [], None
+    if autofix and any((p.fix and p.fix != REBOOT) or p.repairable for p in problems):
+        outcomes, handed, repair = auto_fix(problems)
+        done = {i for i, o in outcomes.items() if o == "fixed" or o.startswith(("done", "fixed by Claude"))}
+        fixed = [p for p in problems if id(p) in done]
+        problems = [p for p in problems if id(p) not in done]
+
+    ignored = [l for l in repo or [] if "[ignored]" in l]
+    repo = [l for l in repo or [] if "[ignored]" not in l]
+    names = [l.split()[0] for l in repo + aur]
+    n = len(repo) + len(aur) + len(flat)
+
+    lines.append(f"Update check — {stamp}")
+    if since:
+        days = (datetime.now(since.tzinfo) - since).days
+        lines.append(f"Last full update: {since:%a %d %b %Y} ({days} day{'s' * (days != 1)} ago)")
+    lines.append(tested)
+    lines.append("")
+
+    if news:
+        lines.append(f"== Arch news since your last update ({len(news)}) — READ BEFORE UPDATING ==")
+        for date, title, link, text, mine in news:
+            lines.append(f"* {date:%d %b}: {title}")
+            if mine:
+                lines.append(f"  Affects packages you have: {', '.join(mine[:8])}")
+            lines.append("  " + (text[:600] + ("…" if len(text) > 600 else "")))
+            lines.append(f"  {link}")
+            lines.append("")
+        todo.append("Read the Arch news above first; follow any manual steps it gives.")
+    elif news_err:
+        lines.append(f"(Couldn't fetch Arch news: {news_err})\n")
+
+    if repo_err:
+        lines.append(f"(Couldn't check official repos: {' '.join(repo_err)})")
+    for title, pk in (("Official repos", repo), ("AUR", aur), ("Flatpak", flat)):
+        if pk:
+            lines.append(f"== {title}: {len(pk)} update{'s' * (len(pk) != 1)} ==")
+            lines += ["  " + p for p in pk]
+            lines.append("")
+    if ignored:
+        lines.append("Held back on purpose (IgnorePkg in /etc/pacman.conf, kept in step with the top bar):")
+        lines += ["  " + p for p in ignored]
+        lines.append("")
+
+    for pattern, advice in ADVICE:
+        hit = [p for p in names if re.search(pattern, p)]
+        if hit:
+            todo.append(f"{advice}  [{', '.join(hit[:6])}{', …' if len(hit) > 6 else ''}]")
+    if problems:
+        lines.append("== Needs attention now ==")
+        lines += render_problems(problems, outcomes)
+        lines.append("")
+    if fixed:
+        lines.append("== Fixed automatically ==")
+        for p in fixed:
+            lines.append(f"  * {p.what}")
+            if p.cause:
+                lines.append(f"      why it broke: {p.cause}")
+            if p.why and not outcomes[id(p)].startswith("fixed by Claude"):
+                lines.append(f"      what was done: {p.why} ({p.fix})")
+            lines.append(f"      -> {outcomes[id(p)]}")
+        lines.append(f"  (what the fixes printed: {FIX_LOG})")
+        lines.append("")
+    if repair:
+        lines.append("== What Claude found and did ==")
+        lines += render_repair(repair)
+        lines.append("")
+    if new:
+        lines.append(f"== Since your last update ({len(new)} package change{'s' * (len(new) != 1)}) ==")
+        lines += ["  * " + t for t in ([journal] if journal else []) + notes]
+        lines.append("")
+        lines += render_changes(new, limit=15)
+
+    if n:
+        todo.insert(0 if not news else 1, "Run: arch-update   (updates repos + AUR and rebuilds what this desktop needs)")
+    if flat:
+        todo.append("Flatpaks: flatpak update")
+    if any(p.fix and p.fix != REBOOT and p not in handed for p in problems):
+        todo.append("Fix the problems above (each fix, its follow-ups, then a re-check): update-check --after --fix")
+    if since and n and (datetime.now(since.tzinfo) - since).days > 30:
+        todo.append("It's been over a month: update soon, Arch gets harder to update the longer you wait.")
+
+    if todo:
+        lines.append("== What to do ==")
+        lines += [f"  {i}. {t}" for i, t in enumerate(todo, 1)]
+    if not n and not problems and not news:
+        lines.append("Everything is up to date. Nothing to do.")
+
+    # headline + body for the notification
+    if not n and not problems and not news and not fixed:
+        level, head, body = "ok", "System up to date", "No updates, no news, nothing broken."
+    else:
+        parts = []
+        if n:
+            parts.append(f"{n} update{'s' * (n != 1)}")
+        if news:
+            parts.append(f"{len(news)} Arch news post{'s' * (len(news) != 1)} to read first")
+        if problems:
+            parts.append(f"{len(problems)} thing{'s' * (len(problems) != 1)} need attention")
+        if new:
+            parts.insert(0, f"updated {len(new)} package{'s' * (len(new) != 1)} since last check")
+        if fixed:
+            by_claude = sum(1 for p in fixed if outcomes[id(p)].startswith("fixed by Claude"))
+            parts.append(f"fixed {len(fixed)} problem{'s' * (len(fixed) != 1)} automatically"
+                         + (f" ({by_claude} by Claude)" if by_claude else ""))
+        if handed:
+            parts.append(f"{len(handed)} fix{'es' * (len(handed) != 1)} need{'s' * (len(handed) == 1)} your password: "
+                         + outcomes[id(handed[0])].split(": ", 1)[1].replace(" for it", ""))
+        level = "important" if news or problems else "updates"
+        head = "Updates available" if n else "System needs attention" if problems else "Fixed automatically"
+        body = ", ".join(parts) + "."
+        extra = [p.what.split(":")[0] + "." for p in problems if p.fix == REBOOT]
+        extra += [t for t in todo if "Reboot" in t or "caelestia-patch" in t or "Qt changes" in t]
+        if extra:
+            body += "\n" + extra[0].split("  [")[0]
+    if not n and not problems and not news and new:
+        body = f"Updated {len(new)} package{'s' * (len(new) != 1)} since last check; nothing looks broken."
+    undo_id = repair["id"] if repair and repair["files_changed"] else None
+    return "\n".join(lines) + "\n", level, (head, body, undo_id), new, problems
+
+
+def show():
+    try:
+        print(REPORT.read_text())
+    except OSError:
+        print("No report yet. Run: update-check")
+        return
+    offer_update()
+
+
+def offer_update():
+    if not sys.stdin.isatty():
+        return
+    try:
+        ans = input("Run arch-update now? [y/N] ").strip().lower()
+    except EOFError:
+        return
+    if ans == "y":
+        subprocess.call([str(BIN / "arch-update")])
+        input("\nDone. Press Enter to close.")
+
+
+def locked():
+    _, out, _ = run(["qs", "-c", "caelestia", "ipc", "call", "lock", "isLocked"], timeout=10)
+    return out.strip() == "true"
+
+
+def daily():
+    today = datetime.now().date().isoformat()
+    try:
+        if LAST_RUN.read_text().strip() == today:
+            return
+    except OSError:
+        pass
+    # Woken at 7:00 or straight out of suspend: wait until you've unlocked, so the
+    # notification isn't lost behind the lock screen (give up after 12 hours).
+    deadline = time.time() + 12 * 3600
+    while locked():
+        if time.time() > deadline:
+            return
+        time.sleep(15)
+    time.sleep(10)  # Wi-Fi reconnecting after resume
+    login(delay=0, detach=True)
+
+
+WAITER = CACHE / "waiter.pid"  # the check whose notification is waiting for a click
+
+
+def replace_waiter():
+    """Only the newest notification waits for a click. An older waiter is out of date, and it may never
+    return: its notification is lost if the shell restarts, and its 24 h timeout doesn't count time asleep."""
+    try:
+        old = int(WAITER.read_text())
+        cmdline = Path(f"/proc/{old}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        old, cmdline = None, b""
+    if old and old != os.getpid() and b"update-check" in cmdline:
+        for child in run(["pgrep", "-P", str(old)], timeout=10)[1].split():
+            try:
+                os.kill(int(child), 15)  # its notify-send
+            except (ProcessLookupError, ValueError):
+                pass
+        try:
+            os.kill(old, 15)
+        except ProcessLookupError:
+            pass
+    CACHE.mkdir(parents=True, exist_ok=True)
+    WAITER.write_text(str(os.getpid()))
+
+
+def login(delay=20, detach=False):
+    time.sleep(delay)  # let the shell's notification server and the network come up first
+    report, level, msg, new, problems = build_report(wait=300, autofix=True)
+    CACHE.mkdir(parents=True, exist_ok=True)
+    if level != "offline":
+        LAST_RUN.write_text(datetime.now().date().isoformat() + "\n")
+    REPORT.write_text(report)
+    mark_seen(new)
+    if level == "offline":
+        return
+    all_good(problems)
+    # The notification can sit unanswered all day; under the timer, let a child wait for
+    # the click so the service finishes and tomorrow's 7:00 run isn't blocked.
+    if detach and os.fork() > 0:
+        os._exit(0)
+    head, body, undo_id = msg
+    replace_waiter()
+    cmd = ["notify-send", "-a", "Update check", "-i", "system-software-update", head, body]
+    if level == "ok":
+        subprocess.call(cmd + ["-t", "6000"])
+        return
+    cmd += ["-u", "critical" if level == "important" else "normal",
+            "-A", "details=Show details", "-A", "update=Update now"]
+    if undo_id:
+        cmd += ["-A", "undo=Undo Claude's changes"]
+    _, out, _ = run(cmd, timeout=24 * 3600)
+    if out.strip() == "undo":
+        _, done = smart.undo(undo_id)
+        subprocess.call(["notify-send", "-a", "Update check", "-i", "edit-undo", "Undid Claude's changes",
+                         "\n".join(done[:6])])
+    elif out.strip() in ("details", "update"):
+        subprocess.Popen(["kitty", "--class", "update-check", "-T", "Update check",
+                          "-e", str(BIN / "update-check"), "--show"], start_new_session=True)
+
+
+def history(args):
+    """--history: recent snapshots; --history PATH: that file's versions; --history REV PATH: print one."""
+    if not smart.ensure_repo() or not smart.head():
+        print("No history yet (the first snapshot is taken at the next check or update).")
+        return
+    if not args:
+        _, out = smart.git("log", "--format=%h %cd  %s%d", "--date=format:%a %d %b %H:%M", "-n", "30")
+        print(out.rstrip() or "No snapshots yet.")
+        print("\nOne file's versions: update-check --history ~/.config/hypr/hyprland.lua")
+        return
+    path = os.path.relpath(os.path.abspath(os.path.expanduser(args[-1])), HOME)
+    if len(args) == 1:
+        print(smart.history_log(path).rstrip() or f"No saved versions of ~/{path}.")
+        print(f"\nPrint one: update-check --history REV ~/{path}    Put one back: update-check --restore ~/{path} REV")
+    else:
+        sys.stdout.write(smart.history_show(args[0], path))
+
+
+def restore(args):
+    """--restore PATH [REV]: put a file back as it was in a snapshot (default: the last check that found
+    nothing wrong). The current version is snapshotted first, so this can be undone the same way."""
+    if not args:
+        sys.exit("Which file? update-check --restore ~/.config/hypr/hyprland.lua [REV]")
+    path = os.path.relpath(os.path.abspath(os.path.expanduser(args[0])), HOME)
+    rev = args[1] if len(args) > 1 else "good"
+    if smart.git("cat-file", "-e", f"{rev}:{path}")[0] != 0:
+        sys.exit(f"There's no saved version of ~/{path} at {rev}. Its versions: update-check --history ~/{path}")
+    before = smart.snapshot(f"before restoring {path} from {rev}")
+    smart.git("checkout", rev, "--", path)
+    smart.snapshot(f"restored {path} from {rev}")
+    print(f"Put back ~/{path} as it was at {rev}. The version you had is saved too ({before[:8]}): "
+          f"update-check --restore ~/{path} {before[:8]}")
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "--login":
+        login()
+    elif arg == "--daily":
+        daily()
+    elif arg == "--show":
+        show()
+    elif arg == "--after":
+        flags = sys.argv[2:]
+        after(do_fix="--fix" in flags, ask="--ask" in flags, pause="--pause" in flags)
+    elif arg == "--fix-later":
+        fix_later()
+    elif arg == "--snapshot":
+        smart.snapshot(" ".join(sys.argv[2:]) or "snapshot", tag="before-update" if "update" in " ".join(sys.argv[2:]) else None)
+    elif arg == "--history":
+        history(sys.argv[2:])
+    elif arg == "--restore":
+        restore(sys.argv[2:])
+    elif arg == "--undo":
+        run_id, done = smart.undo(sys.argv[2] if len(sys.argv) > 2 else None)
+        print((f"Fix run {run_id}:\n  " if run_id else "") + "\n  ".join(done))
+    elif arg == "--selftest":
+        config, _ = load_config()
+        custom = {e["package"]: e for e in config.get("custom", []) if isinstance(e, dict) and e.get("package")}
+        problems, tested = selftest(custom)
+        print(tested)
+        print("\n".join(render_problems(problems)))
+        if "--fix" in sys.argv[2:]:
+            fix_here(problems, ask="--ask" in sys.argv[2:])
+    elif arg in ("-h", "--help"):
+        print(__doc__.strip())
+    elif arg == "":
+        print("Checking (repos, AUR, Flatpak, Arch news, system health)…", flush=True)
+        report, _, _, new, problems = build_report(wait=15)
+        CACHE.mkdir(parents=True, exist_ok=True)
+        REPORT.write_text(report)
+        mark_seen(new)
+        print("\n" + report)
+        if any(p.fix and p.fix != REBOOT for p in problems):
+            fix_here(problems)
+        offer_update()
+    else:
+        sys.exit(f"Unknown option {arg} (try: update-check --help)")
+
+
+if __name__ == "__main__":
+    main()

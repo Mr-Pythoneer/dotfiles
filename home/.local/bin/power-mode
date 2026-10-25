@@ -1,0 +1,52 @@
+#!/bin/sh
+# Switches power settings when the charger is plugged in or pulled out.
+#   plugged in   -> "performance" profile, full blur
+#   on battery   -> "balanced" profile, lighter blur, screen dimmed to 60% if it was brighter
+#   battery <=20% -> "power-saver" profile
+#   plugging back in puts the brightness back, unless you turned it up yourself meanwhile
+# (Live wallpapers pause on battery by themselves: see ~/.config/caelestia/patches/wallpaper-live.patch)
+# Only acts when the state changes, so picking a profile by hand sticks until the next change.
+state="$HOME/.local/state/power-mode"
+battery_brightness=60   # % the screen goes down to when you unplug (only if it was brighter)
+mkdir -p "$state"
+
+dim() {
+    cur=$(brightnessctl g) max=$(brightnessctl m)
+    [ -n "$cur" ] && [ -n "$max" ] || return
+    if [ $((cur * 100)) -gt $((max * battery_brightness)) ]; then
+        echo "$cur" > "$state/brightness"
+        brightnessctl -q set "$battery_brightness%"
+        brightnessctl g > "$state/brightness-set"
+    fi
+}
+
+undim() {
+    [ -f "$state/brightness" ] || return
+    sleep 2   # efficiency mode puts its own cap back when the profile changes; let it go first
+    if [ "$(brightnessctl g)" -le "$(cat "$state/brightness-set" 2>/dev/null || echo 0)" ]; then
+        brightnessctl -q set "$(cat "$state/brightness")"
+    fi
+    rm -f "$state/brightness" "$state/brightness-set"
+}
+
+update() {
+    if [ "$(cat /sys/class/power_supply/AC/online)" = 1 ]; then
+        mode=ac
+    elif [ "$(cat /sys/class/power_supply/BAT0/capacity)" -le 20 ]; then
+        mode=low
+    else
+        mode=battery
+    fi
+    [ "$mode" = "$last" ] && return
+    last=$mode
+    case $mode in
+        ac)      profile=performance; passes=3 ;;
+        battery) profile=balanced;    passes=2 ;;
+        low)     profile=power-saver; passes=1 ;;
+    esac
+    powerprofilesctl set "$profile"
+    hyprctl eval "hl.config({ decoration = { blur = { passes = $passes } } })" >/dev/null
+    if [ "$mode" = ac ]; then undim; else dim; fi
+}
+update
+udevadm monitor --udev --subsystem-match=power_supply | grep --line-buffered ' change ' | while read -r _; do update; done

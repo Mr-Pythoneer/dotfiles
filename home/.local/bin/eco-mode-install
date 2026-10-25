@@ -1,0 +1,75 @@
+#!/bin/sh
+# eco-mode-install — run once with sudo: sudo ~/.local/bin/eco-mode-install   (undo: --undo)
+# Installs the root-only half of efficiency mode (see ~/.local/bin/eco-mode):
+#   /usr/local/bin/eco-root on|off   turbo off, GPU allowed down to its lowest clock and capped,
+#                                     your apps kept on the 4 low-power cores (the big cores can sleep)
+#   /etc/sudoers.d/eco-mode          lets your user run exactly "eco-root on" / "eco-root off" without a password
+set -eu
+[ "$(id -u)" = 0 ] || { echo "run it with sudo: sudo $0" >&2; exit 1; }
+user=${SUDO_USER:-}
+[ -n "$user" ] && [ "$user" != root ] || { echo "run it with sudo from your own account" >&2; exit 1; }
+
+if [ "${1:-}" = --undo ]; then
+    [ -x /usr/local/bin/eco-root ] && /usr/local/bin/eco-root off || true
+    rm -f /etc/sudoers.d/eco-mode /usr/local/bin/eco-root
+    echo "Removed the efficiency-mode helper."
+    exit 0
+fi
+
+tmp=$(mktemp)
+cat > "$tmp" <<'EOF'
+#!/bin/sh
+# eco-root on|off — the root-only part of efficiency mode, run by ~/.local/bin/eco-mode through sudo
+# (no password, see /etc/sudoers.d/eco-mode). Installed by ~/.local/bin/eco-mode-install (--undo removes it).
+#   on:  turbo boost off; GPU may drop to its lowest clock (it never went below 800 MHz) and tops out at 1100 MHz;
+#        everything in your session (user.slice) runs on the low-power cores, so the big ones can power down
+#   off: back to the defaults
+set -u
+pstate=/sys/devices/system/cpu/intel_pstate/no_turbo
+gt=$(ls -d /sys/class/drm/card*/device/tile0/gt0/freq0 2>/dev/null | head -n1)
+small=$(cat /sys/devices/cpu_atom/cpus 2>/dev/null)
+case "${1:-}" in
+on)
+    [ -w "$pstate" ] && echo 1 > "$pstate"
+    if [ -n "$gt" ]; then
+        cat "$gt/rpn_freq" > "$gt/min_freq"
+        echo 1100 > "$gt/max_freq"
+    fi
+    [ -n "$small" ] && systemctl set-property --runtime user.slice "AllowedCPUs=$small"
+    ;;
+off)
+    [ -w "$pstate" ] && echo 0 > "$pstate"
+    if [ -n "$gt" ]; then
+        cat "$gt/rp0_freq" > "$gt/max_freq"
+        cat "$gt/rpe_freq" > "$gt/min_freq"
+    fi
+    systemctl set-property --runtime user.slice "AllowedCPUs="
+    # Dropping the limit doesn't give the programs that ran meanwhile their CPUs back: they (and everything
+    # they start, systemd --user included) would stay on the low-power cores. So hand every process in
+    # your session all CPUs again. Only root can do this for systemd --user (it holds a capability).
+    all=$(cat /sys/devices/system/cpu/online)
+    find /sys/fs/cgroup/user.slice -name cgroup.procs -exec cat {} + 2>/dev/null | while read -r pid; do
+        taskset -a -cp "$all" "$pid" >/dev/null 2>&1
+    done
+    ;;
+*)
+    echo "usage: eco-root on|off" >&2
+    exit 2
+    ;;
+esac
+exit 0
+EOF
+install -o root -g root -m 755 "$tmp" /usr/local/bin/eco-root
+rm -f "$tmp"
+
+rule=$(mktemp)
+printf '%s ALL=(root) NOPASSWD: /usr/local/bin/eco-root on, /usr/local/bin/eco-root off\n' "$user" > "$rule"
+if visudo -cf "$rule" >/dev/null; then
+    install -o root -g root -m 440 "$rule" /etc/sudoers.d/eco-mode
+else
+    rm -f "$rule"
+    echo "the sudoers rule didn't validate, nothing installed for it" >&2
+    exit 1
+fi
+rm -f "$rule"
+echo "Installed. Efficiency mode can now also limit the CPU and GPU."

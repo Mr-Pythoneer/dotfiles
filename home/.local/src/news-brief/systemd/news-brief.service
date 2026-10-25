@@ -1,0 +1,10 @@
+[Unit]
+Description=News brief: tech & politics summary as a notification (7:30 and 20:30)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/news-brief --scheduled
+# the notification-click waiter is forked off and must outlive the service
+KillMode=process
+TimeoutStartSec=infinity

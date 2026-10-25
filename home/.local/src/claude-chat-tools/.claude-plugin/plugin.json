@@ -1,0 +1,6 @@
+{
+  "name": "chat-tools",
+  "version": "0.1.0",
+  "description": "/chats, /open, /pin and /delete for Claude Code chats: a numbered list with pinned chats on top, and deleting a chat to the trash",
+  "license": "MIT"
+}

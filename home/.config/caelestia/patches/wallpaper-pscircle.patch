@@ -1,0 +1,87 @@
+--- a/modules/background/Wallpaper.qml
++++ b/modules/background/Wallpaper.qml
+@@ -2,6 +2,8 @@
+ 
+ import QtQuick
+ import QtMultimedia
++import Quickshell
++import Quickshell.Io
+ import Quickshell.Services.UPower
+ import Caelestia.Config
+ import Caelestia.I18n
+@@ -173,6 +175,75 @@
+                     }
+                 }
+             }
++
++            // A wallpaper named "name.pscircle.png" is a live process tree: ~/.local/bin/pscircle-wall redraws it
++            // every 30 s on AC power and every 2 minutes on battery (not in efficiency mode), over the still.
++            // The drawings go to $XDG_RUNTIME_DIR/pscircle, two per screen used in turn, and skip the image
++            // cache (it keeps a copy of every distinct image, so each redraw would add one).
++            readonly property bool treeLive: /\.pscircle\.png$/i.test(path) && root.current === img
++
++            Loader {
++                anchors.fill: parent
++                active: img.treeLive
++
++                sourceComponent: Item {
++                    id: tree
++
++                    readonly property QsWindow win: QsWindow.window as QsWindow
++                    readonly property int w: Math.round(width * (win?.devicePixelRatio ?? 1))
++                    readonly property int h: Math.round(height * (win?.devicePixelRatio ?? 1))
++                    readonly property string stem: `${Quickshell.env("XDG_RUNTIME_DIR")}/pscircle/${win?.screen?.name ?? "screen"}`
++                    readonly property int every: PowerProfiles.profile === PowerProfile.PowerSaver ? 0 : UPower.onBattery ? 120 : 30
++                    property int drawn: 0
++                    property Image shown
++
++                    Process {
++                        id: draw
++
++                        command: [Quickshell.env("HOME") + "/.local/bin/pscircle-wall", `${tree.stem}-${(tree.drawn + 1) % 2}.png`, String(tree.w), String(tree.h)]
++                        onExited: code => {
++                            if (code !== 0)
++                                return;
++                            tree.drawn++;
++                            // a new URL each time, so the file is read again
++                            (tree.shown === drawingA ? drawingB : drawingA).source = `file://${tree.stem}-${tree.drawn % 2}.png?${tree.drawn}`;
++                        }
++                    }
++
++                    Timer {
++                        interval: Math.max(1, tree.every) * 1000
++                        running: tree.every > 0 && tree.w > 0 && tree.h > 0
++                        repeat: true
++                        triggeredOnStart: true
++                        onTriggered: if (!draw.running) draw.running = true
++                    }
++
++                    // swap only once a new drawing has fully loaded, so there's never a blank frame
++                    Image {
++                        id: drawingA
++
++                        anchors.fill: parent
++                        asynchronous: true
++                        cache: false
++                        fillMode: Image.PreserveAspectCrop
++                        sourceSize: Qt.size(tree.w, tree.h)
++                        visible: tree.shown === drawingA
++                        onStatusChanged: if (status === Image.Ready) tree.shown = drawingA
++                    }
++
++                    Image {
++                        id: drawingB
++
++                        anchors.fill: parent
++                        asynchronous: true
++                        cache: false
++                        fillMode: Image.PreserveAspectCrop
++                        sourceSize: Qt.size(tree.w, tree.h)
++                        visible: tree.shown === drawingB
++                        onStatusChanged: if (status === Image.Ready) tree.shown = drawingB
++                    }
++                }
++            }
+         }
+     }
+ }

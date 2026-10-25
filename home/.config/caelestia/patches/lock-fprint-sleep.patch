@@ -1,0 +1,142 @@
+Lock screen fingerprint vs suspend: suspending while the lock screen scans cancels the
+scan ("Cannot run while suspended"), which showed a red "FP ERROR:" (always with an empty
+message) and could leave the reader dead until the next lock. Now the scan is paused on
+PrepareForSleep and restarted 1.5s after resume, one-off errors retry silently, retries
+never give up for good, and a reader that keeps failing gets a readable message. After
+five errors in a row it retries every 35s rather than 5s: fprintd can be left unable to
+reopen the reader after such a sleep, and it only restarts once it has had 30s without
+requests (the root fix is fprint-sleep-install).
+--- a/modules/lock/center/StateMessage.qml
++++ b/modules/lock/center/StateMessage.qml
+@@ -15,7 +15,8 @@
+     readonly property string msg: {
+         // Errors
+         if (pam.fprint.state === Pam.Error)
+-            return Tr.tr("FP ERROR: %1").arg(pam.fprint.message);
++            // PamContext clears its message before reporting the result, so there is no detail to show
++            return Tr.tr("Fingerprint reader isn't responding. Use your password.");
+         if (pam.howdy.state === Pam.Error)
+             return Tr.tr("FACE ERROR: %1").arg(pam.howdy.message);
+         if (pam.state === Pam.Error)
+--- a/modules/lock/Pam.qml
++++ b/modules/lock/Pam.qml
+@@ -27,6 +27,10 @@
+     property string lockMessage
+     property int state
+     property string buffer
++    // True between logind's PrepareForSleep(true) and the resume after it.
++    // Suspend cancels a running fingerprint scan ("Cannot run while suspended"),
++    // which is not a reader error, so results that arrive in this window are ignored.
++    property bool sleeping
+ 
+     signal flashMsg
+ 
+@@ -143,7 +147,16 @@
+     }
+ 
+     Connections {
++        function onAboutToSleep(): void {
++            root.sleeping = true;
++            fprintResume.stop();
++            fprint.pause();
++        }
++
+         function onResumed(): void {
++            root.sleeping = false;
++            // Give fprintd a moment to resume the reader before scanning again
++            fprintResume.restart();
+             if (howdy.canAttempt && !howdy.active && GlobalConfig.lock.triggerHowdyOnWake)
+                 howdy.start();
+         }
+@@ -151,6 +164,13 @@
+         target: SessionManager
+     }
+ 
++    Timer {
++        id: fprintResume
++
++        interval: 1500
++        onTriggered: root.restartFprint()
++    }
++
+     Connections {
+         function onSecureChanged(): void {
+             if (root.lock.secure) {
+@@ -222,6 +242,17 @@
+             tries = 0;
+             errorTries = 0;
+             state = Pam.None;
++            errorRetry.stop();
++        }
++
++        // Stop scanning quietly (no error shown, no retries) until restarted
++        function pause(): void {
++            errorRetry.stop();
++            stateReset.stop();
++            errorTries = 0;
++            if (state !== Pam.MaxTries)
++                state = Pam.None;
++            pam.abort();
+         }
+ 
+         PamContext {
+@@ -230,21 +261,30 @@
+             configDirectory: Quickshell.shellPath("assets/pam.d")
+ 
+             onCompleted: res => {
+-                if (!ctx.available)
++                if (!ctx.available || root.sleeping)
+                     return;
+ 
+                 if (res === PamResult.Success)
+                     return root.lock.unlock();
+ 
++                // One-off errors (reader busy or waking up) are retried quietly;
++                // only a reader that keeps failing gets a message. Never give up
++                // for good: after a few fast retries, keep trying every 35s. A sleep
++                // during a scan can leave fprintd unable to reopen the reader until it
++                // restarts, and it only exits after 30s without requests, so a slower
++                // retry lets it come back fresh.
++                if (res === PamResult.Error && ++ctx.errorTries < 3) {
++                    errorRetry.interval = 800;
++                    errorRetry.restart();
++                    return;
++                }
++
+                 root.clearTransientState();
+ 
+                 if (res === PamResult.Error) {
+                     ctx.state = Pam.Error;
+-                    ctx.errorTries++;
+-                    if (ctx.errorTries < 5) {
+-                        abort();
+-                        errorRetry.restart();
+-                    }
++                    errorRetry.interval = ctx.errorTries < 5 ? 800 : 35000;
++                    errorRetry.restart();
+                 } else if (res === PamResult.MaxTries || res === PamResult.Failed) {
+                     ctx.tries++;
+                     if (ctx.tries < ctx.maxTries) {
+@@ -266,7 +306,10 @@
+             id: errorRetry
+ 
+             interval: 800
+-            onTriggered: pam.start()
++            onTriggered: {
++                if (ctx.canAttempt)
++                    pam.start();
++            }
+         }
+ 
+         Timer {
+@@ -276,7 +319,9 @@
+             onTriggered: {
+                 if (ctx.state !== Pam.MaxTries)
+                     ctx.state = Pam.None;
+-                ctx.errorTries = 0;
++                // Keep counting while the reader is still erroring so the retry backs off
++                if (!errorRetry.running)
++                    ctx.errorTries = 0;
+             }
+         }
+ 

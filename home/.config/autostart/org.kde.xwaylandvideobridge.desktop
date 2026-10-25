@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=org.kde.xwaylandvideobridge
+# Hyprland already starts this (~/.config/hypr/hyprland.lua / login-later); hidden so it does not start twice
+Hidden=true

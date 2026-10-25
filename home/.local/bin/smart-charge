@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Optimized battery charging, like macOS.
+
+Learns when you usually unplug the charger, holds the battery at 80% while
+plugged in, and tops up to 100% just before you normally unplug.
+
+    smart-charge daemon    run the learner (autostarted from hyprland.lua)
+    smart-charge full      charge to 100% now (until the charger is unplugged)
+    smart-charge auto      back to optimized charging
+    smart-charge limit     always stop at 80%
+    smart-charge toggle    full <-> auto (used by the bar)
+    smart-charge status    print the current status
+
+The battery thresholds and RTC wake alarm are root-only, so the daemon writes
+what it wants to $STATE/request and a root systemd path unit applies it
+(installed by `sudo smart-charge-install`).
+"""
+import json
+import os
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+BAT = Path("/sys/class/power_supply/BAT0")
+AC = Path("/sys/class/power_supply/AC/online")
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "smart-charge"
+HOLD = 80              # limit while optimizing
+TICK = 15              # seconds; short so we react quickly after resume
+MIN_SESSION = 3 * 60   # shorter plug-ins aren't worth learning from
+HISTORY_DAYS = 35
+WINDOW_MIN = 120       # sessions started within +-2h of now's plug-in time are "similar"
+MIN_SIMILAR = 3
+PERCENTILE = 0.3       # predict on the early side so it's full in time
+
+
+def read(path, default=""):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+def write_atomic(path, text):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def load_json(name, default):
+    try:
+        return json.loads((STATE / name).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def get_mode():
+    m = read(STATE / "mode", "auto")
+    return m if m in ("auto", "full", "limit") else "auto"
+
+
+def minute_of_day(ts):
+    d = datetime.fromtimestamp(ts)
+    return d.hour * 60 + d.minute
+
+
+def is_weekend(ts):
+    return datetime.fromtimestamp(ts).weekday() >= 5
+
+
+def predict_unplug(now, plug_ts, sessions):
+    """Expected unplug time for the current session, or None if not confident."""
+    elapsed = now - plug_ts
+    tod = minute_of_day(plug_ts)
+    recent = [s for s in sessions if now - s[1] <= HISTORY_DAYS * 86400]
+
+    def similar(split_weekend):
+        out = []
+        for p, u, *_ in recent:
+            diff = abs(minute_of_day(p) - tod)
+            if min(diff, 1440 - diff) > WINDOW_MIN:
+                continue
+            if split_weekend and is_weekend(p) != is_weekend(plug_ts):
+                continue
+            if u - p > elapsed:  # only sessions that lasted at least this long
+                out.append(u - p)
+        return out
+
+    durs = similar(True)
+    if len(durs) < MIN_SIMILAR:
+        durs = similar(False)
+    if len(durs) < MIN_SIMILAR:
+        return None
+    durs.sort()
+    return plug_ts + durs[int(PERCENTILE * (len(durs) - 1))]
+
+
+def topup_lead():
+    """Seconds needed to go from now to 100%, with margin for the slow end."""
+    full = int(read(BAT / "energy_full", "57000000"))
+    now_e = int(read(BAT / "energy_now", "0"))
+    power = int(read(BAT / "power_now", "0"))
+    if read(BAT / "status") != "Charging" or power < 5_000_000:
+        power = 40_000_000
+    need = max(full - min(now_e, int(full * HOLD / 100)), 0)
+    return max(need / power * 3600 * 1.6 + 20 * 60, 45 * 60)
+
+
+def fmt_time(ts):
+    return datetime.fromtimestamp(ts).strftime("%-H:%M")
+
+
+class Daemon:
+    def __init__(self):
+        STATE.mkdir(parents=True, exist_ok=True)
+        self.sessions = load_json("sessions.json", [])
+        cur = load_json("current.json", {})
+        self.ac = read(AC) == "1"
+        now = time.time()
+        # Keep the plug-in time across restarts/reboots while still plugged in.
+        if self.ac and cur.get("plug") and now - cur.get("seen", 0) < 12 * 3600:
+            self.plug_ts = cur["plug"]
+        else:
+            self.plug_ts = now if self.ac else None
+        self.last_tick = now
+        self.requested = None
+        self.mismatch_since = None
+
+    def save_current(self, now):
+        write_atomic(STATE / "current.json", json.dumps({"plug": self.plug_ts, "seen": now}))
+
+    def on_unplug(self, now, uncertain):
+        if self.plug_ts and now - self.plug_ts >= MIN_SESSION:
+            self.sessions.append([round(self.plug_ts), round(now), uncertain])
+            cutoff = now - 90 * 86400
+            self.sessions = [s for s in self.sessions if s[1] >= cutoff]
+            write_atomic(STATE / "sessions.json", json.dumps(self.sessions))
+        self.plug_ts = None
+        if get_mode() == "full":  # "charge to full now" lasts until unplug, like macOS
+            write_atomic(STATE / "mode", "auto")
+
+    def tick(self):
+        now = time.time()
+        slept = now - self.last_tick > TICK * 4
+        self.last_tick = now
+        ac = read(AC) == "1"
+        if ac and not self.ac:
+            self.plug_ts = now
+        elif self.ac and not ac:
+            # If we were suspended we only know it happened before now.
+            self.on_unplug(now, slept)
+        self.ac = ac
+        self.save_current(now)
+
+        mode = get_mode()
+        pred = wake = None
+        if mode == "full":
+            limit = 100
+        elif mode == "limit" or not ac:
+            limit = HOLD
+        else:
+            pred = predict_unplug(now, self.plug_ts, self.sessions)
+            start = pred - topup_lead() if pred else None
+            if start and now >= start:
+                limit = 100
+            else:
+                limit = HOLD
+                if start:
+                    wake = int(start) // 300 * 300  # wake from suspend to start the top-up
+
+        self.request(limit, wake)
+        self.write_status(now, mode, ac, limit, pred)
+
+    def request(self, limit, wake):
+        req = f"limit={limit}\nwake={wake or 0}\n"
+        if req != self.requested:
+            write_atomic(STATE / "request", req)
+            self.requested = req
+
+    def write_status(self, now, mode, ac, limit, pred):
+        actual = read(BAT / "charge_control_end_threshold")
+        if actual != str(limit):
+            self.mismatch_since = self.mismatch_since or now
+        else:
+            self.mismatch_since = None
+        ready = not (self.mismatch_since and now - self.mismatch_since > 20)
+
+        n = len(self.sessions)
+        if not ready:
+            summary = "Charge limit not set up (run: sudo smart-charge-install)"
+        elif mode == "full":
+            summary = "Charging to 100% until unplugged"
+        elif mode == "limit":
+            summary = f"Always stopping at {HOLD}%"
+        elif not ac:
+            summary = (f"Optimized charging · learned from {n} charge{'s' * (n != 1)}"
+                       if n else "Optimized charging · learning your routine")
+        elif limit == 100:
+            summary = f"Topping up to 100% · you usually unplug ~{fmt_time(pred)}"
+        elif pred:
+            summary = f"Holding at {HOLD}% · full by ~{fmt_time(pred)}"
+        else:
+            summary = f"Holding at {HOLD}% · still learning your routine"
+
+        status = {"mode": mode, "ac": ac, "limit": limit, "ready": ready,
+                  "predicted_unplug": pred, "sessions": n, "summary": summary}
+        text = json.dumps(status)
+        if text != read(STATE / "status.json"):
+            write_atomic(STATE / "status.json", text)
+
+    def run(self):
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        write_atomic(STATE / "pid", str(os.getpid()))
+        while True:
+            self.tick()
+            signal.sigtimedwait({signal.SIGUSR1}, TICK)
+
+
+def poke():
+    try:
+        os.kill(int(read(STATE / "pid", "0")), signal.SIGUSR1)
+    except (ValueError, OSError):
+        pass
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "daemon":
+        Daemon().run()
+    elif cmd in ("full", "auto", "limit", "toggle"):
+        STATE.mkdir(parents=True, exist_ok=True)
+        if cmd == "toggle":
+            cmd = "auto" if get_mode() == "full" else "full"
+        write_atomic(STATE / "mode", cmd)
+        poke()
+    elif cmd == "status":
+        st = load_json("status.json", None)
+        print(st["summary"] if st else "smart-charge daemon is not running")
+    else:
+        print(__doc__.strip())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

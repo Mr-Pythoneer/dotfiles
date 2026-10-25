@@ -1,0 +1,71 @@
+# Example ~/.config/boardroom/company.toml
+# `boardroom setup` and `boardroom org auto` write this file for you; edit it to fine-tune.
+# A project folder can have its own boardroom.toml with the same keys; it wins over this file.
+
+name = "Penguin Labs"
+autonomy = "full"        # full | ask | no-shell
+max_steps = 80           # tool uses per task before an agent must report back
+max_depth = 2            # how deep subagents can nest
+max_subagents = 4        # subagents per request
+token_budget = 0         # stop a run after this many tokens (0 = no limit)
+sandbox = "auto"         # auto | bwrap | off  (shell commands of API members)
+
+# Your own role. Hire for it with: boardroom hire designer claude:sonnet
+[roles.designer]
+description = "Makes the user interface look good and work well on phones."
+prompt = "Follow the existing style. Test every page at 375px width."
+
+# Correct Boardroom's guess about a model (tier: frontier | strong | fast; score 0-100).
+[models."gpt-6-luna"]
+tier = "strong"
+score = 84
+
+[[member]]
+id = "ceo"
+role = "ceo"
+model = "claude:opus"               # account:model
+subagent_model = "claude:haiku"
+
+[[member]]
+id = "debugger"
+role = "debugger"
+model = "chatgpt:gpt-6.1-sol"
+
+[[member]]
+id = "worker-1"
+role = "worker"
+model = "claude:sonnet"
+subagent_model = "claude:haiku"
+
+[[member]]
+id = "worker-2"
+role = "worker"
+model = "deepseek:deepseek-v4-pro"
+
+[[member]]
+id = "designer-1"
+role = "designer"
+model = "claude:sonnet"
+
+
+# Example ~/.config/boardroom/accounts.toml (written by `boardroom connect`):
+#
+# [accounts.claude]
+# kind = "claude-code"
+# models = ["opus", "sonnet", "haiku"]
+# max_parallel = 4                     # how many members may use this account at once
+#
+# [accounts.chatgpt]
+# kind = "codex"
+# models = ["gpt-6.1-sol", "gpt-6-luna"]
+#
+# [accounts.deepseek]
+# kind = "openai-compat"
+# preset = "deepseek"
+# key_env = "DEEPSEEK_API_KEY"         # or: key = "sk-..."
+# models = ["deepseek-v4-pro", "deepseek-flash"]
+#
+# [accounts.local]
+# kind = "openai-compat"
+# preset = "ollama"
+# models = ["qwen3-coder:30b"]

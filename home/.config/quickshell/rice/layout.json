@@ -1,0 +1,180 @@
+{
+ "position": "bottom",
+ "style": "edge",
+ "height": "normal",
+ "spacing": "normal",
+ "zones": {
+  "center": [
+   {
+    "id": "sysstats",
+    "key": "sysstats-center",
+    "name": "CPU, GPU and RAM",
+    "opens": "hover",
+    "children": [
+     {
+      "id": "pop-sysstats",
+      "key": "sysstats-pop",
+      "name": "System stats"
+     }
+    ]
+   }
+  ],
+  "left": [
+   {
+    "id": "logo",
+    "key": "mv4gzsez-p",
+    "name": "Arch logo"
+   },
+   {
+    "id": "workspaces-icons",
+    "key": "mv4h0zu3-r",
+    "name": "Workspaces \u00b7 app icons"
+   },
+   {
+    "children": [
+     {
+      "id": "now-playing",
+      "key": "mv4i1krg-u",
+      "name": "Now playing"
+     },
+     {
+      "id": "media-controls",
+      "key": "mv4i1s11-v",
+      "name": "Media controls"
+     },
+     {
+      "id": "volume-slider",
+      "key": "mv4i3y9g-10",
+      "name": "Volume slider"
+     },
+     {
+      "id": "audio-output",
+      "key": "mv4i442b-11",
+      "name": "Audio output"
+     }
+    ],
+    "id": "visualiser",
+    "key": "mv4h4ah3-x",
+    "name": "Mini visualiser",
+    "opens": "hover"
+   },
+   {
+    "children": [
+     {
+      "id": "lock-keys",
+      "key": "mv4i6220-19",
+      "name": "Caps / Num Lock"
+     }
+    ],
+    "id": "kb-layout",
+    "key": "mv4i3aft-x",
+    "name": "Keyboard / input method",
+    "opens": "hover"
+   },
+   {
+    "id": "todo",
+    "key": "mv4i9244-1e",
+    "name": "To-do count"
+   }
+  ],
+  "right": [
+   {
+    "id": "spun",
+    "key": "mv4i4a6p-12",
+    "name": "Spun deck"
+   },
+   {
+    "children": [
+     {
+      "id": "date",
+      "key": "mv4h2ezi-w",
+      "name": "Date"
+     },
+     {
+      "id": "uptime",
+      "key": "mv4i3p56-y",
+      "name": "Uptime"
+     },
+     {
+      "id": "timer",
+      "key": "mv4i3sfz-z",
+      "name": "Timer / stopwatch"
+     },
+     {
+      "id": "pop-calendar",
+      "key": "mv4i87ok-1c",
+      "name": "Month calendar"
+     }
+    ],
+    "id": "clock-seconds",
+    "key": "mv4h2asj-v",
+    "name": "Clock with seconds",
+    "opens": "hover"
+   },
+   {
+    "children": [
+     {
+      "id": "pop-bt-list",
+      "key": "mv4i7yy1-1a",
+      "name": "Bluetooth devices"
+     }
+    ],
+    "id": "bluetooth",
+    "key": "mv4i4z8x-13",
+    "name": "Bluetooth",
+    "opens": "hover"
+   },
+   {
+    "children": [
+     {
+      "id": "airplane",
+      "key": "mv4i55a0-14",
+      "name": "Airplane mode"
+     },
+     {
+      "id": "vpn",
+      "key": "mv4i57ux-15",
+      "name": "VPN"
+     },
+     {
+      "id": "pop-wifi-list",
+      "key": "mv4i82b4-1b",
+      "name": "Wi-Fi networks"
+     }
+    ],
+    "id": "network",
+    "key": "mv4i2mao-w",
+    "name": "Wi-Fi / network",
+    "opens": "hover"
+   },
+   {
+    "children": [
+     {
+      "id": "pop-battery-time",
+      "key": "stk1-a",
+      "name": "Battery time & health"
+     },
+     {
+      "id": "pop-profiles",
+      "key": "stk1-b",
+      "name": "Power profile buttons"
+     },
+     {
+      "id": "pop-smart-charge",
+      "key": "stk1-c",
+      "name": "Smart charge"
+     }
+    ],
+    "id": "battery",
+    "key": "mv4h9lj2-y",
+    "name": "Battery",
+    "opens": "hover"
+   },
+   {
+    "id": "power-btn",
+    "key": "mv4i9hwr-1g",
+    "name": "Power menu"
+   }
+  ]
+ }
+}

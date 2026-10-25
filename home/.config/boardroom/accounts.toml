@@ -1,0 +1,4 @@
+
+[accounts.claude]
+kind = "claude-code"
+models = ["opus", "sonnet", "haiku"]

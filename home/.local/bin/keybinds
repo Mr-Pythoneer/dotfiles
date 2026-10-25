@@ -1,0 +1,1235 @@
+#!/usr/bin/env python3
+"""Keybinds: make your own keyboard shortcuts for Hyprland.
+
+A shortcut runs one or more steps, top to bottom: open an app (or switch to it), run a command, open a
+website/file/folder, type text, press keys, a window or workspace action, a desktop action, or wait.
+They're kept in ~/.config/hypr/keybinds.json and written out as ~/.config/hypr/keybinds.lua, which
+hyprland.lua loads last, so a shortcut can also replace a built-in one (hl.unbind). Hyprland reloads on
+save. Shortcuts with several steps, or that open apps, type or press keys, run through
+~/.local/bin/keybind-run; single commands and window actions are bound directly.
+
+Recording keys: while you press a shortcut, Hyprland is switched to the empty submap "keybinds-capture"
+(defined in keybinds.lua), so keys that already do something reach this window instead. Escape, 15
+seconds, or leaving the window switches back.
+
+Testing: KEYBINDS_DIR=<dir> writes the json/lua there and skips the reload; KEYBINDS_SHOT=<png> renders
+the window (KEYBINDS_SHOT_EDIT=<index|new>, KEYBINDS_SHOT_STEP=<kind>) and quits.
+"""
+import copy
+import json
+import os
+import re
+import shlex
+import subprocess
+import tempfile
+import uuid
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+
+APP_ID = "dev.mrpythoneer.keybinds"
+TESTING = "KEYBINDS_DIR" in os.environ
+HYPR = os.path.expanduser(os.environ.get("KEYBINDS_DIR", "~/.config/hypr"))
+DATA = os.path.join(HYPR, "keybinds.json")
+LUA = os.path.join(HYPR, "keybinds.lua")
+MAIN = os.path.expanduser("~/.config/hypr/hyprland.lua")
+CONFIGS = [MAIN, os.path.expanduser("~/.config/hypr/plugins.lua")]
+SUBMAP = "keybinds-capture"
+MODS = ["SUPER", "CTRL", "ALT", "SHIFT"]
+MODMASK = {"SHIFT": 1, "CTRL": 4, "ALT": 8, "SUPER": 64}
+MASK = {"SUPER": Gdk.ModifierType.SUPER_MASK, "CTRL": Gdk.ModifierType.CONTROL_MASK,
+        "ALT": Gdk.ModifierType.ALT_MASK, "SHIFT": Gdk.ModifierType.SHIFT_MASK}
+ALIASES = {"CONTROL": "CTRL", "MOD4": "SUPER", "WIN": "SUPER", "LOGO": "SUPER", "MOD1": "ALT"}
+MODIFIER_KEYS = {"Super_L", "Super_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Shift_L", "Shift_R",
+                 "Meta_L", "Meta_R", "Hyper_L", "Hyper_R", "ISO_Level3_Shift", "Caps_Lock", "Num_Lock"}
+
+MOD_LABEL = {"SUPER": "Super", "CTRL": "Ctrl", "ALT": "Alt", "SHIFT": "Shift"}
+KEY_LABEL = {
+    "return": "Enter", "space": "Space", "escape": "Esc", "backspace": "Backspace", "tab": "Tab",
+    "delete": "Delete", "insert": "Insert", "home": "Home", "end": "End", "prior": "Page Up",
+    "page_up": "Page Up", "next": "Page Down", "page_down": "Page Down", "print": "Print Screen",
+    "left": "←", "right": "→", "up": "↑", "down": "↓", "minus": "-", "equal": "=",
+    "bracketleft": "[", "bracketright": "]", "backslash": "\\", "semicolon": ";", "apostrophe": "'",
+    "grave": "`", "comma": ",", "period": ".", "slash": "/",
+    "mouse:272": "Left click", "mouse:273": "Right click", "mouse:274": "Middle click",
+    "mouse:275": "Mouse back", "mouse:276": "Mouse forward", "mouse_up": "Scroll up",
+    "mouse_down": "Scroll down", "mouse_left": "Wheel left", "mouse_right": "Wheel right",
+    "xf86audioplay": "Play", "xf86audiopause": "Pause", "xf86audionext": "Next track",
+    "xf86audioprev": "Previous track", "xf86audioraisevolume": "Volume up",
+    "xf86audiolowervolume": "Volume down", "xf86audiomute": "Mute", "xf86audiomicmute": "Mic mute",
+    "xf86monbrightnessup": "Brightness up", "xf86monbrightnessdown": "Brightness down",
+    "xf86display": "Display key", "xf86rfkill": "Airplane key", "xf86wlan": "Wi-Fi key",
+    "xf86selectivescreenshot": "Snip key", "xf86assistant": "Copilot key",
+}
+MOUSE_BUTTONS = {2: "mouse:274", 8: "mouse:275", 9: "mouse:276"}
+NUMPAD_OFF = ["kp_end", "kp_down", "kp_next", "kp_left", "kp_begin", "kp_right", "kp_home", "kp_up",
+              "kp_prior", "kp_insert"]
+
+# what a step can be: kind -> (name, icon, what the add-step menu says)
+STEP_TYPES = {
+    "app": ("Open an app", "view-app-grid-symbolic", "Opens it, or switches to it if it's open"),
+    "command": ("Run a command", "utilities-terminal-symbolic", "Anything you'd type in a terminal"),
+    "link": ("Open a website, file or folder", "web-browser-symbolic", "In the app that normally opens it"),
+    "text": ("Type text", "insert-text-symbolic", "Into the window in front"),
+    "keys": ("Press keys", "input-keyboard-symbolic", "Send a shortcut to the window in front"),
+    "hypr": ("Window or workspace", "view-grid-symbolic", "Close, fullscreen, move, switch workspace…"),
+    "system": ("Desktop action", "emblem-system-symbolic", "Lock, screenshot, volume, panels…"),
+    "wait": ("Wait", "preferences-system-time-symbolic", "Pause before the next step"),
+}
+
+# window / workspace actions: id, label, Lua dispatcher (%d = workspace number)
+HYPR_ACTIONS = [
+    ("close", "Close the window", 'hl.dsp.window.close()'),
+    ("kill", "Force-quit the window", 'hl.dsp.window.kill()'),
+    ("fullscreen", "Fullscreen", 'hl.dsp.window.fullscreen({ mode = "fullscreen" })'),
+    ("maximize", "Maximize", 'hl.dsp.window.fullscreen({ mode = "maximized" })'),
+    ("float", "Float / tile the window", 'hl.dsp.window.float({ action = "toggle" })'),
+    ("pin", "Pin the window to every workspace", 'hl.dsp.window.pin()'),
+    ("center", "Center the window", 'hl.dsp.window.center()'),
+    ("split", "Flip the split direction", 'hl.dsp.layout("togglesplit")'),
+    ("focus-left", "Focus the window on the left", 'hl.dsp.focus({ direction = "left" })'),
+    ("focus-right", "Focus the window on the right", 'hl.dsp.focus({ direction = "right" })'),
+    ("focus-up", "Focus the window above", 'hl.dsp.focus({ direction = "up" })'),
+    ("focus-down", "Focus the window below", 'hl.dsp.focus({ direction = "down" })'),
+    ("move-left", "Move the window left", 'hl.dsp.window.move({ direction = "left" })'),
+    ("move-right", "Move the window right", 'hl.dsp.window.move({ direction = "right" })'),
+    ("move-up", "Move the window up", 'hl.dsp.window.move({ direction = "up" })'),
+    ("move-down", "Move the window down", 'hl.dsp.window.move({ direction = "down" })'),
+    ("ws-go", "Go to workspace…", 'hl.dsp.focus({ workspace = %d })'),
+    ("ws-move", "Move the window to workspace…", 'hl.dsp.window.move({ workspace = %d })'),
+    ("ws-next", "Next workspace", 'hl.dsp.focus({ workspace = "r+1" })'),
+    ("ws-prev", "Previous workspace", 'hl.dsp.focus({ workspace = "r-1" })'),
+    ("scratch", "Show / hide the scratchpad", 'hl.dsp.workspace.toggle_special("magic")'),
+    ("to-scratch", "Move the window to the scratchpad", 'hl.dsp.window.move({ workspace = "special:magic" })'),
+]
+
+# desktop actions: id, label, shell command (the same ones hyprland.lua and the rice bar use)
+RICE = "qs -c rice ipc call panels toggle "
+CAE = "qs -c caelestia ipc call "
+SYSTEM_ACTIONS = [
+    ("lock", "Lock the screen", "loginctl lock-session"),
+    ("power", "Power menu", CAE + "drawers toggle session"),
+    ("launcher", "App launcher", "caelestia shell drawers toggle launcher"),
+    ("dashboard", "Dashboard", RICE + "dashboard"),
+    ("control", "Control centre", RICE + "control"),
+    ("shelf", "Shelf", RICE + "shelf"),
+    ("notifications", "Notifications", "caelestia shell drawers toggle sidebar"),
+    ("clipboard", "Clipboard history", "caelestia clipboard"),
+    ("shot-area", "Screenshot an area", "~/.local/bin/screenshot-area"),
+    ("shot-screen", "Screenshot the screen", "hyprshot -m output -m active -o ~/Pictures/Screenshots"),
+    ("shot-window", "Screenshot the window", "hyprshot -m window -m active -o ~/Pictures/Screenshots"),
+    ("record", "Start / stop screen recording", "caelestia record"),
+    ("play", "Play / pause", "playerctl play-pause"),
+    ("next", "Next track", "playerctl next"),
+    ("prev", "Previous track", "playerctl previous"),
+    ("vol-up", "Volume up", "wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+"),
+    ("vol-down", "Volume down", "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"),
+    ("mute", "Mute / unmute", "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"),
+    ("mic", "Mute / unmute the mic", "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"),
+    ("bright-up", "Brightness up", "brightnessctl -e4 -n2 set 5%+"),
+    ("bright-down", "Brightness down", "brightnessctl -e4 -n2 set 5%-"),
+    ("dnd", "Do not disturb on / off", CAE + "notifs toggleDnd"),
+    ("awake", "Keep awake on / off", CAE + "idleInhibitor toggle"),
+    ("game", "Game mode on / off", CAE + "gameMode toggle"),
+    ("airplane", "Airplane mode on / off", "~/.local/bin/airplane-mode"),
+    ("wallpaper", "Next wallpaper", "~/.local/bin/rice-wall next"),
+    ("sysmon", "System monitor", "~/.local/bin/sysmon-toggle"),
+    ("displays", "Arrange displays", "~/.local/bin/displays"),
+    ("bluetooth", "Bluetooth devices", "~/.local/bin/bluetooth-manager"),
+    ("keybinds", "Open Keybinds", "~/.local/bin/keybinds"),
+]
+# what built-in exec binds do, for the list of built-in shortcuts
+CMD_WORDS = [(cmd, label) for _, label, cmd in SYSTEM_ACTIONS] + [
+    ("wlogout", "Power menu"), ("uwsm stop", "Log out"), ("snappy-switcher next", "Switch windows"),
+    ("snappy-switcher prev", "Switch windows (backwards)"), ("rice-wall prev", "Previous wallpaper"),
+    ("penguin", "A penguin does something random"), ("ToggleDeck", "Spun's tape deck"),
+    ("kitty -e spf", "File manager"),
+]
+DESCRIBE = [
+    (r"window\.close\(", "Close the window"), (r'mode = "fullscreen"', "Fullscreen"),
+    (r'mode = "maximized"', "Maximize"), (r"window\.float\(", "Float / tile the window"),
+    (r"togglesplit", "Flip the split direction"), (r'"special:magic"', "Move the window to the scratchpad"),
+    (r"toggle_special", "Show / hide the scratchpad"), (r'workspace = "[er]\+1"', "Next workspace"),
+    (r'workspace = "[er]-1"', "Previous workspace"), (r"window\.drag\(", "Drag the window"),
+    (r"window\.resize\(\)", "Resize the window"), (r"hymission", "Window overview"),
+    (r'focus\(\{ direction = "left"', "Focus the window on the left"),
+    (r'focus\(\{ direction = "right"', "Focus the window on the right"),
+    (r'focus\(\{ direction = "up"', "Focus the window above"),
+    (r'focus\(\{ direction = "down"', "Focus the window below"),
+]
+
+CSS = """
+.keycap { min-width: 14px; padding: 2px 8px; border-radius: 6px; font-weight: 600; font-size: 0.9em;
+          background: alpha(currentColor, 0.09); box-shadow: inset 0 -2px alpha(currentColor, 0.16); }
+.listening { color: @accent_color; font-weight: 600; }
+.replaced { opacity: 0.55; }
+"""
+
+
+# ---------- keys ----------
+
+def key_label(key):
+    k = key.lower()
+    if k in KEY_LABEL:
+        return KEY_LABEL[k]
+    if k.startswith("kp_"):
+        return "Num " + key[3:]
+    if k.startswith("xf86"):
+        return key[4:]
+    return key.upper() if len(key) == 1 else key
+
+
+def parts(keys):
+    return [MOD_LABEL[m] for m in MODS if m in keys.get("mods", [])] + [key_label(keys.get("key", ""))]
+
+
+def pretty(keys):
+    return " + ".join(parts(keys)) if keys and keys.get("key") else "No keys"
+
+
+def combo(keys):
+    """The keys as Hyprland reads them, e.g. SUPER + SHIFT + E"""
+    return " + ".join([m for m in MODS if m in keys.get("mods", [])] + [keys["key"]])
+
+
+def norm(keys):
+    return frozenset(keys.get("mods", [])), keys.get("key", "").lower()
+
+
+def parse_combo(s):
+    mods, key = [], ""
+    for t in (t.strip() for t in s.split("+")):
+        u = ALIASES.get(t.upper(), t.upper())
+        if u in MODS:
+            mods.append(u)
+        elif t:
+            key = t
+    return {"mods": [m for m in MODS if m in mods], "key": key}
+
+
+def base_keyval(keycode, keyval):
+    """The key's own symbol, without Shift: Shift+1 is still the 1 key"""
+    display = Gdk.Display.get_default()
+    try:
+        ok, keys, vals = display.map_keycode(keycode)
+    except (TypeError, ValueError):
+        ok = False
+    if ok:
+        for k, v in zip(keys, vals):
+            if k.group == 0 and k.level == 0:
+                return v
+    return Gdk.keyval_to_lower(keyval)
+
+
+# ---------- the built-in shortcuts (hyprland.lua, plugins.lua, and whatever else Hyprland has) ----------
+
+def split_args(s):
+    """Arguments of a call, given the text after its "(": [args], text after the closing paren"""
+    args, depth, cur, quote, i = [], 0, "", None, 0
+    while i < len(s):
+        ch = s[i]
+        if quote:
+            cur += ch
+            if ch == "\\":
+                cur += s[i + 1:i + 2]
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            cur += ch
+        elif s.startswith("--", i):
+            break
+        elif ch in "({[":
+            depth += 1
+            cur += ch
+        elif ch in ")}]":
+            if depth == 0:
+                args.append(cur.strip())
+                return args, s[i + 1:]
+            depth -= 1
+            cur += ch
+        elif ch == "," and depth == 0:
+            args.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+        i += 1
+    args.append(cur.strip())
+    return args, ""
+
+
+def lua_concat(expr, env):
+    out = ""
+    for part in expr.split(".."):
+        p = part.strip()
+        if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'":
+            out += p[1:-1]
+        elif p in env:
+            out += env[p]
+        else:
+            return None
+    return out
+
+
+def describe(action, env, before):
+    m = re.match(r"hl\.dsp\.exec_cmd\((.*)\)\s*$", action, re.S)
+    if m:
+        cmd = lua_concat(m.group(1), env) or ""
+        for needle, label in CMD_WORDS:
+            if needle.replace("~/.local/bin/", "") in cmd:
+                return label
+        return f"Runs {cmd}" if cmd else "Runs a command"
+    for pat, words in DESCRIBE:
+        if re.search(pat, action):
+            return words
+    if action.startswith("function"):
+        return before or "Custom action"
+    return "Set in your Hyprland config"
+
+
+def guess(keys):
+    """For binds made in loops (that the line-by-line read can't see)"""
+    mods, k = set(keys["mods"]), keys["key"].lower()
+    where = {"left": "on the left", "right": "on the right", "up": "above", "down": "below",
+             "h": "on the left", "l": "on the right", "k": "above", "j": "below"}
+    way = {"h": "left", "l": "right", "k": "up", "j": "down"}.get(k, k)
+    num = None
+    if k.isdigit():
+        num = int(k) or 10
+    elif k.startswith("kp_") and k[3:].isdigit():
+        num = int(k[3:]) or 10
+    elif k in NUMPAD_OFF:
+        num = NUMPAD_OFF.index(k) + 1
+    if k in where:
+        if mods == {"SUPER"}:
+            return f"Focus the window {where[k]}"
+        if mods == {"SUPER", "SHIFT"}:
+            return f"Move the window {way}"
+        if mods == {"SUPER", "CTRL"}:
+            return "Resize the window"
+    if num:
+        if mods == {"SUPER"}:
+            return f"Go to workspace {num}"
+        if mods == {"SUPER", "SHIFT"}:
+            return f"Move the window to workspace {num}"
+    return "Set in your Hyprland config"
+
+
+def live_binds():
+    try:
+        r = subprocess.run(["hyprctl", "binds", "-j"], capture_output=True, text=True, timeout=3)
+        data = json.loads(r.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    return data
+
+
+def builtins():
+    """[{keys, title, note}] — what the keys already do, read from the config, then the rest from Hyprland"""
+    found = {}
+    for path in CONFIGS:
+        try:
+            text = open(path).read()
+        except OSError:
+            continue
+        env = dict(re.findall(r'^local\s+(\w+)\s*=\s*"([^"]*)"', text, re.M))
+        before = ""
+        for line in text.splitlines():
+            m = re.match(r"\s*hl\.bind\((.*)", line)
+            if not m:
+                c = re.match(r"\s*--\s*(.*)", line)
+                before = c.group(1).strip() if c else ""
+                continue
+            args, rest = split_args(m.group(1))
+            keys_text = lua_concat(args[0], env) if args else None
+            if not keys_text:
+                continue
+            keys = parse_combo(keys_text)
+            note = re.search(r"--\s*(.*)$", rest)
+            note = note.group(1).strip() if note else ""
+            title = describe(args[1] if len(args) > 1 else "", env, before)
+            found.setdefault(norm(keys), {"keys": keys, "title": title, "note": note[:1].upper() + note[1:]})
+    for b in live_binds():
+        # other submaps, ours, and pass-through hooks (Caelestia's Caps/Num Lock indicator) don't take the key
+        if b.get("submap") or not b.get("key") or b.get("non_consuming") or \
+                (b.get("description") or "").startswith("keybinds:"):
+            continue
+        keys = {"mods": [m for m in MODS if b.get("modmask", 0) & MODMASK[m]], "key": b["key"]}
+        found.setdefault(norm(keys), {"keys": keys, "title": guess(keys), "note": ""})
+    return sorted(found.values(), key=lambda x: (x["title"].startswith("Set in"), x["title"].lower(), pretty(x["keys"])))
+
+
+def capture_ready():
+    return any(b.get("submap") == SUBMAP for b in live_binds())
+
+
+def set_capture(on):
+    if TESTING:
+        return
+    subprocess.Popen(["hyprctl", "dispatch", f'hl.dsp.submap("{SUBMAP if on else "reset"}")'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------- steps ----------
+
+def summary(step):
+    kind = step.get("type")
+    if kind == "app":
+        return f"Open {step.get('name') or step.get('app', 'an app')}"
+    if kind == "command":
+        return f"Run {step.get('command', '')}" + (" in a terminal" if step.get("terminal") else "")
+    if kind == "link":
+        return f"Open {step.get('target', '')}"
+    if kind == "text":
+        t = step.get("text", "")
+        first = t.strip().splitlines()[0] if t.strip() else t
+        more = len(first) > 40 or "\n" in t.strip()
+        return f"Type “{first[:40]}{'…' if more else ''}”"
+    if kind == "keys":
+        n = int(step.get("times", 1))
+        return f"Press {pretty(step.get('keys', {}))}" + (f" × {n}" if n > 1 else "")
+    if kind in ("hypr", "system"):
+        return step.get("label", "")
+    if kind == "wait":
+        return f"Wait {float(step.get('seconds', 1)):g} s"
+    return kind or "?"
+
+
+def bind_summary(b):
+    steps = b.get("steps", [])
+    if not steps:
+        return "Does nothing yet"
+    text = " → ".join(summary(s) for s in steps)
+    return text if len(text) < 90 else text[:88] + "…"
+
+
+def lua_str(s):
+    out = []
+    for ch in s:
+        if ch in '\\"':
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ord(ch) < 32:
+            out.append("\\%03d" % ord(ch))
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def dispatcher(b):
+    """Lua for what the keys do: simple one-step shortcuts directly, everything else through keybind-run"""
+    steps = b["steps"]
+    if len(steps) == 1:
+        s = steps[0]
+        if s["type"] == "command":
+            cmd = s["command"]
+            return f"hl.dsp.exec_cmd({lua_str('kitty --hold sh -c ' + shlex.quote(cmd) if s.get('terminal') else cmd)})"
+        if s["type"] == "link":
+            return f"hl.dsp.exec_cmd({lua_str('xdg-open ' + shlex.quote(os.path.expanduser(s['target'])))})"
+        if s["type"] in ("hypr", "system"):
+            return s["lua"] if s.get("lua") else f"hl.dsp.exec_cmd({lua_str(s['command'])})"
+    return f"hl.dsp.exec_cmd(run .. {lua_str(b['id'])})"
+
+
+def generate(binds):
+    live = [b for b in binds if b.get("enabled", True) and b.get("keys", {}).get("key") and b.get("steps")]
+    out = ["-- Made by the Keybinds app (~/.local/bin/keybinds) from keybinds.json: edit shortcuts there,",
+           "-- changes to this file get overwritten. Loaded last from hyprland.lua.", "",
+           'local run = "~/.local/bin/keybind-run "', ""]
+    replaced = sorted({combo(b["keys"]) for b in live if b.get("replace")})
+    if replaced:
+        out.append("-- built-in shortcuts these replace")
+        out += [f"hl.unbind({lua_str(c)})" for c in replaced]
+        out.append("")
+    for b in live:
+        opts = [f"description = {lua_str('keybinds:' + b['id'])}"]
+        if b.get("repeat"):
+            opts.append("repeating = true")
+        if b.get("locked"):
+            opts.append("locked = true")
+        note = re.sub(r"\s+", " ", b.get("name") or bind_summary(b))
+        out.append(f"-- {note}")
+        out.append(f"hl.bind({lua_str(combo(b['keys']))}, {dispatcher(b)}, {{ {', '.join(opts)} }})")
+    out += ["",
+            "-- While the app records a shortcut it switches to this empty submap, so keys that already do",
+            "-- something reach the app instead. Escape (or the app) switches back.",
+            f"hl.define_submap({lua_str(SUBMAP)}, function()",
+            '    hl.bind("Escape", hl.dsp.submap("reset"), { non_consuming = true })',
+            "end)", ""]
+    return "\n".join(out)
+
+
+def load():
+    try:
+        with open(DATA) as f:
+            return json.load(f).get("binds", [])
+    except (OSError, ValueError):
+        return []
+
+
+def write_atomic(path, text):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="." + os.path.basename(path) + ".")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def ensure_required():
+    """hyprland.lua loads keybinds.lua last, after the built-in binds it may replace"""
+    text = open(MAIN).read()
+    if re.search(r'^\s*require\(\s*"keybinds"\s*\)', text, re.M):
+        return
+    with open(MAIN, "a") as f:
+        f.write('\n-- Your own shortcuts, made in the Keybinds app (last, so they can replace the ones above)\n'
+                'require("keybinds")\n')
+
+
+def save(binds):
+    """Write the json and the Lua, check it, reload Hyprland. Raises with a readable message on failure."""
+    os.makedirs(HYPR, exist_ok=True)
+    text = generate(binds)
+    fd, tmp = tempfile.mkstemp(suffix=".lua")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    r = subprocess.run(["luac", "-p", tmp], capture_output=True, text=True)
+    os.unlink(tmp)
+    if r.returncode:
+        raise ValueError("The shortcuts didn't turn into valid Hyprland config:\n" + r.stderr.strip())
+    write_atomic(DATA, json.dumps({"version": 1, "binds": binds}, indent=1, ensure_ascii=False) + "\n")
+    write_atomic(LUA, text)
+    if TESTING:
+        return
+    ensure_required()
+    subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=10)
+    errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, timeout=5).stdout.strip()
+    if "keybinds" in errors:
+        raise ValueError("Hyprland didn't like it:\n" + errors)
+
+
+# ---------- widgets ----------
+
+def text_row(title, subtitle="", **kw):
+    """An ActionRow showing its text as typed (names and commands can contain & or <)"""
+    row = Adw.ActionRow(use_markup=False, **kw)
+    row.set_title(title)
+    row.set_subtitle(subtitle)
+    return row
+
+
+class KeyCaps(Gtk.Box):
+    def __init__(self):
+        super().__init__(spacing=4, valign=Gtk.Align.CENTER)
+
+    def show_keys(self, keys, empty="Not set"):
+        while (c := self.get_first_child()):
+            self.remove(c)
+        if not keys or not keys.get("key"):
+            self.append(Gtk.Label(label=empty, css_classes=["dim-label"]))
+            return
+        for p in parts(keys):
+            self.append(Gtk.Label(label=p, css_classes=["keycap"]))
+
+    def listening(self):
+        while (c := self.get_first_child()):
+            self.remove(c)
+        self.append(Gtk.Label(label="Press the keys…", css_classes=["listening"]))
+
+
+class KeyRecorder(Gtk.Box):
+    """Shows keys as keycaps; Record listens for the next shortcut you press"""
+    __gsignals__ = {"changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
+                    "recording": (GObject.SignalFlags.RUN_FIRST, None, (bool,))}
+
+    def __init__(self, keys=None, allow_mouse=True, capture=True):
+        super().__init__(spacing=10, valign=Gtk.Align.CENTER)
+        self.keys, self.allow_mouse, self.capture = keys, allow_mouse, capture
+        self.recording = False
+        self._ctrls, self._timer, self._active = [], 0, 0
+        self.caps = KeyCaps()
+        self.button = Gtk.Button(valign=Gtk.Align.CENTER)
+        self.button.connect("clicked", lambda *_: self.stop() if self.recording else self.start())
+        self.append(self.caps)
+        self.append(self.button)
+        self.connect("unrealize", lambda *_: self.stop())
+        self._show()
+
+    def _show(self):
+        if self.recording:
+            self.caps.listening()
+            self.button.set_label("Cancel")
+            self.button.remove_css_class("suggested-action")
+        else:
+            self.caps.show_keys(self.keys)
+            self.button.set_label("Change" if self.keys and self.keys.get("key") else "Record")
+            if self.keys and self.keys.get("key"):
+                self.button.remove_css_class("suggested-action")
+            else:
+                self.button.add_css_class("suggested-action")
+
+    def start(self):
+        root = self.get_root()
+        if not root or self.recording:
+            return
+        self.recording = True
+        key = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        key.connect("key-pressed", self._key)
+        click = Gtk.GestureClick(button=0, propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        click.connect("pressed", self._click)
+        for c in (key, click):
+            root.add_controller(c)
+            self._ctrls.append((root, c))
+        self._active = root.connect("notify::is-active", lambda w, _: None if w.is_active() else self.stop())
+        self._timer = GLib.timeout_add_seconds(15, self._timeout)
+        if self.capture:
+            set_capture(True)
+        self._show()
+        self.emit("recording", True)
+
+    def stop(self):
+        if not self.recording:
+            return
+        self.recording = False
+        for root, c in self._ctrls:
+            root.remove_controller(c)
+        if self._ctrls and self._active:
+            self._ctrls[0][0].disconnect(self._active)
+        self._ctrls, self._active = [], 0
+        if self._timer:
+            GLib.source_remove(self._timer)
+            self._timer = 0
+        if self.capture:
+            set_capture(False)
+        self._show()
+        self.emit("recording", False)
+
+    def _timeout(self):
+        self._timer = 0
+        self.stop()
+        return False
+
+    def _key(self, _ctrl, keyval, keycode, state):
+        name = Gdk.keyval_name(keyval) or ""
+        if name in MODIFIER_KEYS:
+            return True
+        mods = [m for m in MODS if state & MASK[m]]
+        if keyval == Gdk.KEY_Escape and not mods:
+            self.stop()
+            return True
+        key = Gdk.keyval_name(base_keyval(keycode, keyval)) or name
+        self.keys = {"mods": mods, "key": key.upper() if len(key) == 1 else key}
+        self.stop()
+        self.emit("changed")
+        return True
+
+    def _click(self, gesture, _n, _x, _y):
+        button = gesture.get_current_button()
+        if self.allow_mouse and button in MOUSE_BUTTONS:
+            state = gesture.get_current_event_state()
+            self.keys = {"mods": [m for m in MODS if state & MASK[m]], "key": MOUSE_BUTTONS[button]}
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            self.stop()
+            self.emit("changed")
+
+
+def dialog_shell(dialog, title, done_label, on_done, width=500, height=-1):
+    """Header with Cancel / done, and a preferences page to fill"""
+    dialog.set_title(title)
+    dialog.set_content_width(width)
+    if height > 0:
+        dialog.set_content_height(height)
+    tv = Adw.ToolbarView()
+    hb = Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False)
+    cancel = Gtk.Button(label="Cancel")
+    cancel.connect("clicked", lambda *_: dialog.close())
+    done = Gtk.Button(label=done_label, css_classes=["suggested-action"])
+    done.connect("clicked", lambda *_: on_done())
+    hb.pack_start(cancel)
+    hb.pack_end(done)
+    tv.add_top_bar(hb)
+    page = Adw.PreferencesPage()
+    tv.set_content(page)
+    dialog.set_child(tv)
+    return page, done
+
+
+class StepDialog(Adw.Dialog):
+    """Set up one step"""
+
+    def __init__(self, kind, step, on_done, capture=True):
+        super().__init__()
+        self.kind, self.step, self.on_done, self.capture = kind, dict(step or {}), on_done, capture
+        self.page, self.done = dialog_shell(self, STEP_TYPES[kind][0], "Done", self._finish,
+                                            height=560 if kind == "app" else -1)
+        self._get = lambda: None
+        getattr(self, "_build_" + kind)()
+        self._check()
+
+    def _check(self, *_):
+        self.done.set_sensitive(self._get() is not None)
+
+    def _finish(self):
+        step = self._get()
+        if step is not None:
+            self.on_done(step)
+            self.close()
+
+    def _group(self, title="", description=""):
+        g = Adw.PreferencesGroup(title=title, description=description)
+        self.page.add(g)
+        return g
+
+    def _build_app(self):
+        g = self._group(description="Opens the app. If it's already open, it can switch to it instead.")
+        search = Gtk.SearchEntry(placeholder_text="Search apps", margin_bottom=8)
+        g.add(search)
+        self.apps = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.SINGLE)
+        scroller = Gtk.ScrolledWindow(child=self.apps, min_content_height=280, max_content_height=280,
+                                      hscrollbar_policy=Gtk.PolicyType.NEVER)
+        g.add(scroller)
+        apps = sorted((a for a in Gio.AppInfo.get_all() if a.should_show()), key=lambda a: a.get_display_name().lower())
+        pick = None
+        for a in apps:
+            row = Gtk.ListBoxRow()
+            row.app = a
+            box = Gtk.Box(spacing=12, margin_top=7, margin_bottom=7, margin_start=10, margin_end=10)
+            box.append(Gtk.Image(gicon=a.get_icon(), pixel_size=28))
+            box.append(Gtk.Label(label=a.get_display_name(), xalign=0, hexpand=True,
+                                 ellipsize=Pango.EllipsizeMode.END))
+            row.set_child(box)
+            self.apps.append(row)
+            if a.get_id() == self.step.get("app"):
+                pick = row
+        search.connect("search-changed", lambda e: self.apps.invalidate_filter())
+        self.apps.set_filter_func(lambda r: search.get_text().lower() in r.app.get_display_name().lower())
+        self.apps.connect("row-selected", self._check)
+        self.apps.connect("row-activated", lambda *_: self._finish())
+        if pick:
+            self.apps.select_row(pick)
+            GLib.idle_add(lambda: pick.grab_focus() and False)
+        g2 = self._group()
+        focus = Adw.SwitchRow(title="If it's already open, switch to it", active=self.step.get("focus", True),
+                              subtitle="Pressing again goes through its windows")
+        g2.add(focus)
+
+        def get():
+            row = self.apps.get_selected_row()
+            if not row:
+                return None
+            a = row.app
+            stem = a.get_id().removesuffix(".desktop")
+            classes = {stem, stem.split(".")[-1], os.path.basename(a.get_executable() or "")}
+            wm = a.get_startup_wm_class() if hasattr(a, "get_startup_wm_class") else None
+            if wm:
+                classes.add(wm)
+            icon = a.get_icon()
+            return {"type": "app", "app": a.get_id(), "name": a.get_display_name(),
+                    "icon": icon.to_string() if icon else "", "classes": sorted(c for c in classes if c),
+                    "focus": focus.get_active()}
+        self._get = get
+
+    def _build_command(self):
+        g = self._group(description="Runs like you'd type it in a terminal (in your home folder).")
+        entry = Adw.EntryRow(title="Command", text=self.step.get("command", ""))
+        entry.add_css_class("monospace")
+        term = Adw.SwitchRow(title="Show it in a terminal", subtitle="Opens kitty and keeps it open after",
+                             active=self.step.get("terminal", False))
+        g.add(entry)
+        g.add(term)
+        entry.connect("changed", self._check)
+        self._get = lambda: ({"type": "command", "command": entry.get_text().strip(), "terminal": term.get_active()}
+                             if entry.get_text().strip() else None)
+
+    def _build_link(self):
+        g = self._group(description="A web address, or a file or folder on this computer.")
+        entry = Adw.EntryRow(title="Website, file or folder", text=self.step.get("target", ""))
+        for icon, tip, folder in (("document-open-symbolic", "Choose a file", False),
+                                  ("folder-open-symbolic", "Choose a folder", True)):
+            b = Gtk.Button(icon_name=icon, tooltip_text=tip, valign=Gtk.Align.CENTER, css_classes=["flat"])
+            b.connect("clicked", self._choose, entry, folder)
+            entry.add_suffix(b)
+        g.add(entry)
+        entry.connect("changed", self._check)
+
+        def get():
+            t = entry.get_text().strip()
+            if not t:
+                return None
+            if not re.match(r"^([a-z][a-z0-9+.-]*:|[~/.])", t, re.I) and re.match(r"^[\w-]+(\.[\w-]+)+(/|$)", t):
+                t = "https://" + t   # "youtube.com" -> a website
+            home = os.path.expanduser("~")
+            if t.startswith(home + "/"):
+                t = "~" + t[len(home):]
+            return {"type": "link", "target": t}
+        self._get = get
+
+    def _choose(self, _b, entry, folder):
+        fd = Gtk.FileDialog(title="Choose a folder" if folder else "Choose a file")
+
+        def done(d, res):
+            try:
+                f = d.select_folder_finish(res) if folder else d.open_finish(res)
+            except GLib.Error:
+                return
+            if f and f.get_path():
+                entry.set_text(f.get_path())
+        (fd.select_folder if folder else fd.open)(self.get_root(), None, done)
+
+    def _build_text(self):
+        g = self._group(description="Typed into the window in front. Letters, numbers and symbols are typed; "
+                                    "emoji and accented letters are pasted.")
+        buf = Gtk.TextBuffer(text=self.step.get("text", ""))
+        view = Gtk.TextView(buffer=buf, wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=10, bottom_margin=10,
+                            left_margin=12, right_margin=12, accepts_tab=False)
+        frame = Gtk.Frame(child=Gtk.ScrolledWindow(child=view, min_content_height=140,
+                                                   hscrollbar_policy=Gtk.PolicyType.NEVER))
+        g.add(frame)
+        buf.connect("changed", self._check)
+
+        def get():
+            t = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+            return {"type": "text", "text": t} if t else None
+        self._get = get
+
+    def _build_keys(self):
+        g = self._group(description="Sent to the window in front, e.g. Ctrl + Shift + T to reopen a closed tab.")
+        rec = KeyRecorder(self.step.get("keys"), allow_mouse=False, capture=self.capture)
+        row = Adw.ActionRow(title="Keys to press")
+        row.add_suffix(rec)
+        times = Adw.SpinRow.new_with_range(1, 50, 1)
+        times.set_title("Times")
+        times.set_value(int(self.step.get("times", 1)))
+        g.add(row)
+        g.add(times)
+        rec.connect("changed", self._check)
+        rec.connect("recording", self._check)
+        self._get = lambda: ({"type": "keys", "keys": rec.keys, "times": int(times.get_value())}
+                             if rec.keys and rec.keys.get("key") and not rec.recording else None)
+
+    def _pick_row(self, table, current):
+        names = Gtk.StringList()
+        for _, label, _ in table:
+            names.append(label)
+        row = Adw.ComboRow(title="Action", model=names, enable_search=True)
+        ids = [t[0] for t in table]
+        if current in ids:
+            row.set_selected(ids.index(current))
+        return row
+
+    def _build_hypr(self):
+        g = self._group()
+        row = self._pick_row(HYPR_ACTIONS, self.step.get("action"))
+        ws = Adw.SpinRow.new_with_range(1, 10, 1)
+        ws.set_title("Workspace")
+        ws.set_value(int(self.step.get("workspace", 1)))
+        g.add(row)
+        g.add(ws)
+
+        def update(*_):
+            ws.set_visible("%d" in HYPR_ACTIONS[row.get_selected()][2])
+        row.connect("notify::selected", update)
+        update()
+
+        def get():
+            aid, label, lua = HYPR_ACTIONS[row.get_selected()]
+            step = {"type": "hypr", "action": aid, "label": label, "lua": lua}
+            if "%d" in lua:
+                n = int(ws.get_value())
+                step.update(workspace=n, lua=lua % n, label=label.replace("…", f" {n}"))
+            return step
+        self._get = get
+
+    def _build_system(self):
+        g = self._group()
+        row = self._pick_row(SYSTEM_ACTIONS, self.step.get("action"))
+        g.add(row)
+
+        def get():
+            aid, label, cmd = SYSTEM_ACTIONS[row.get_selected()]
+            return {"type": "system", "action": aid, "label": label, "command": cmd}
+        self._get = get
+
+    def _build_wait(self):
+        g = self._group(description="Gives an app time to open before the next step.")
+        secs = Adw.SpinRow.new_with_range(0.1, 60, 0.1)
+        secs.set_title("Seconds")
+        secs.set_digits(1)
+        secs.set_value(float(self.step.get("seconds", 1)))
+        g.add(secs)
+        self._get = lambda: {"type": "wait", "seconds": round(secs.get_value(), 1)}
+
+
+class EditorDialog(Adw.Dialog):
+    """Make or change one shortcut: its keys, its steps, a few options"""
+
+    def __init__(self, win, bind, is_new):
+        super().__init__()
+        self.win, self.bind, self.is_new = win, copy.deepcopy(bind), is_new
+        self.page, self.save_btn = dialog_shell(self, "New shortcut" if is_new else "Edit shortcut", "Save",
+                                                self._save, width=600, height=700)
+
+        g = Adw.PreferencesGroup(title="Shortcut")
+        self.page.add(g)
+        self.rec = KeyRecorder(self.bind.get("keys"), capture=win.capture)
+        keys_row = Adw.ActionRow(title="Keys", subtitle="Press Record, then the keys you want")
+        keys_row.add_suffix(self.rec)
+        g.add(keys_row)
+        self.replace_row = Adw.SwitchRow(use_markup=False, visible=False)
+        self.replace_row.set_active(self.bind.get("replace", True) or is_new)
+        g.add(self.replace_row)
+        self.clash_row = Adw.ActionRow(visible=False, css_classes=["warning"], use_markup=False)
+        self.clash_row.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic"))
+        g.add(self.clash_row)
+        self.name_row = Adw.EntryRow(title="Name (optional)", text=self.bind.get("name", ""))
+        g.add(self.name_row)
+        self.rec.connect("changed", self._keys_changed)
+        self.rec.connect("recording", lambda *_: self._check())
+
+        sg = Adw.PreferencesGroup(title="What it does", description="Steps run top to bottom. Add more than one "
+                                                                    "to make a macro.")
+        add = Gtk.MenuButton(css_classes=["flat"], valign=Gtk.Align.CENTER)
+        add.set_child(self._add_label())
+        add.set_popover(self._step_menu(add))
+        sg.set_header_suffix(add)
+        self.steps = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE)
+        self.steps.connect("row-activated", self._edit_step)
+        sg.add(self.steps)
+        self.page.add(sg)
+
+        og = Adw.PreferencesGroup(title="Options")
+        self.repeat_row = Adw.SwitchRow(title="Repeat while held", active=self.bind.get("repeat", False),
+                                        subtitle="Like holding a volume key")
+        self.locked_row = Adw.SwitchRow(title="Also works on the lock screen", active=self.bind.get("locked", False))
+        og.add(self.repeat_row)
+        og.add(self.locked_row)
+        self.page.add(og)
+
+        if not is_new:
+            dg = Adw.PreferencesGroup()
+            delete = Adw.ButtonRow(title="Delete shortcut", css_classes=["destructive-action"])
+            delete.connect("activated", self._delete)
+            dg.add(delete)
+            self.page.add(dg)
+
+        self._render_steps()
+        self._keys_changed()
+
+    def _add_label(self):
+        box = Gtk.Box(spacing=6)
+        box.append(Gtk.Image(icon_name="list-add-symbolic"))
+        box.append(Gtk.Label(label="Add a step"))
+        return box
+
+    def _step_menu(self, button):
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_top=6, margin_bottom=6,
+                      margin_start=6, margin_end=6)
+        for kind, (name, icon, hint) in STEP_TYPES.items():
+            b = Gtk.Button(css_classes=["flat"])
+            row = Gtk.Box(spacing=12, margin_top=3, margin_bottom=3)
+            row.append(Gtk.Image(icon_name=icon))
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            text.append(Gtk.Label(label=name, xalign=0))
+            text.append(Gtk.Label(label=hint, xalign=0, css_classes=["dim-label", "caption"]))
+            row.append(text)
+            b.set_child(row)
+            b.connect("clicked", self._new_step, kind, pop)
+            box.append(b)
+        pop.set_child(box)
+        return pop
+
+    def _new_step(self, _b, kind, pop):
+        pop.popdown()
+        StepDialog(kind, None, self._append_step, capture=self.win.capture).present(self)
+
+    def _append_step(self, step):
+        self.bind.setdefault("steps", []).append(step)
+        self._render_steps()
+
+    def _edit_step(self, _list, row):
+        if getattr(row, "index", None) is None:
+            return
+        i = row.index
+
+        def done(step):
+            self.bind["steps"][i] = step
+            self._render_steps()
+        StepDialog(self.bind["steps"][i]["type"], self.bind["steps"][i], done, capture=self.win.capture).present(self)
+
+    def _move(self, _b, i, d):
+        steps = self.bind["steps"]
+        if 0 <= i + d < len(steps):
+            steps[i], steps[i + d] = steps[i + d], steps[i]
+            self._render_steps()
+
+    def _remove(self, _b, i):
+        del self.bind["steps"][i]
+        self._render_steps()
+
+    def _render_steps(self):
+        self.steps.remove_all()
+        steps = self.bind.get("steps", [])
+        if not steps:
+            row = Adw.ActionRow(title="Nothing yet", subtitle="Use “Add a step”: open an app, run something, "
+                                                              "type text…", activatable=False)
+            row.index = None
+            self.steps.append(row)
+        for i, s in enumerate(steps):
+            row = text_row(summary(s), STEP_TYPES.get(s["type"], ("",))[0], activatable=True, title_lines=2)
+            row.index = i
+            icon = Gio.Icon.new_for_string(s["icon"]) if s.get("icon") else None
+            img = Gtk.Image(gicon=icon, pixel_size=24) if icon else Gtk.Image(icon_name=STEP_TYPES[s["type"]][1])
+            row.add_prefix(img)
+            for icon_name, tip, cb, arg in (("go-up-symbolic", "Move up", self._move, -1),
+                                            ("go-down-symbolic", "Move down", self._move, 1),
+                                            ("user-trash-symbolic", "Remove", self._remove, None)):
+                b = Gtk.Button(icon_name=icon_name, tooltip_text=tip, valign=Gtk.Align.CENTER, css_classes=["flat"])
+                if arg is None:
+                    b.connect("clicked", cb, i)
+                else:
+                    b.set_sensitive(0 <= i + arg < len(steps))
+                    b.connect("clicked", cb, i, arg)
+                row.add_suffix(b)
+            self.steps.append(row)
+        self._check()
+
+    def _keys_changed(self, *_):
+        keys = self.rec.keys
+        self.replace_row.set_visible(False)
+        self.clash_row.set_visible(False)
+        if keys and keys.get("key"):
+            n = norm(keys)
+            builtin = next((b for b in self.win.builtins if norm(b["keys"]) == n), None)
+            other = next((b for b in self.win.binds if b["id"] != self.bind["id"] and norm(b.get("keys", {})) == n
+                          and b.get("enabled", True)), None)
+            if builtin:
+                self.replace_row.set_title(f"Replace “{builtin['title']}”")
+                self.replace_row.set_subtitle(f"{pretty(keys)} already does that. Off: pressing it does both.")
+                self.replace_row.set_visible(True)
+            if other:
+                self.clash_row.set_title(f"Your shortcut “{other.get('name') or bind_summary(other)}” uses these keys too")
+                self.clash_row.set_subtitle("Pressing them will run both")
+                self.clash_row.set_visible(True)
+        self._check()
+
+    def _check(self):
+        keys = self.rec.keys
+        self.save_btn.set_sensitive(bool(keys and keys.get("key") and self.bind.get("steps")) and not self.rec.recording)
+
+    def _save(self):
+        b = self.bind
+        b.update(keys=self.rec.keys, name=self.name_row.get_text().strip(), repeat=self.repeat_row.get_active(),
+                 locked=self.locked_row.get_active(),
+                 replace=self.replace_row.get_visible() and self.replace_row.get_active())
+        if self.win.save_bind(b):
+            self.close()
+
+    def _delete(self, *_):
+        alert = Adw.AlertDialog(heading="Delete this shortcut?", body=f"{pretty(self.bind.get('keys'))} will stop "
+                                "doing this" + (" and goes back to what it did before." if self.bind.get("replace") else "."))
+        alert.add_response("cancel", "Cancel")
+        alert.add_response("delete", "Delete")
+        alert.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def answered(_a, response):
+            if response == "delete" and self.win.delete_bind(self.bind["id"]):
+                self.close()
+        alert.connect("response", answered)
+        alert.present(self)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Keybinds", default_width=760, default_height=800)
+        self.binds = load()
+        self.builtins = []
+        self.capture = TESTING or capture_ready()
+
+        tv = Adw.ToolbarView()
+        hb = Adw.HeaderBar()
+        add = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="New shortcut")
+        add.connect("clicked", lambda *_: self.edit(None))
+        hb.pack_start(add)
+        self.search = Gtk.SearchEntry(placeholder_text="Search shortcuts", width_chars=28)
+        self.search.connect("search-changed", lambda *_: self._refilter())
+        hb.set_title_widget(self.search)
+        tv.add_top_bar(hb)
+        self.toasts = Adw.ToastOverlay()
+        tv.set_content(self.toasts)
+        page = Adw.PreferencesPage()
+        self.toasts.set_child(page)
+        self.set_content(tv)
+
+        self.mine_group = Adw.PreferencesGroup(title="Your shortcuts", description="Keys that open an app, run "
+                                               "something, type text, or run a whole macro.")
+        new = Gtk.Button(css_classes=["flat"], valign=Gtk.Align.CENTER)
+        box = Gtk.Box(spacing=6)
+        box.append(Gtk.Image(icon_name="list-add-symbolic"))
+        box.append(Gtk.Label(label="New shortcut"))
+        new.set_child(box)
+        new.connect("clicked", lambda *_: self.edit(None))
+        self.mine_group.set_header_suffix(new)
+        self.mine = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE)
+        self.mine.connect("row-activated", lambda _l, r: self.edit(r.bind) if getattr(r, "bind", None) else self.edit(None))
+        self.mine_group.add(self.mine)
+        page.add(self.mine_group)
+
+        self.builtin_group = Adw.PreferencesGroup(title="Built in", description="From hyprland.lua. To change one, "
+                                                  "press ✎ and give its keys a new job.")
+        self.builtin_list = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE)
+        self.builtin_group.add(self.builtin_list)
+        page.add(self.builtin_group)
+        for lst in (self.mine, self.builtin_list):
+            lst.set_filter_func(self._match)
+
+        self.connect("close-request", lambda *_: set_capture(False) or False)
+        self.refresh()
+
+    def refresh(self):
+        self.builtins = builtins()
+        self._render()
+
+    def _match(self, row):
+        q = self.search.get_text().strip().lower()
+        return not q or q in getattr(row, "text", "").lower()
+
+    def _refilter(self):
+        self.mine.invalidate_filter()
+        self.builtin_list.invalidate_filter()
+
+    def _render(self):
+        self.mine.remove_all()
+        if not self.binds:
+            row = Adw.ActionRow(title="No shortcuts yet", subtitle="Press “New shortcut” to make your first one",
+                                activatable=True)
+            row.add_prefix(Gtk.Image(icon_name="input-keyboard-symbolic", pixel_size=24))
+            row.text = ""
+            self.mine.append(row)
+        for b in self.binds:
+            name = b.get("name") or bind_summary(b)
+            row = text_row(name, bind_summary(b) if b.get("name") else "", activatable=True, subtitle_lines=1)
+            row.bind = b
+            row.text = f"{name} {bind_summary(b)} {pretty(b.get('keys'))}"
+            first = (b.get("steps") or [{}])[0]
+            icon = Gio.Icon.new_for_string(first["icon"]) if first.get("icon") else None
+            row.add_prefix(Gtk.Image(gicon=icon, pixel_size=28) if icon else
+                           Gtk.Image(icon_name=STEP_TYPES.get(first.get("type"), ("", "input-keyboard-symbolic"))[1]))
+            caps = KeyCaps()
+            caps.show_keys(b.get("keys"))
+            row.add_suffix(caps)
+            sw = Gtk.Switch(active=b.get("enabled", True), valign=Gtk.Align.CENTER, tooltip_text="On / off")
+            sw.connect("notify::active", self._toggle, b)
+            row.add_suffix(sw)
+            row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            self.mine.append(row)
+
+        self.builtin_list.remove_all()
+        replaced = {norm(b["keys"]): b for b in self.binds if b.get("replace") and b.get("enabled", True)}
+        for item in self.builtins:
+            mine = replaced.get(norm(item["keys"]))
+            row = text_row(item["title"], f"Replaced by your shortcut “{mine.get('name') or bind_summary(mine)}”"
+                           if mine else item["note"])
+            row.text = f"{item['title']} {item['note']} {pretty(item['keys'])}"
+            if mine:
+                row.add_css_class("replaced")
+            caps = KeyCaps()
+            caps.show_keys(item["keys"])
+            row.add_suffix(caps)
+            edit = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Give these keys a new job",
+                              valign=Gtk.Align.CENTER, css_classes=["flat"])
+            edit.connect("clicked", lambda _b, k=item["keys"]: self.edit(None, keys=k))
+            row.add_suffix(edit)
+            self.builtin_list.append(row)
+        self.builtin_group.set_title(f"Built in ({len(self.builtins)})")
+
+    def edit(self, bind, keys=None):
+        is_new = bind is None
+        if is_new:
+            bind = {"id": "k" + uuid.uuid4().hex[:8], "name": "", "keys": copy.deepcopy(keys), "enabled": True,
+                    "replace": True, "repeat": False, "locked": False, "steps": []}
+        dialog = EditorDialog(self, bind, is_new)
+        dialog.present(self)
+        return dialog
+
+    def _apply(self, binds, message):
+        try:
+            save(binds)
+        except Exception as e:  # noqa: BLE001 — show any failure to the person, keep the old shortcuts
+            alert = Adw.AlertDialog(heading="Couldn't save", body=str(e)[:600])
+            alert.add_response("ok", "OK")
+            alert.present(self)
+            return False
+        self.binds = binds
+        self.refresh()
+        self.toasts.add_toast(Adw.Toast(title=message, timeout=3))
+        return True
+
+    def save_bind(self, bind):
+        binds = [bind if b["id"] == bind["id"] else b for b in self.binds]
+        if not any(b["id"] == bind["id"] for b in self.binds):
+            binds.append(bind)
+        return self._apply(binds, f"Saved. Press {pretty(bind['keys'])} to try it")
+
+    def delete_bind(self, bid):
+        return self._apply([b for b in self.binds if b["id"] != bid], "Shortcut deleted")
+
+    def _toggle(self, sw, _p, bind):
+        on = sw.get_active()
+        if bind.get("enabled", True) == on:
+            return
+        binds = [dict(b, enabled=on) if b["id"] == bind["id"] else b for b in self.binds]
+        GLib.idle_add(lambda: self._apply(binds, f"{pretty(bind['keys'])} turned {'on' if on else 'off'}") and False)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        css = Gtk.CssProvider()
+        css.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        if os.environ.get("KEYBINDS_SHOT"):   # headless renders never finish an animation
+            Gtk.Settings.get_default().set_property("gtk-enable-animations", False)
+        win = self.props.active_window or Window(self)
+        win.present()
+        if os.environ.get("KEYBINDS_SHOT"):
+            GLib.timeout_add(700, self._shot_setup, win)
+
+    def _shot_setup(self, win):
+        target = win
+        which = os.environ.get("KEYBINDS_SHOT_EDIT")
+        if which:
+            target = win.edit(None if which == "new" else win.binds[int(which)])
+            kind = os.environ.get("KEYBINDS_SHOT_STEP")
+            if kind:
+                step = next((s for s in target.bind.get("steps", []) if s["type"] == kind), None)
+                target2 = StepDialog(kind, step, lambda s: None)
+                target2.present(target)
+                target = target2
+        GLib.timeout_add(1500, self._shot, win, target)
+        return False
+
+    def _shot(self, win, target):
+        try:
+            paintable = Gtk.WidgetPaintable.new(target)
+            snap = Gtk.Snapshot()
+            paintable.snapshot(snap, target.get_width(), target.get_height())
+            node = snap.to_node()
+            tex = win.get_renderer().render_texture(node, node.get_bounds())
+            tex.save_to_png(os.environ["KEYBINDS_SHOT"])
+        finally:
+            self.quit()
+        return False
+
+
+if __name__ == "__main__":
+    App().run(None)

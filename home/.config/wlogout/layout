@@ -1,0 +1,36 @@
+{
+    "label" : "lock",
+    "action" : "loginctl lock-session",
+    "text" : "Lock",
+    "keybind" : "l"
+}
+{
+    "label" : "hibernate",
+    "action" : "systemctl hibernate",
+    "text" : "Hibernate",
+    "keybind" : "h"
+}
+{
+    "label" : "logout",
+    "action" : "~/.local/bin/session save; uwsm stop",
+    "text" : "Logout",
+    "keybind" : "e"
+}
+{
+    "label" : "shutdown",
+    "action" : "~/.local/bin/session save; systemctl poweroff",
+    "text" : "Shutdown",
+    "keybind" : "s"
+}
+{
+    "label" : "suspend",
+    "action" : "systemctl suspend",
+    "text" : "Suspend",
+    "keybind" : "u"
+}
+{
+    "label" : "reboot",
+    "action" : "~/.local/bin/session save; systemctl reboot",
+    "text" : "Reboot",
+    "keybind" : "r"
+}

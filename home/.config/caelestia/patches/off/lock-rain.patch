@@ -1,0 +1,99 @@
+Lock screen (rice, 2026-10-11): background is always the GitHub-blue code rain from
+~/Pictures/Wallpapers/rice/5-code-rain.{mp4,live.png}, playing on AC and still on battery, with a lighter
+blur. Fast lock: the widgets load asynchronously and the video starts only once the session is locked,
+so the first frame (which is what actually locks the session) is cheap: ~0.03-0.09s instead of ~0.15s idle.
+diff -ruN a/modules/lock/LockSurface.qml b/modules/lock/LockSurface.qml
+--- a/modules/lock/LockSurface.qml	2026-10-11 09:49:20.121073314 -0400
++++ b/modules/lock/LockSurface.qml	2026-10-11 09:49:20.121537619 -0400
+@@ -1,6 +1,9 @@
+ pragma ComponentBehavior: Bound
+ 
+ import QtQuick
++import QtMultimedia
++import Quickshell.Services.UPower
++import Quickshell
+ import QtQuick.Effects
+ import Quickshell.Wayland
+ import Caelestia.Config
+@@ -165,8 +168,8 @@
+         layer.effect: MultiEffect {
+             autoPaddingEnabled: false
+             blurEnabled: true
+-            blur: 1
+-            blurMax: 64
++            blur: 0.45 // local patch: lighter, so the code rain behind the lock still reads as rain
++            blurMax: 24
+             blurMultiplier: 1
+         }
+ 
+@@ -187,8 +190,41 @@
+     Component {
+         id: wallpaperBackground
+ 
+-        CachingImage {
+-            path: Wallpapers.current
++        // Lock background (local patch, rice): always the GitHub-blue code rain, moving while on
++        // AC power and a still frame on battery
++        Item {
++            id: rain
++
++            readonly property string dir: Quickshell.env("HOME") + "/Pictures/Wallpapers/rice/"
++
++            CachingImage {
++                anchors.fill: parent
++                path: rain.dir + "5-code-rain.live.png"
++            }
++
++            // the video only starts once the session is actually locked (fast lock)
++            Loader {
++                anchors.fill: parent
++                active: root.lock.secure && !UPower.onBattery
++
++                sourceComponent: Item {
++                    MediaPlayer {
++                        id: rainPlayer
++
++                        source: "file://" + rain.dir + "5-code-rain.mp4"
++                        loops: MediaPlayer.Infinite
++                        videoOutput: rainVideo
++                        Component.onCompleted: play()
++                    }
++
++                    VideoOutput {
++                        id: rainVideo
++
++                        anchors.fill: parent
++                        fillMode: VideoOutput.PreserveAspectCrop
++                    }
++                }
++            }
+         }
+     }
+ 
+@@ -231,16 +267,24 @@
+             rotation: 180
+         }
+ 
+-        Content {
++        // Fast lock (local patch): the widgets are built in the background after the lock surface's
++        // first frame. Until that frame, the session isn't locked and your windows still take input,
++        // so nothing heavy is built before it. They're invisible until the intro animation anyway.
++        Loader {
+             id: content
+ 
+             anchors.centerIn: parent
+             width: (root.screen?.height ?? 0) * Tokens.sizes.lock.heightMult * Tokens.sizes.lock.ratio - Tokens.padding.extraLargeIncreased
+             height: (root.screen?.height ?? 0) * Tokens.sizes.lock.heightMult - Tokens.padding.extraLargeIncreased
+ 
+-            lock: root
++            asynchronous: true
++            focus: true
+             opacity: 0
+             scale: 0
++
++            sourceComponent: Content {
++                lock: root
++            }
+         }
+     }
+ }

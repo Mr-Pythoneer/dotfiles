@@ -1,0 +1,24 @@
+#!/bin/sh
+# The login things you don't need in the first second, started once the bar is up and a beat
+# apart, so they don't all fight the shell for the CPU at once (hyprland.lua runs this at login).
+# Tray apps also need the bar's tray to exist before they start, or their icons go missing.
+
+# wait for the Caelestia bar to be on screen (give up after 15 s)
+for _ in $(seq 60); do
+    hyprctl layers | grep -q caelestia-drawers && break
+    sleep 0.25
+done
+sleep 1
+
+nm-applet &                     # network icon in the tray
+sleep 0.4
+udiskie --tray &                # auto-mount USB drives
+sleep 0.4
+solaar --window=hide &          # Logitech mouse: thumb button = Super+Q, wheel-mode button = Super+Space
+sleep 0.4
+snappy-switcher --daemon &      # Alt+Tab switcher
+sleep 0.4
+xwaylandvideobridge &           # lets old X11 apps (Discord etc.) share your screen
+sleep 1
+
+exec ~/.local/bin/session restore   # reopen the apps from last time, one at a time

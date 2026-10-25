@@ -1,0 +1,82 @@
+--- a/modules/bar/popouts/Battery.qml
++++ b/modules/bar/popouts/Battery.qml
+@@ -1,6 +1,8 @@
+ pragma ComponentBehavior: Bound
+ 
+ import QtQuick
++import Quickshell
++import Quickshell.Io
+ import Quickshell.Services.UPower
+ import Caelestia.Config
+ import Caelestia.I18n
+@@ -225,6 +227,70 @@
+         }
+     }
+ 
++    // Optimized charging (~/.local/bin/smart-charge)
++    FileView {
++        id: chargeFile
++
++        property var status: {
++            try {
++                return JSON.parse(text());
++            } catch (e) {
++                return null;
++            }
++        }
++
++        path: `${Quickshell.env("HOME")}/.local/state/smart-charge/status.json`
++        watchChanges: true
++        onFileChanged: reload()
++    }
++
++    StyledText {
++        width: parent.width
++        wrapMode: Text.WordWrap
++        horizontalAlignment: Text.AlignHCenter
++        text: chargeFile.status?.summary ?? "Optimized charging isn't running"
++        color: Colours.palette.m3onSurfaceVariant
++    }
++
++    StyledRect {
++        id: chargeFull
++
++        readonly property bool on: chargeFile.status?.mode === "full"
++
++        anchors.horizontalCenter: parent.horizontalCenter
++        implicitWidth: chargeRow.implicitWidth + Tokens.padding.large * 2
++        implicitHeight: chargeRow.implicitHeight + Tokens.padding.small * 2
++
++        color: on ? Colours.palette.m3primary : Colours.tPalette.m3surfaceContainer
++        radius: Tokens.rounding.full
++
++        StateLayer {
++            radius: Tokens.rounding.full
++            color: chargeFull.on ? Colours.palette.m3onPrimary : Colours.palette.m3onSurface
++            onClicked: Quickshell.execDetached([`${Quickshell.env("HOME")}/.local/bin/smart-charge`, "toggle"])
++        }
++
++        Row {
++            id: chargeRow
++
++            anchors.centerIn: parent
++            spacing: Tokens.spacing.small
++
++            MaterialIcon {
++                anchors.verticalCenter: parent.verticalCenter
++                text: "battery_charging_full"
++                color: chargeFull.on ? Colours.palette.m3onPrimary : Colours.palette.m3onSurfaceVariant
++                fill: chargeFull.on ? 1 : 0
++            }
++
++            StyledText {
++                anchors.verticalCenter: parent.verticalCenter
++                text: "Charge to 100% now"
++                color: chargeFull.on ? Colours.palette.m3onPrimary : Colours.palette.m3onSurface
++            }
++        }
++    }
++
+     component Fill: AnchorChanges {
+         required property Item item
+ 

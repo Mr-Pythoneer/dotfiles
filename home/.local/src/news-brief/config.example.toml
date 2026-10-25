@@ -1,0 +1,77 @@
+# Copy to ~/.config/news-brief/config.toml and change what you like. Anything left out keeps its default.
+
+# Claude model that writes the summary (through the `claude` CLI, so it uses your subscription)
+model = "sonnet"
+
+# Newest N stories from each outlet, and at most N stories per topic on the page
+per_feed = 8
+per_topic = 30
+
+# Who the summary is written for (steers which political stories matter most)
+reader = "The reader lives in Canada and follows Canadian, US and world politics."
+
+# Setting `feeds` replaces the whole default list, so copy all the ones you want to keep.
+# topic is "tech" or "politics". Any RSS or Atom feed works.
+[[feeds]]
+topic = "tech"
+name = "Hacker News"
+url = "https://news.ycombinator.com/rss"
+
+[[feeds]]
+topic = "tech"
+name = "Ars Technica"
+url = "https://feeds.arstechnica.com/arstechnica/index"
+
+[[feeds]]
+topic = "tech"
+name = "The Verge"
+url = "https://www.theverge.com/rss/index.xml"
+
+[[feeds]]
+topic = "tech"
+name = "TechCrunch"
+url = "https://techcrunch.com/feed/"
+
+[[feeds]]
+topic = "tech"
+name = "Wired"
+url = "https://www.wired.com/feed/rss"
+
+[[feeds]]
+topic = "politics"
+name = "CBC"
+url = "https://www.cbc.ca/webfeed/rss/rss-politics"
+
+[[feeds]]
+topic = "politics"
+name = "The Globe and Mail"
+url = "https://www.theglobeandmail.com/arc/outboundfeeds/rss/category/politics/"
+
+[[feeds]]
+topic = "politics"
+name = "National Post"
+url = "https://nationalpost.com/category/news/politics/feed"
+
+[[feeds]]
+topic = "politics"
+name = "NPR"
+url = "https://feeds.npr.org/1014/rss.xml"
+
+[[feeds]]
+topic = "politics"
+name = "Politico"
+url = "https://rss.politico.com/politics-news.xml"
+
+[[feeds]]
+topic = "politics"
+name = "Fox News"
+url = "https://moxie.foxnews.com/google-publisher/politics.xml"
+
+[[feeds]]
+topic = "politics"
+name = "BBC World"
+url = "https://feeds.bbci.co.uk/news/world/rss.xml"
+
+# More that work: The Register (https://www.theregister.com/headlines.atom), Global News politics
+# (https://globalnews.ca/politics/feed/), The Guardian US politics (https://www.theguardian.com/us-news/us-politics/rss),
+# The Hill (https://thehill.com/homenews/feed/)

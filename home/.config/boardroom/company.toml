@@ -1,0 +1,37 @@
+name = "My AI Company"
+
+[[member]]
+id = "ceo"
+role = "ceo"
+model = "claude:opus"
+subagent_model = "claude:haiku"
+
+[[member]]
+id = "debugger"
+role = "debugger"
+model = "claude:sonnet"
+subagent_model = "claude:haiku"
+
+[[member]]
+id = "worker-1"
+role = "worker"
+model = "claude:sonnet"
+subagent_model = "claude:haiku"
+
+[[member]]
+id = "worker-2"
+role = "worker"
+model = "claude:sonnet"
+subagent_model = "claude:haiku"
+
+[[member]]
+id = "worker-3"
+role = "worker"
+model = "claude:sonnet"
+subagent_model = "claude:haiku"
+
+[[member]]
+id = "worker-4"
+role = "worker"
+model = "claude:sonnet"
+subagent_model = "claude:haiku"

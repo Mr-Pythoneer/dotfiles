@@ -1,0 +1,27 @@
+#!/bin/bash
+# One-time rice setup that needs your password: installs fastfetch, puts the GitHub Dark scheme
+# where Caelestia looks for colour schemes, installs the terminal-style login screen, then switches
+# everything on (rice-apply). Safe to run again.
+# Run it again if a Caelestia update ever loses the scheme (rice-wall will tell you).
+set -euo pipefail
+src="$HOME/.local/src/rice/caelestia-scheme/github/default/dark.txt"
+schemes=$(python3 -c 'import caelestia, os; print(os.path.join(os.path.dirname(caelestia.__file__), "data", "schemes"))')
+echo "Installing fastfetch, the GitHub Dark scheme ($schemes/github) and the terminal login screen."
+echo "Your password is needed once."
+if command -v pacman >/dev/null; then sudo pacman -S --needed --noconfirm fastfetch
+elif command -v dnf >/dev/null; then sudo dnf -y install fastfetch
+else echo "Neither pacman nor dnf found; install fastfetch yourself." >&2; fi
+# the scheme folder is ours (Caelestia doesn't own it), so later colour tweaks need no password
+sudo install -d -o "$USER" -g "$(id -gn)" "$schemes/github" "$schemes/github/default"
+install -m644 "$src" "$schemes/github/default/dark.txt"
+# old login theme in the same colours too (kept as a fallback)
+sudo install -d /usr/share/sddm/themes/caelestia   # (exists on Arch; not on Fedora)
+sudo install -m644 "$HOME/.local/src/rice/sddm/theme.conf" /usr/share/sddm/themes/caelestia/theme.conf
+sudo install -m644 "$HOME/.local/src/rice/sddm/background.png" /usr/share/sddm/themes/caelestia/background.png
+# the login screen: a terminal-style prompt over the code rain. To go back to the old one, set
+# Current=caelestia in /etc/sddm.conf.d/theme.conf
+sudo rm -rf /usr/share/sddm/themes/rice-terminal
+sudo cp -r "$HOME/.local/src/rice/sddm/rice-terminal" /usr/share/sddm/themes/rice-terminal
+sudo chmod -R a+rX /usr/share/sddm/themes/rice-terminal
+printf '[Theme]\nCurrent=rice-terminal\n' | sudo tee /etc/sddm.conf.d/theme.conf >/dev/null
+"$HOME/.local/bin/rice-apply"

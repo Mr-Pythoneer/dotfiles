@@ -1,0 +1,15 @@
+#!/bin/sh
+# Print: drag a box, then annotate it in satty (Ctrl+C copies, Ctrl+S saves).
+# Pressing Print again while picking cancels; only one runs at a time.
+dir=~/Pictures/Screenshots
+mkdir -p "$dir"
+pkill -x slurp && exit 0
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/screenshot-area.lock"
+flock -n 9 || exit 0
+# The lock stays with this script only (9>&- on everything it starts): wl-copy, which satty starts for
+# Ctrl+C, keeps running to serve the clipboard until something else is copied, and if it inherited the
+# lock, the next Print/F9 would quietly do nothing until then.
+geom=$(slurp -d -b '#0000004d' -c '#dcdcd8ff' -s '#00000000' -w 2 9>&-) || exit 0
+grim -g "$geom" - 9>&- | satty --filename - \
+    --output-filename "$dir/satty-%Y-%m-%d_%H-%M-%S.png" \
+    --early-exit --copy-command wl-copy 9>&-

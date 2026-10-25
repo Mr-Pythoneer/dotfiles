@@ -1,0 +1,4222 @@
+#!/usr/bin/env python3
+"""archboot — terminal eye candy: a random animated scene with your system info, played once.
+
+Usage: archboot                 boot lines, then a random scene, played once
+       archboot --no-boot       skip the boot lines (alias: archfetch)
+       archboot --scene NAME    a specific scene (archboot --list shows them; alias: scene NAME)
+       archboot --screensaver   every scene in turn, full-screen with a clock; any key quits
+Any key skips to the end; Esc stops it and clears the screen.
+"""
+import colorsys, math, os, pwd, random, select, shutil, signal, socket, sys, termios, time, tty
+
+ESC = "\x1b["
+RESET = ESC + "0m"
+
+
+def distro_id():
+    if os.environ.get("ARCHBOOT_BRAND"):  # preview another distro's look: ARCHBOOT_BRAND=fedora archboot
+        return os.environ["ARCHBOOT_BRAND"]
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("ID="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "arch"
+
+
+# Everything that names the distro comes from here, so the same file is Arch on the desktop and Fedora in the VM
+BRANDS = {
+    "arch": {"name": "Arch Linux", "word": "Arch", "caps": "ARCH", "blue": (23, 147, 209), "pm": "pacman",
+             "upgrade": "sudo pacman -Syu", "sync": [":: Synchronizing", " core   up to date", " extra  up to date"],
+             "ticker": "$ARCH", "vision": "ARCHVISION", "since": "2002", "fan": "pacman_-Syu"},
+    "fedora": {"name": "Fedora Linux", "word": "Fedora", "caps": "FEDORA", "blue": (81, 162, 218), "pm": "dnf",
+               "upgrade": "sudo dnf upgrade", "sync": ["Updating and loading", " repositories...", "Nothing to do."],
+               "ticker": "$RHT", "vision": "RED HAT VISION", "since": "1993", "fan": "dnf_upgrade"},
+}
+BRAND = BRANDS.get(distro_id(), BRANDS["arch"])
+FEDORA = BRAND is BRANDS["fedora"]
+BRAND_BLUE = BRAND["blue"]
+
+# ── Tux sprite (20×22 pixels, drawn with half-blocks so pixels come out square) ──
+BODY = [
+    ".......KKKKKK.......",
+    "......KKGGGGKK......",
+    ".....KKGGKKKKKK.....",
+    ".....KWWKKKKWWK.....",
+    ".....KWEKKKKEWK.....",
+    ".....KKYYYYYYKK.....",
+    ".....KYYYYYYYYK.....",
+    "....KKKYYYYYYKKK....",
+    "....KKWWWYYWWWKK....",
+    "...KKWWWWWWWWWWKK...",
+    "...KWWWWWWWWWWWWK...",
+    "..KKWWWWWWWWWWWWKK..",
+    "..KWWWWWWWWWWWWWWK..",
+    "..KWWWWWWWWWWWWWWK..",
+    "..KWWWWWWWWWWWWWWK..",
+    "..KWWWWWWWWWWWWWWK..",
+    "..KKWWWWWWWWWWWWKK..",
+    "...KWWWWWWWWWWWWK...",
+    "...KKWWWWWWWWWWKK...",
+    "....KKKKKKKKKKKK....",
+]
+FOOT_L = ["..YYYYY...", ".DYYYYY..."]
+FOOT_R = ["...YYYYY..", "...YYYYYD."]
+PAL = {
+    "K": (62, 65, 77), "G": (105, 110, 126), "W": (236, 236, 228),
+    "E": (16, 16, 20), "Y": (255, 178, 36), "D": (214, 122, 22),
+}
+
+
+def tux(pix, ox, oy, t, move="dance", walk_dir=1):
+    """Draw Tux into pix {(x, y): rgb} with its top-left at (ox, oy)."""
+    beat = t * 2.0  # 120 bpm
+    if isinstance(move, tuple):  # an explicit pose: ("pose", left flipper, right flipper, (lift_l, lift_r))
+        al, ar, lift = move[1], move[2], move[3]
+    elif move == "swim":  # slow breaststrokes and kicking feet
+        al = ar = 1.1 + 0.8 * math.sin(t * 3)
+        lift = (1, 0) if int(t * 3) % 2 else (0, 1)
+    elif move == "dance":
+        style = int(beat / 4) % 3
+        if style == 0:    # alternating flaps
+            al = 0.5 + 1.6 * (0.5 + 0.5 * math.sin(math.pi * beat))
+            ar = 0.5 + 1.6 * (0.5 - 0.5 * math.sin(math.pi * beat))
+        elif style == 1:  # hands in the air
+            al = ar = 2.3 + 0.5 * math.sin(math.pi * beat * 2)
+        else:             # chicken dance
+            al = ar = 0.9 + 0.7 * abs(math.sin(math.pi * beat * 2))
+        ox += round(3 * math.sin(math.pi * beat / 2))
+        oy -= int(abs(math.sin(math.pi * beat)) * 2.2)
+        lift = (0, 1) if int(beat) % 2 else (1, 0)
+    elif move == "walk":
+        al = ar = 0.5 + 0.35 * abs(math.sin(t * 8))
+        oy -= int(abs(math.sin(t * 8)) * 1.5)
+        lift = (1, 0) if int(t * 5) % 2 else (0, 1)
+    elif move == "type":  # flippers pattering on a keyboard
+        al = 0.8 + 0.18 * math.sin(t * 23)
+        ar = 0.8 + 0.18 * math.sin(t * 23 + 1.7)
+        lift = (0, 0)
+    elif move == "fish":  # left flipper relaxed, right one holding the rod out
+        al, ar = 0.45 + 0.05 * math.sin(t * 2), 1.35
+        lift = (0, 0)
+    elif move == "idle":
+        al = ar = 0.45 + 0.05 * math.sin(t * 2)
+        lift = (0, 0)
+    else:                 # "wave": standing, right flipper waving hello
+        al = 0.45
+        ar = 2.4 + 0.45 * math.sin(t * 10)
+        lift = (0, 0)
+
+    def put(x, y, c):
+        pix[(ox + x, oy + y)] = c
+
+    for side, ang, sx in ((-1, al, 3.5), (1, ar, 16.5)):  # flippers behind the body
+        dx, dy = side * math.sin(ang), math.cos(ang)
+        for i in range(15):
+            s = i * 0.5
+            w = 3 if s < 3 else 2 if s < 6 else 1  # thick at the shoulder, tapering to the tip
+            for k in range(w):
+                put(round(sx + dx * s - side * dy * k), round(10 + dy * s + side * dx * k), PAL["K"])
+
+    blink = (t % 3.1) < 0.13
+    for y, line in enumerate(BODY):
+        for x, ch in enumerate(line):
+            if ch == ".":
+                continue
+            if blink and y in (3, 4) and ch in "WE":
+                ch = "K" if y == 3 else "W"
+            put(x, y, PAL[ch])
+    for foot, x0, up in ((FOOT_L, 0, lift[0]), (FOOT_R, 10, lift[1])):
+        for y, line in enumerate(foot):
+            for x, ch in enumerate(line):
+                if ch != ".":
+                    put(x0 + x, 20 + y - up, PAL[ch])
+
+
+# ── drawing helpers ──
+def hsv(h, s=0.7, v=1.0):
+    return tuple(int(c * 255) for c in colorsys.hsv_to_rgb(h % 1.0, s, v))
+
+
+def scale(c, f):
+    return tuple(int(v * f) for v in c)
+
+
+class Painter:
+    """Builds a row of cells, only emitting colour codes when they change.
+    Painter.fade (0..1) dims every colour toward Painter.base, for fading scenes in and out."""
+    fade, base = 1.0, (6, 7, 9)
+
+    def __init__(self):
+        self.parts, self.fg, self.bg = [], None, None
+
+    @classmethod
+    def faded(cls, c):
+        if cls.fade >= 1:
+            return c
+        return tuple(round(b + (x - b) * cls.fade) for x, b in zip(c, cls.base))
+
+    def cell(self, ch, fg=None, bg=None):
+        if fg != self.fg:
+            fc = self.faded(fg) if fg else None
+            self.parts.append(f"{ESC}38;2;{fc[0]};{fc[1]};{fc[2]}m" if fg else ESC + "39m")
+            self.fg = fg
+        if bg != self.bg:
+            bc = self.faded(bg) if bg else None
+            self.parts.append(f"{ESC}48;2;{bc[0]};{bc[1]};{bc[2]}m" if bg else ESC + "49m")
+            self.bg = bg
+        self.parts.append(ch)
+
+    def text(self, s, fg=None, bold=False):
+        if bold:
+            self.parts.append(ESC + "1m")
+        for ch in s:
+            self.cell(ch, fg, None)
+        if bold:
+            self.parts.append(ESC + "22m")
+
+    def done(self):
+        self.parts.append(RESET + ESC + "K")
+        self.fg = self.bg = None
+        s = "".join(self.parts)
+        self.parts = []
+        return s
+
+
+def compose(p, pix, text, row, width, bg=None):
+    """Draw one terminal row: text with its own background wins, then pixels, then plain text."""
+    for col in range(width):
+        cell = text.get((col, row))
+        if cell and len(cell) == 3:
+            p.cell(*cell)
+            continue
+        top, bot = pix.get((col, row * 2)), pix.get((col, row * 2 + 1))
+        if top and bot:
+            p.cell("▀", top, bot) if top != bot else p.cell("█", top, bg)
+        elif top:
+            p.cell("▀", top, bg)
+        elif bot:
+            p.cell("▄", bot, bg)
+        elif (col, row) in text:
+            ch, fg = text[(col, row)]
+            p.cell(ch, fg, bg)
+        else:
+            p.cell(" ", None, bg)
+
+
+# ── input / terminal ──
+class KeyWatch:
+    """cbreak mode so a keypress can skip; restores the tty afterwards.
+    Esc sets .escaped too, meaning "get out of the way now", not just "skip ahead"."""
+
+    def __enter__(self):
+        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        if self.fd is not None:
+            self.old = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        self.hit = self.escaped = False
+        self.key = b""
+        return self
+
+    def wait(self, secs):
+        if self.hit:
+            return True
+        if self.fd is None:
+            time.sleep(secs)
+        elif select.select([self.fd], [], [], secs)[0]:
+            self.hit = True
+            self.key = os.read(self.fd, 64)
+            self.escaped = self.key.startswith(b"\x1b")
+        return self.hit
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            termios.tcflush(self.fd, termios.TCIFLUSH)  # don't leak the key into the prompt
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+
+def out(s):
+    sys.stdout.write(s)
+    sys.stdout.flush()
+
+
+# ── system info ──
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def sysinfo():
+    user = pwd.getpwuid(os.getuid()).pw_name
+    osname = BRAND["name"]
+    for line in read("/etc/os-release").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            osname = line.split("=", 1)[1].strip('"')
+    up = int(float(read("/proc/uptime", "0").split()[0]))
+    h, m = divmod(up // 60, 60)
+    pkgs, pm = "?", BRAND["pm"]
+    try:
+        pkgs = str(len(os.listdir("/var/lib/pacman/local")) - 1)
+    except OSError:
+        if shutil.which("rpm"):
+            import subprocess
+            r = subprocess.run(["rpm", "-qa", "--qf", ".\\n"], capture_output=True, text=True)
+            pkgs, pm = str(r.stdout.count(".")), "rpm"
+    mem = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, v = line.split(":", 1)
+        mem[k] = int(v.split()[0])
+    cpu = "?"
+    for line in read("/proc/cpuinfo").splitlines():
+        if line.startswith("model name"):
+            cpu = " ".join(line.split(":", 1)[1].split())
+            cpu = cpu.replace("(R)", "").replace("(TM)", "").split(" @")[0]
+            break
+    title = f"{user}@{socket.gethostname()}"
+    return [
+        ("", title), ("", "─" * len(title)),
+        ("OS", osname), ("Kernel", os.uname().release),
+        ("Uptime", f"{h}h {m}m" if h else f"{m}m"),
+        ("Packages", f"{pkgs} ({pm})"),
+        ("Shell", os.path.basename(os.environ.get("SHELL", "bash"))),
+        ("WM", os.environ.get("XDG_CURRENT_DESKTOP", "?")),
+        ("CPU", cpu[:30]),
+        ("Memory", f"{(mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)) // 1024} / "
+                   f"{mem.get('MemTotal', 0) // 1024} MiB"),
+    ]
+
+
+HOLD = 0.4  # a beat on the last frame of a story before the splash stops animating
+
+
+# ── splash scenes: each paints a 40×30-pixel stage (15 text rows) beside the system info ──
+STAGE_W, STAGE_ROWS = 40, 15
+NOTES = "♪♫♬♩"
+
+
+def disc(pix, cx, cy, r, color):
+    for y in range(int(cy - r) - 1, int(cy + r) + 2):
+        for x in range(int(cx - r) - 1, int(cx + r) + 2):
+            if math.hypot(x + 0.5 - cx, y + 0.5 - cy) <= r:
+                pix[(x, y)] = color
+
+
+def put_text(text, col, row, s, color):
+    for i, ch in enumerate(s):
+        if ch != " ":
+            text[(col + i, row)] = (ch, color)
+
+
+class Dance:
+    """Tux dancing on a disco floor, music notes floating up."""
+
+    def __init__(self):
+        self.notes, self.last_beat = [], -1  # note: [x, y, vx, char, hue, born]
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        beat = int(t * 2)
+        if not done and beat != self.last_beat:
+            self.last_beat = beat
+            for _ in range(2):
+                self.notes.append([random.choice((8, 9, 30, 31)), 7.0, random.uniform(-0.5, 0.5),
+                                   random.choice(NOTES), random.random(), t])
+        for n in self.notes:
+            n[0] += n[2] * 0.15
+            n[1] -= 0.12
+        self.notes = [n for n in self.notes if n[1] > 0 and t - n[5] < 2.2]
+        for x, y, _, ch, hue, born in self.notes:
+            text[(int(x), int(y))] = (ch, hsv(hue + t * 0.3, 0.6, max(0.25, 1 - (t - born) / 2.2)))
+        for i in range(10):  # twinkling sparkles
+            r = random.Random(i * 7919)
+            sx, sy = r.randrange(STAGE_W), r.randrange(STAGE_ROWS - 6)
+            if math.sin(t * 3 + i * 1.7) > 0.6:
+                text.setdefault((sx, sy), ("✦" if i % 3 == 0 else "·", hsv(0.55 + i * 0.03, 0.4)))
+        tux(pix, 10, 3, t, "wave" if done else "dance")
+        for y in range(26, 30):  # disco floor
+            for x in range(STAGE_W):
+                lit = 0.55 if (x // 4 + (y - 26) // 2 + beat) % 2 else 0.16
+                c = scale(BRAND_BLUE, lit * 0.6) if done else hsv(0.55 + 0.12 * math.sin(x * 0.3 + t * 2), 0.65, lit)
+                pix[(x, y)] = scale(c, 0.6) if y % 2 else c
+        return pix, text
+
+
+class Pacman:
+    """pacman -Syu, literally: Pac-Man eats the updates, grabs the power pellet, the ghost flees."""
+    TRAVEL = 3.0
+
+    def over(self, t):  # ghost has fled off-screen, then a moment to enjoy it
+        return t > self.TRAVEL + 2.5 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        put_text(text, 1, 0, ("$ " + BRAND["upgrade"])[:max(0, int(t * 30))], (200, 200, 205))
+        for y, f in ((4, 1.0), (6, 0.45), (22, 0.45), (24, 1.0)):  # maze walls
+            for x in range(STAGE_W):
+                pix[(x, y)] = scale(BRAND_BLUE, f)
+        p = 1.0 if done else min(1.0, t / self.TRAVEL)
+        cx, cy = -7 + p * 39, 14.0
+        scared = done or t >= self.TRAVEL
+        for x in range(2, 31, 4):  # pellets still ahead of Pac-Man
+            if x > cx:
+                for dx in (0, 1):
+                    for dy in (0, 1):
+                        pix[(x + dx, 13 + dy)] = (255, 184, 151)
+        if not scared and int(t * 6) % 2:
+            disc(pix, 35, 14, 2.2, (255, 184, 151))  # power pellet
+        mouth = 0.8 * abs(math.sin(t * 14))
+        for y in range(7, 22):
+            for x in range(int(cx) - 8, int(cx) + 9):
+                dx, dy = x + 0.5 - cx, y + 0.5 - cy
+                if math.hypot(dx, dy) <= 6.5 and abs(math.atan2(dy, dx)) >= mouth:
+                    pix[(x, y)] = (255, 214, 0)
+        # the ghost chases, until the power pellet turns it blue and it runs
+        if scared:
+            gx = 10 if done else cx - 17 - (t - self.TRAVEL) * 12
+            flash = not done and int(t * 8) % 2 and t - self.TRAVEL > 0.6
+            body = (240, 240, 250) if flash else (40, 50, 220)
+        else:
+            gx, body = cx - 17, (238, 62, 62)
+        self.ghost(pix, int(gx), 8, t, body, scared)
+        width = 26  # ILoveCandy progress bar
+        pos = int(p * width)
+        bar = "-" * pos + ("C" if int(t * 8) % 2 else "c") + "".join(" o"[i % 2] for i in range(width - pos - 1))
+        put_text(text, 1, 13, ":: there is nothing to do" if scared else ":: Starting full system upgrade...",
+                 (150, 160, 175))
+        put_text(text, 1, 14, "[", (110, 110, 120))
+        for i, ch in enumerate(bar[:width]):
+            text[(2 + i, 14)] = (ch, (255, 214, 0) if ch in "Cc" else (255, 184, 151) if ch == "o" else (90, 90, 100))
+        put_text(text, 2 + width, 14, f"] {int(p * 100):3d}%", (110, 110, 120))
+        return pix, text
+
+    @staticmethod
+    def ghost(pix, gx, gy, t, body, scared):
+        for y in range(14):
+            for x in range(14):
+                dx, dy = x + 0.5 - 7, y + 0.5 - 7
+                if (y < 7 and math.hypot(dx, dy) <= 7) or 7 <= y < 12 or (y >= 12 and (x + int(t * 8)) % 4 < 2):
+                    pix[(gx + x, gy + y)] = body
+        if scared:
+            for ex in (4, 9):
+                pix[(gx + ex, gy + 5)] = (255, 184, 151)
+            for x in range(2, 12):
+                pix[(gx + x, gy + 9 + x % 2)] = (255, 184, 151)
+        else:
+            for ex in (2, 8):
+                for x in range(3):
+                    for y in range(4):
+                        pix[(gx + ex + x, gy + 3 + y)] = (240, 240, 250)
+                for x in range(2):
+                    for y in range(2):
+                        pix[(gx + ex + 1 + x, gy + 5 + y)] = (40, 50, 200)
+
+
+class Snow:
+    """Tux in an Arch-blue scarf, snow falling and piling up under the moon."""
+
+
+    def __init__(self):
+        r = random.Random()
+        self.flakes = [(r.uniform(0, 40), r.uniform(0, 32), r.uniform(3, 7), r.uniform(0, 6.3)) for _ in range(45)]
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        disc(pix, 35.5, 4.5, 3.4, (238, 232, 200))  # moon
+        pix[(34, 3)] = pix[(36, 6)] = (205, 198, 165)
+        for y in range(10, 26):  # pine tree, three tiers, snow on the edges
+            k = y - 10
+            half = (k % 5) * 0.9 + (k // 5) * 1.2 + 0.6
+            for x in range(STAGE_W):
+                d = abs(x + 0.5 - 34)
+                if d <= half:
+                    pix[(x, y)] = (225, 232, 245) if d > half - 1 and k % 5 == 4 else (34, 84, 62)
+        pix[(33, 26)] = pix[(34, 26)] = (100, 70, 45)
+        tux(pix, 8, 4, t, "wave" if done else "idle")
+        for x in range(3 + 8, 17 + 8):  # scarf around the neck, tail flapping in the wind
+            pix[(x, 13)] = BRAND_BLUE
+            pix[(x, 14)] = scale(BRAND_BLUE, 0.7)
+        for i, y in enumerate(range(15, 20)):
+            pix[(21 + round(math.sin(t * 5 + i * 0.8) * (i * 0.35)), y)] = BRAND_BLUE if i % 2 else scale(BRAND_BLUE, 0.7)
+        pile = min(1.5, t * 0.45) if not done else 1.5
+        for x in range(STAGE_W):  # snowdrift, growing as the snow falls
+            top = int(26.5 - pile - 1.2 * math.sin(x * 0.3) - 0.8 * math.sin(x * 0.11 + 1))
+            for y in range(top, 30):
+                pix[(x, y)] = (240, 245, 255) if y == top else (200, 212, 232)
+        for x0, y0, speed, ph in self.flakes:
+            y = (y0 + speed * t) % 32 - 2
+            x = x0 + math.sin(t * 1.5 + ph) * 1.5
+            pix.setdefault((int(x), int(y)), (235, 240, 255) if speed > 5 else (150, 160, 185))  # behind Tux
+        return pix, text
+
+
+class FedoraLogo:
+    """The Fedora logo assembling itself from a swirl of particles, then shimmering."""
+
+    def __init__(self):
+        r = random.Random()
+        self.parts = []
+        cx, cy, rad = 20.0, 12.5, 12.0
+        for y in range(26):
+            for x in range(STAGE_W):
+                u, v = x + 0.5 - cx, y + 0.5 - cy
+                if math.hypot(u, v * 1.0) > rad:
+                    continue
+                # the white f: a stem, its hook over the top to the right, and the crossbar
+                stem = -4.5 <= u <= -1.0 and -5.0 <= v <= 8.0
+                hook = math.hypot(u - 0.75, v + 5.0) <= 5.25 and math.hypot(u - 0.75, v + 5.0) >= 1.75 and v <= -5.0 and u >= -4.5
+                bar = -9.0 <= u <= 3.0 and -0.5 <= v <= 2.5
+                tail = 1.75 <= math.hypot(u + 5.25, v - 5.5) <= 5.0 and v >= 5.5 and u <= -1.0  # curls back left
+                white = stem or hook or bar or tail
+                a, rr = r.uniform(0, 2 * math.pi), r.uniform(22, 34)
+                self.parts.append((x, y, cx + math.cos(a) * rr, 13 + math.sin(a) * rr * 0.6,
+                                   r.uniform(0, 0.6) + y * 0.015, r.random(), white))
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        for x, y, sx, sy, delay, hue, white in self.parts:
+            p = 1.0 if done else max(0.0, min(1.0, (t - delay) / 1.3))
+            e = 1 - (1 - p) ** 3
+            spin = (1 - e) * 1.8
+            ox, oy = sx - x, sy - y
+            px = x + (ox * math.cos(spin) - oy * math.sin(spin)) * (1 - e)
+            py = y + (ox * math.sin(spin) + oy * math.cos(spin)) * (1 - e)
+            v = 0.8 + 0.2 * max(0.0, math.sin(x * 0.25 + y * 0.5 - t * 6)) ** 8
+            final = scale((240, 242, 246), v) if white else scale((60, 110, 180), v + 0.1 * math.sin(y * 0.35 - t * 4))
+            spark = hsv(hue, 0.5, 1.0)
+            pix[(round(px), round(py))] = tuple(min(255, int(a + (b - a) * e)) for a, b in zip(spark, final))
+        title = "F E D O R A   L I N U X"
+        shown = title if done else title[:max(0, int((t - 1.9) * 14))]
+        for i, ch in enumerate(shown):
+            if ch != " ":
+                text[(8 + i, 14)] = (ch, scale(BRAND_BLUE, 0.85 + 0.15 * math.sin(t * 3 + i * 0.4)))
+        return pix, text
+
+
+class ArchLogo:
+    """The Arch logo assembling itself from a swirl of particles, then shimmering."""
+
+
+    def __init__(self):
+        r = random.Random()
+        self.parts = []
+        for y in range(26):
+            for x in range(STAGE_W):
+                u, yy = x + 0.5 - 20, y + 0.5
+                if abs(u) >= (y + 1) * 0.6:
+                    continue
+                if (u / 6.5) ** 2 + ((yy - 27) / 11.5) ** 2 < 1:  # the arch under the peak
+                    continue
+                ax, ay, bx, by = -10.0, 18.5, 2.0, 11.0  # the slanted notch on the left
+                s = max(0, min(1, ((u - ax) * (bx - ax) + (yy - ay) * (by - ay)) / ((bx - ax) ** 2 + (by - ay) ** 2)))
+                if math.hypot(u - (ax + s * (bx - ax)), yy - (ay + s * (by - ay))) < 0.9 and s < 0.98:
+                    continue
+                a, rad = r.uniform(0, 2 * math.pi), r.uniform(22, 34)
+                self.parts.append((x, y, 20 + math.cos(a) * rad, 13 + math.sin(a) * rad * 0.6,
+                                   r.uniform(0, 0.6) + y * 0.015, r.random()))
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        for x, y, sx, sy, delay, hue in self.parts:
+            p = 1.0 if done else max(0.0, min(1.0, (t - delay) / 1.3))
+            e = 1 - (1 - p) ** 3
+            spin = (1 - e) * 1.8  # swirl in rather than flying straight
+            ox, oy = sx - x, sy - y
+            px = x + (ox * math.cos(spin) - oy * math.sin(spin)) * (1 - e)
+            py = y + (ox * math.sin(spin) + oy * math.cos(spin)) * (1 - e)
+            wave = math.sin(y * 0.35 + x * 0.18 - t * 4)
+            v = 0.75 + 0.25 * max(0.0, math.sin(x * 0.25 + y * 0.5 - t * 6)) ** 8
+            final = hsv(0.55 + 0.05 * wave, 0.8, v)
+            spark = hsv(hue, 0.5, 1.0)
+            pix[(round(px), round(py))] = tuple(int(a + (b - a) * e) for a, b in zip(spark, final))
+        title = "A R C H   L I N U X"
+        shown = title if done else title[:max(0, int((t - 1.9) * 14))]
+        for i, ch in enumerate(shown):
+            if ch != " ":
+                text[(10 + i, 14)] = (ch, hsv(0.55 + 0.04 * math.sin(t * 3 + i * 0.4), 0.6))
+        return pix, text
+
+
+class Hacker:
+    """Tux at the keyboard while a terminal scrolls through a kernel build and an upgrade."""
+    STAGE = (44, 15)  # room for Tux's elbow
+    LINES = ["$ make -j8", "  CC kernel/fork.o", "  CC mm/mmap.o", "  CC fs/ext4/inode.o", "  CC net/ipv4/tcp.o",
+             "  LD vmlinux", "  Kernel: bzImage", "$ " + BRAND["upgrade"], *BRAND["sync"], "$ ping -c1 tux", "64 bytes: 0.04ms", "$ uptime", " up 999 days",
+             "$ fortune", "fish > bugs", "$ cowsay moo", "< moo >", "$ ls ~/fish", "salmon.c tuna.py",
+             "$ git push", "Everything up-to-", "  date", "$ whoami", " tux"]
+    FINAL = ["$ uname -o", "GNU/Linux", "$ cat /etc/issue", BRAND["name"], "$ echo btw", f"I use {BRAND['word']} btw"]
+
+    def over(self, t):  # every line printed, then a moment to read "I use Arch btw"
+        return t > (len(self.LINES) + len(self.FINAL)) / 7 + HOLD + 1
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        bezel = (88, 92, 104)
+        for x in range(18):
+            pix[(x, 4)] = pix[(x, 23)] = bezel
+        for y in range(4, 24):
+            pix[(0, y)] = pix[(17, y)] = bezel
+        for x in range(7, 11):
+            pix[(x, 24)] = pix[(x, 25)] = (70, 73, 84)
+        for x in range(3, 15):
+            pix[(x, 26)] = (70, 73, 84)
+        n = len(self.LINES) if done else int(t * 7)
+        lines = (self.LINES + self.FINAL)[:n] if not done else self.FINAL
+        lines = lines[-7:]
+        cursor = "█" if int(t * 3) % 2 else " "
+        for i, line in enumerate(lines + ["$ " + cursor]):
+            for j, ch in enumerate(line[:16]):
+                if ch != " ":
+                    green = line.startswith("$") and j == 0
+                    text[(1 + j, 3 + i)] = (ch, (80, 250, 123) if green else (220, 220, 225) if line.startswith("$")
+                                            else (120, 190, 140))
+        tux(pix, 21, 3, t, "idle" if done else "type")
+        for x in range(18, STAGE_W):  # desk and keyboard
+            pix[(x, 25)] = pix[(x, 26)] = (96, 68, 46)
+            if x >= 20:
+                pix[(x, 23)] = (110, 115, 128) if x % 2 else (78, 82, 94)
+                pix[(x, 24)] = (62, 65, 77)
+        return pix, text
+
+
+def line(pix, x0, y0, x1, y1, color):
+    n = int(max(abs(x1 - x0), abs(y1 - y0)) * 2) + 1
+    for i in range(n + 1):
+        k = i / n
+        pix[(round(x0 + (x1 - x0) * k), round(y0 + (y1 - y0) * k))] = color
+
+
+def sprite(pix, rows, colors, ox, oy):
+    for y, row in enumerate(rows):
+        for x, ch in enumerate(row):
+            if ch != ".":
+                pix[(ox + x, oy + y)] = colors[ch]
+
+
+class Fishing:
+    """Tux ice fishing off a floe: the bobber dips, and he reels one in."""
+    FISH = ["..BBB..B", ".BBBBBBB", "BEBBBBB.", ".BBBBBBB", "..BBB..B"]
+
+    def over(self, t):  # fish landed
+        return t > 3.1 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        bob = round(math.sin(t * 2) * 0.6)
+        for x in range(STAGE_W):  # water with moving wave crests
+            for y in range(24, 30):
+                crest = y == 24 and math.sin(x * 0.5 + t * 3) > 0.2
+                pix[(x, y)] = (90, 150, 210) if crest else scale((30, 80, 140), 1 - (y - 24) * 0.08)
+        for x in range(1, 24):  # ice floe
+            for y in range(22 + bob, 26 + bob):
+                if not (y == 22 + bob and x in (1, 23)):
+                    pix[(x, y)] = (235, 242, 252) if y == 22 + bob else (180, 205, 232)
+        tux(pix, 4, bob, t, "fish")
+        tip = (36, 2 + bob)
+        line(pix, 21, 11 + bob, *tip, (150, 110, 70))  # rod
+        if done:
+            stage, caught = 3, 1.0
+        else:
+            stage = 0 if t < 1.8 else 1 if t < 2.4 else 2 if t < 3.1 else 3
+            caught = 0 if stage < 2 else min(1.0, (t - 2.4) / 0.7)
+        if stage <= 1:
+            dip = 0 if stage == 0 else (2 if int(t * 10) % 2 else 1)
+            line(pix, *tip, 36, 23 + dip, (200, 200, 210))
+            pix[(36, 23 + dip)] = pix[(37, 23 + dip)] = (238, 62, 62)  # bobber
+            pix[(36, 24 + dip)] = pix[(37, 24 + dip)] = (240, 240, 245)
+            if stage == 1:
+                text[(35, 10)] = ("!", (255, 214, 0))
+        else:
+            fy = round(26 - caught * 14)
+            line(pix, *tip, 36, fy, (200, 200, 210))
+            wiggle = int(t * 8) % 2 if stage == 3 else 0
+            sprite(pix, self.FISH, {"B": (95, 170, 240), "E": (16, 16, 20)}, 32 + wiggle, fy)
+            if stage == 3:
+                for i in range(3):
+                    if math.sin(t * 4 + i * 2) > -0.2:
+                        text[(26 + i * 4, 2 + (i % 2))] = ("♥", (255, 105, 140))
+        return pix, text
+
+
+class Rocket:
+    """Countdown, liftoff, and Tux heading for orbit in a rocket with a porthole."""
+    STAGE = (40, 18)  # the launch smoke
+
+    BODY = [".....BB.....", "....BBBB....", "...BBBBBB...", "...WWWWWW...", "..WWWWWWWW..",
+            "..WWKKKKWW..", "..WKKWWKKW..", "..WKKYYKKW..", "..WWKKKKWW..", "..WWWWWWWW..",
+            "..WWGWWGWW..", "..WWWWWWWW..", "..WWWWWWWW..", ".BWWWWWWWWB.", "BBWWWWWWWWBB",
+            "BBWWWWWWWWBB", "BB.GGGGGG.BB", "B...GGGG...B"]
+    COL = {"B": BRAND_BLUE, "W": (225, 228, 235), "K": (62, 65, 77), "Y": (255, 178, 36), "G": (120, 125, 140)}
+
+    def __init__(self):
+        r = random.Random()
+        self.stars = [(r.uniform(0, 40), r.uniform(0, 30), r.uniform(0.4, 1.0)) for _ in range(40)]
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        lift = 99 if done else max(0.0, t - 1.5)
+        speed = min(40.0, lift * lift * 18)          # px/s the world scrolls down
+        travel = 99 if done else (lift ** 3) * 6     # how far we've gone
+        for sx, sy, b in self.stars:
+            y = 2 + (sy + travel * b) % 25  # keep clear of the text rows
+            streak = 1 + int(min(4, speed * b / 10)) if not done else 1
+            for k in range(min(streak, int(y) - 1)):
+                pix.setdefault((int(sx), int(y) - k), scale((220, 225, 240), b * (1 - k / (streak + 1))))
+        rise = min(8.0, lift * 6)
+        rx, ry = 14, round(9 - rise)
+        if lift < 0.01:
+            shake = random.choice((-1, 0, 1)) if t > 0.6 else 0
+            rx += shake if t > 1.0 else 0
+        ground = 28 + travel
+        if ground < 30:
+            for x in range(STAGE_W):
+                for y in range(int(ground), 30):
+                    pix[(x, y)] = (70, 73, 84) if y == int(ground) else (45, 47, 55)
+        flame_len = 3 + (0 if lift == 0 and t < 1.0 else 3 + int(min(lift, 1) * 4))
+        for k in range(flame_len):  # flickering exhaust
+            half = max(0.5, 2.6 - k * 0.35 + random.uniform(-0.6, 0.6))
+            c = (255, 250, 220) if k < 2 else (255, 200, 60) if k < 4 else (255, 120, 40) if k < 7 else (200, 60, 40)
+            for x in range(int(rx + 6 - half), int(rx + 6 + half)):
+                pix[(x, ry + 18 + k)] = c
+        if lift < 1.2 and t > 0.8:  # smoke on the pad
+            for i in range(14):
+                a = i * 0.45
+                d = (t - 0.8) * 9 + (i % 3)
+                px, py = rx + 6 + math.cos(a) * d * 1.4, ground - 1 - abs(math.sin(a)) * d * 0.4
+                pix.setdefault((int(px), int(py)), (150, 150, 160))
+        sprite(pix, self.BODY, self.COL, rx, ry)
+        put_text(text, 1, 0, "$ ./launch.sh"[:max(0, int(t * 30))], (200, 200, 205))
+        if done or lift > 0:
+            msg, col = ("LIFTOFF", (255, 200, 60)) if not done and lift < 1.5 else ("next stop: orbit", (150, 160, 175))
+        else:
+            msg, col = f"T-{3 - min(2, int(t / 0.5))}", (255, 255, 255)
+        put_text(text, 1, 14, msg, col)
+        return pix, text
+
+
+class Tetris:
+    """A round of Tetris in an Arch-blue well, ending in a four-line clear."""
+    STAGE = (32, 15)  # the well and the score beside it
+    W, H = 10, 13
+    PIECES = [("O", [(0, 0), (1, 0), (0, 1), (1, 1)], 0, (255, 214, 0)),
+              ("T", [(0, 0), (1, 0), (2, 0), (1, 1)], 3, (170, 90, 220)),
+              ("L", [(0, 0), (0, 1), (0, 2), (1, 2)], 6, (255, 150, 40)),
+              ("I", [(0, 0), (0, 1), (0, 2), (0, 3)], 9, (60, 210, 230))]
+    COLORS = [(238, 62, 62), (80, 220, 110), (60, 120, 230), (255, 150, 40), (170, 90, 220)]
+
+    def __init__(self):
+        r = random.Random()
+        self.board = {}
+        for row in range(self.H - 4, self.H):  # four rows with a gap in the last column
+            for col in range(self.W - 1):
+                if not (row == self.H - 4 and col in (r.randrange(9), 4)):
+                    self.board[(col, row)] = r.choice(self.COLORS)
+        self.drops = []  # (cells, colour, start, land_row)
+        board = dict(self.board)
+        for i, (_, cells, col, color) in enumerate(self.PIECES):
+            row = 0
+            while all((col + dx, row + 1 + dy) not in board and row + 1 + dy < self.H for dx, dy in cells):
+                row += 1
+            self.drops.append((cells, col, color, i * 0.8, row))
+            for dx, dy in cells:
+                board[(col + dx, row + dy)] = color
+        self.final = board
+        self.clear_at = len(self.PIECES) * 0.8 + 0.1
+        self.full = [r for r in range(self.H) if all((c, r) in board for c in range(self.W))]
+
+    def over(self, t):  # lines cleared and the score shown
+        return t > self.clear_at + 0.5 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        ox, oy = 2, 1
+        for y in range(oy - 1, oy + self.H * 2 + 1):  # the well
+            pix[(ox - 1, y)] = pix[(ox + self.W * 2, y)] = scale(BRAND_BLUE, 0.8)
+        for x in range(ox - 1, ox + self.W * 2 + 1):
+            pix[(x, oy + self.H * 2)] = scale(BRAND_BLUE, 0.8)
+
+        def block(c, r, color):
+            for dx in (0, 1):
+                pix[(ox + c * 2 + dx, oy + r * 2)] = color
+                pix[(ox + c * 2 + dx, oy + r * 2 + 1)] = scale(color, 0.72)
+
+        if done or t > self.clear_at + 0.5:  # after the clear: rows removed, the rest drops
+            gone = len(self.full)
+            for (c, r), color in self.final.items():
+                if r not in self.full:
+                    shift = sum(1 for f in self.full if f > r)
+                    block(c, r + shift, color)
+            lines = gone
+        else:
+            board = dict(self.board)
+            for cells, col, color, start, land in self.drops:
+                if t >= start:
+                    row = min(land, int((t - start) * 16))
+                    for dx, dy in cells:
+                        board[(col + dx, row + dy)] = color
+            flash = t > self.clear_at and int(t * 12) % 2
+            for (c, r), color in board.items():
+                block(c, r, (255, 255, 255) if flash and r in self.full else color)
+            lines = 0
+        hue = t * 0.8
+        put_text(text, 25, 1, "SCORE", (150, 160, 175))
+        put_text(text, 25, 2, f"{lines * 200:06d}", (230, 230, 235))
+        put_text(text, 25, 4, "LINES", (150, 160, 175))
+        put_text(text, 25, 5, str(lines), (230, 230, 235))
+        if lines:
+            for i, ch in enumerate("TETRIS!" if lines == 4 else "NICE!"):
+                text[(25 + i, 8)] = (ch, hsv(hue + i * 0.1, 0.6))
+        return pix, text
+
+
+class Debug:
+    """Tux flies a little ship and shoots down every bug in the codebase."""
+    SHIP = ["...KKKKK...", "..KWEKWEK..", "..KKYYYKK..", ".KKWWWWWKK.", "KKWWWWWWWKK", "K.KWWWWWK.K", "...YY.YY..."]
+    BUG = [["..G...G..", ".GGGGGGG.", "GG.GGG.GG", "GGGGGGGGG", ".G.G.G.G.", "G.......G"],
+           ["..G...G..", ".GGGGGGG.", "GG.GGG.GG", "GGGGGGGGG", ".G.G.G.G.", ".G.....G."]]
+
+    def __init__(self):
+        self.bugs = [[c * 12 + 3, r * 7 + 3, True, hsv(0.3 + r * 0.35 + c * 0.05, 0.6, 0.95)]
+                     for r in range(2) for c in range(3)]
+        self.shots, self.booms, self.last, self.fired = [], [], 0.0, 0.0
+        self.ship_x = 15.0
+
+    def over(self, t):  # last bug squashed and its explosion faded (or it's taking far too long)
+        if any(b[2] for b in self.bugs):
+            return t > 20
+        return t > max((b[2] for b in self.booms), default=0) + 0.6 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        dt, self.last = t - self.last, t
+        sway = round(math.sin(t * 2) * 3)
+        alive = [b for b in self.bugs if b[2]]
+        if done:
+            for b in self.bugs:
+                b[2] = False
+            alive = []
+        target = (min(alive, key=lambda b: (-b[1], abs(b[0] + sway + 4 - self.ship_x - 5)))[0] + sway + 4 - 5
+                  if alive else 15)
+        self.ship_x += max(-30 * dt, min(30 * dt, target - self.ship_x))
+        if alive and t - self.fired > 0.32 and abs(target - self.ship_x) < 2:
+            self.fired = t
+            self.shots.append([self.ship_x + 5, 19.0])
+        for s in self.shots:
+            s[1] -= 45 * dt
+            for b in alive:
+                if b[2] and b[0] + sway <= s[0] <= b[0] + sway + 8 and b[1] <= s[1] <= b[1] + 5:
+                    b[2], s[1] = False, -99
+                    self.booms.append([b[0] + sway + 4, b[1] + 2, t, b[3]])
+        self.shots = [s for s in self.shots if s[1] > -2]
+        for b in self.bugs:
+            if b[2]:
+                sprite(pix, self.BUG[int(t * 4) % 2], {"G": b[3]}, b[0] + sway, b[1])
+        for x, y, born, color in self.booms:
+            age = t - born
+            if age < 0.6:
+                for i in range(8):
+                    a = i * math.pi / 4
+                    pix[(round(x + math.cos(a) * age * 12), round(y + math.sin(a) * age * 8))] = color
+        for sx, sy in self.shots:
+            pix[(round(sx), round(sy))] = pix[(round(sx), round(sy) + 1)] = (255, 230, 120)
+        sprite(pix, self.SHIP, PAL, round(self.ship_x), 20)
+        left = sum(1 for b in self.bugs if b[2])
+        if left:
+            put_text(text, 1, 14, f"bugs remaining: {left}", (150, 160, 175))
+        else:
+            put_text(text, 1, 14, "0 bugs. ship it!", (80, 250, 123))
+        return pix, text
+
+
+class Aquarium:
+    """Tux goes for a swim: fish drift by, seaweed sways, bubbles rise."""
+    FISH = ["C.CCC.", "CCCCEC", "C.CCC."]
+
+    def __init__(self):
+        r = random.Random()
+        self.fish = [(r.uniform(0, 50), r.choice((3, 6, 16, 20)), r.uniform(3, 7), r.choice((-1, 1)),
+                      r.choice(((255, 150, 40), (255, 214, 0), (255, 120, 160), (120, 220, 200))))
+                     for _ in range(4)]
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        for y in range(30):  # water, darker with depth, with slanting light rays near the top
+            base = scale((24, 90, 150), 1 - y * 0.022)
+            for x in range(STAGE_W):
+                ray = y < 18 and (x + y * 0.5 + t * 2) % 13 < 2
+                pix[(x, y)] = scale(base, 1.25) if ray else base
+        for x in range(STAGE_W):  # sand
+            for y in range(27, 30):
+                pix[(x, y)] = (194, 170, 120) if (x * 7 + y * 3) % 11 else (160, 140, 100)
+        for sx, height in ((3, 13), (7, 9), (35, 15), (38, 8)):  # seaweed
+            for k in range(height):
+                y = 26 - k
+                pix[(sx + round(math.sin(t * 2 + k * 0.4 + sx) * k * 0.12), y)] = (40, 150, 80) if k % 3 else (60, 180, 95)
+        for x0, y, speed, d, color in self.fish:
+            x = (x0 + speed * t * d) % 52 - 6
+            rows = self.FISH if d > 0 else [r[::-1] for r in self.FISH]
+            sprite(pix, rows, {"C": color, "E": (16, 16, 20)}, round(x), y)
+        bob = round(math.sin(t * 1.6) * 1.5)
+        tux(pix, 10, 3 + bob, t, "swim")
+        for i in range(6):  # bubbles from the beak
+            age = (t * 0.7 + i / 6) % 1
+            bx = 20 + round(math.sin(t * 3 + i) * 1.2 + i % 2)
+            by = round(9 + bob - age * 11)
+            if by >= 0:
+                pix[(bx, by)] = (200, 230, 255)
+        return pix, text
+
+
+class Campfire:
+    """Tux toasting a marshmallow over a crackling campfire under the stars."""
+    STAGE = (40, 15)
+    W, H, FX, FY = 12, 14, 25, 12
+    FIRE = [None, (60, 10, 5), (100, 20, 5), (150, 35, 5), (190, 55, 5), (220, 80, 10), (240, 110, 15),
+            (250, 140, 20), (255, 170, 30), (255, 200, 60), (255, 225, 110), (255, 240, 170), (255, 250, 220)]
+
+    def __init__(self):
+        r = random.Random()
+        self.heat = [[0] * self.W for _ in range(self.H)]
+        self.stars = [(r.randrange(STAGE_W), r.randrange(11), r.uniform(0, 6)) for _ in range(18)]
+        self.sparks, self.steps = [], 0
+
+    def step(self):  # the classic Doom fire: heat rises, drifts sideways, cools
+        top = len(self.FIRE) - 1
+        self.heat[-1] = [top if 2 <= x < self.W - 2 else top // 2 for x in range(self.W)]
+        for y in range(1, self.H):
+            for x in range(self.W):
+                drift = random.randint(-1, 1)
+                nx = min(self.W - 1, max(0, x + drift))
+                self.heat[y - 1][nx] = max(0, self.heat[y][x] - random.choice((0, 1, 1, 2)))
+        if random.random() < 0.3:
+            self.sparks.append([self.FX + random.uniform(3, 9), self.FY + 3, random.uniform(-2, 2), 0.0])
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        while self.steps < int(t * 20):
+            self.steps += 1
+            self.step()
+        for sx, sy, ph in self.stars:
+            if math.sin(t * 2 + ph) > -0.3:
+                pix[(sx, sy)] = (200, 205, 220)
+        for x in range(STAGE_W):  # ground
+            for y in range(27, 30):
+                pix[(x, y)] = (34, 44, 34) if y == 27 else (26, 32, 26)
+        for x in range(23, 39, 2):  # stone ring
+            pix[(x, 27)] = (110, 112, 120)
+        for y, row in enumerate(self.heat):
+            for x, h in enumerate(row):
+                if h:
+                    pix[(self.FX + x, self.FY + y)] = self.FIRE[h]
+        line(pix, 24, 26, 37, 24, (110, 70, 40))  # logs
+        line(pix, 24, 24, 37, 26, (90, 58, 34))
+        for s in self.sparks:
+            s[0] += s[2] * 0.05
+            s[1] -= 0.6
+            s[3] += 0.05
+            if s[1] > 0:
+                pix[(round(s[0]), round(s[1]))] = (255, 180, 60)
+        self.sparks = [s for s in self.sparks if s[1] > 0 and s[3] < 1.2]
+        tux(pix, -2, 5, t, ("pose", 0.5 + 0.05 * math.sin(t * 2), 1.25, (0, 0)))
+        line(pix, 16, 16, 27, 10, (150, 110, 70))  # stick
+        toast = (t % 12) / 12  # white, then golden, then oops
+        c = tuple(int(a + (b - a) * min(1, toast * 1.6)) for a, b in zip((245, 245, 240), (190, 120, 50)))
+        for dx in (0, 1):
+            for dy in (0, 1):
+                pix[(27 + dx, 9 + dy)] = c
+        return pix, text
+
+
+class ServerRoom:
+    """Night shift in the server room: blinking racks, hot coffee, and your real load average."""
+
+    def __init__(self):
+        r = random.Random()
+        self.leds = [(x0 + lx, 2 + u * 3, r.uniform(1, 6), r.uniform(0, 6),
+                      r.choice(((80, 250, 123), (80, 250, 123), (255, 190, 60), BRAND_BLUE)))
+                     for x0 in (0, 30) for u in range(8) for lx in (2, 4, 6)]
+        self.load, self.load_at = "", -9.0
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        for x0 in (0, 30):  # two racks
+            for y in range(0, 26):
+                for x in range(x0, x0 + 10):
+                    edge = x in (x0, x0 + 9) or y in (0, 25)
+                    pix[(x, y)] = (48, 50, 58) if edge else (28, 30, 36) if y % 3 else (38, 40, 48)
+        for x, y, rate, ph, color in self.leds:
+            on = math.sin(t * rate + ph) > 0.2 or random.random() < 0.08
+            pix[(x, y)] = color if on else scale(color, 0.2)
+        for x in range(STAGE_W):  # floor tiles
+            for y in (26, 27):
+                pix[(x, y)] = (52, 54, 62) if (x // 4 + y) % 2 else (42, 44, 52)
+        sip = (t % 8) < 1.3
+        ar = 2.3 if sip else 1.05
+        tux(pix, 10, 4, t, ("pose", 0.45 + 0.04 * math.sin(t * 2), ar, (0, 0)))
+        mx = round(10 + 16.5 + math.sin(ar) * 6.5)
+        my = round(4 + 10 + math.cos(ar) * 6.5) - 2
+        for dx in range(3):  # Arch-blue mug with a handle
+            for dy in range(3):
+                pix[(mx + dx, my + dy)] = BRAND_BLUE if dy else (236, 236, 228)
+        pix[(mx + 3, my + 1)] = BRAND_BLUE
+        if not sip:
+            for k in range(5):  # steam
+                age = (t * 1.5 + k / 5) % 1
+                pix[(mx + 1 + round(math.sin(t * 3 + k) * 1), my - 1 - round(age * 6))] = scale((200, 200, 210), 1 - age)
+        if t - self.load_at > 2:
+            self.load_at = t
+            self.load = "load " + " ".join(read("/proc/loadavg", "? ? ?").split()[:3])
+        put_text(text, (STAGE_W - len(self.load)) // 2, 14, self.load, (150, 160, 175))
+        return pix, text
+
+
+class Fireworks:
+    """Fireworks bursting over the night sky, Tux watching from below."""
+    STAGE = (40, 19)  # Tux stands below the 15th row
+
+    def __init__(self):
+        self.rockets, self.parts, self.last, self.next_launch = [], [], 0.0, 0.2
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        dt, self.last = max(0.0, min(0.1, t - self.last)), t
+        if t >= self.next_launch:
+            self.next_launch = t + random.uniform(0.45, 1.0)
+            self.rockets.append([random.uniform(4, 36), 29.0, random.uniform(-26, -20), random.uniform(3, 10),
+                                 random.random()])
+        for r in self.rockets:
+            r[1] += r[2] * dt
+            if r[1] <= r[3]:
+                n = random.randint(28, 40)
+                two_tone = random.random() < 0.4
+                for i in range(n):
+                    a = i / n * 2 * math.pi
+                    sp = random.uniform(8, 14)
+                    hue = r[4] + (0.5 if two_tone and i % 2 else 0)
+                    self.parts.append([r[0], r[1], math.cos(a) * sp, math.sin(a) * sp * 0.7, 1.3, hue])
+        self.rockets = [r for r in self.rockets if r[1] > r[3]]
+        for p in self.parts:
+            p[0] += p[2] * dt
+            p[1] += p[3] * dt
+            p[3] += 9 * dt
+            p[2] *= 0.985
+            p[4] -= dt
+        self.parts = [p for p in self.parts if p[4] > 0]
+        for x, y, *_ in self.rockets:
+            pix[(round(x), round(y))] = (255, 240, 200)
+            pix[(round(x), round(y) + 1)] = (200, 120, 50)
+        for x, y, _, _, life, hue in self.parts:
+            pix[(round(x), round(y))] = hsv(hue, 0.55, min(1.0, life))
+        tux(pix, 10, 15, t, ("pose", 0.6 + 0.2 * math.sin(t * 3), 0.6 + 0.2 * math.sin(t * 3 + 1), (0, 0)))
+        return pix, text
+
+
+class Panic:
+    """sudo rm -rf /boot, a kernel panic, and Tux reaching for the power button."""
+    STAGE = (62, 15)
+    TRACE = [("Kernel panic - not syncing:", (255, 110, 110)), ("VFS: Unable to mount root fs", None),
+             ("CPU: 0 PID: 1 Comm: init", None), ("Call Trace:", None), (" ? tux_panic+0x42/0x1337", None),
+             (" ? oops_begin+0x7a/0xb0", None), ("---[ end Kernel panic ]---", (255, 110, 110))]
+    BOOT = ["[ OK ] Mounted /boot", "[ OK ] Started init", "[ OK ] Panic averted"]
+
+    def over(self, t):
+        return t > 8.2 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 9.0
+        if t < 1.4:
+            put_text(text, 1, 1, "$ sudo rm -rf /boot"[:int(t * 16)], (220, 220, 225))
+            text[(1, 1)] = ("$", (80, 250, 123))
+            if int(t * 3) % 2:
+                text[(2 + min(19, int(t * 16)), 1)] = ("█", (220, 220, 225))
+        elif t < 2.4:  # glitch
+            for y in range(0, 30, 2):
+                if random.random() < 0.45:
+                    shift = random.randint(-6, 6)
+                    c = random.choice(((238, 62, 62), (80, 250, 123), BRAND_BLUE, (255, 255, 255), (60, 60, 70)))
+                    for x in range(max(0, shift), min(STAGE_W, STAGE_W + shift)):
+                        if random.random() < 0.5:
+                            pix[(x, y + random.randint(0, 1))] = c
+            for _ in range(20):
+                text[(random.randrange(STAGE_W), random.randrange(STAGE_ROWS))] = (random.choice("#@%&$?!01"),
+                                                                                 (200, 200, 205))
+        elif t < 4.6:  # the panic itself, line by line
+            for i, (msg, col) in enumerate(self.TRACE[:int((t - 2.4) * 8) + 1]):
+                put_text(text, 1, 1 + i, msg, col or (200, 200, 205))
+        elif t < 6.2:  # Tux waddles in to the power button
+            k = min(1.0, (t - 4.6) / 0.9)
+            pressing = t > 5.6
+            tux(pix, round(40 - k * 19), 4, t, ("pose", 0.45, 1.6 if pressing else 0.45, (0, 0)) if k >= 1 else "walk")
+            color = (80, 250, 123) if pressing else (238, 62, 62)
+            for a in range(36, 330, 12):  # power symbol: a ring open at the top, and a bar
+                pix[(round(10 + math.sin(math.radians(a)) * 5), round(16 - math.cos(math.radians(a)) * 5))] = color
+            for y in range(9, 16):
+                pix[(10, y)] = color
+            if 5.75 < t < 5.9:  # the screen flashes as it reboots
+                for x in range(STAGE_W):
+                    for y in range(30):
+                        pix[(x, y)] = (235, 235, 240)
+        else:  # back up
+            for i, msg in enumerate(self.BOOT[:int((t - 6.2) * 3) + 1]):
+                row = 2 + i * 2
+                put_text(text, 1, row, "[    ]", (90, 90, 110))
+                put_text(text, 3, row, "OK", (80, 250, 123))
+                put_text(text, 8, row, msg[7:], (210, 210, 215))
+            tux(pix, 21, 4, t, "wave")
+        return pix, text
+
+
+class Runner:
+    """Tux runs a side-scrolling level, hopping over bugs all the way to the flag."""
+    SPEED, OX, BASE = 30.0, 1, 6
+    OBST = [48, 88, 122, 165]
+    FLAG = 215
+    BUG = [".RRR.", "RWRWR", "R.R.R"]
+
+    def __init__(self):
+        self.end = (self.FLAG - (self.OX + 26)) / self.SPEED  # scrolling stops at the flag
+
+    def over(self, t):
+        return t > self.end + 1.0 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = self.end + 1.0
+        scroll = min(t, self.end) * self.SPEED
+        for cx, cy in ((10, 3), (32, 7), (55, 2), (80, 5)):  # clouds drift by slower than the ground
+            x = round((cx - scroll * 0.3) % 70 - 12)
+            sprite(pix, [".WWW..", "WWWWWW"], {"W": (70, 75, 88)}, x, cy)
+        for x in range(STAGE_W):
+            pix[(x, 28)] = (80, 170, 90)
+            pix[(x, 29)] = (110, 80, 50) if (x + int(scroll)) % 6 else (85, 60, 38)
+        for w in self.OBST:
+            sprite(pix, self.BUG, {"R": (238, 62, 62), "W": (240, 240, 245)}, round(w - scroll), 25)
+        fx = round(self.FLAG - scroll)
+        if fx < STAGE_W + 6:
+            for y in range(8, 28):
+                pix[(fx, y)] = (200, 200, 210)
+            for k in range(5):
+                for j in range(5 - abs(k - 2) * 2):
+                    pix[(fx + 1 + j, 8 + k)] = BRAND_BLUE
+        jump = 0.0
+        for w in self.OBST:  # hop so the top of the arc lands right over each bug
+            tj = (w + 2.5 - self.OX - 10) / self.SPEED - 0.55
+            if tj <= t < tj + 1.1:
+                jump = 8 * math.sin(math.pi * (t - tj) / 1.1)
+        running = t < self.end
+        tux(pix, self.OX, self.BASE - round(jump), t, "walk" if running else "wave")
+        put_text(text, 26, 0, f"SCORE {int(scroll) * 10:05d}", (200, 200, 205))
+        if not running:
+            for i, ch in enumerate("LEVEL CLEAR!"):
+                text[(22 + i, 2)] = (ch, hsv(t * 0.8 + i * 0.08, 0.6))
+        return pix, text
+
+
+GREEN = (80, 250, 123)
+
+
+def prompt_line(text, row, cmd, t, start=0.0, cps=16):
+    """Type out a shell command with a green $, starting at `start` seconds."""
+    shown = ("$ " + cmd)[:max(0, int((t - start) * cps))]
+    put_text(text, 1, row, shown, (220, 220, 225))
+    if shown:
+        text[(1, row)] = ("$", GREEN)
+    return len(shown) == len(cmd) + 2
+
+
+class Train:
+    """You typed sl instead of ls: a steam locomotive chugs across the screen."""
+    SPEED, START, LEN = 22.0, 0.8, 46
+
+    def __init__(self):
+        self.gone = self.START + (STAGE_W + self.LEN) / self.SPEED
+        try:
+            names = sorted(n for n in os.listdir(os.path.expanduser("~")) if not n.startswith("."))
+        except OSError:
+            names = []
+        self.ls = "  ".join(names)
+
+    def over(self, t):
+        return t > self.gone + 1.6 + HOLD
+
+    def x_at(self, t):
+        return STAGE_W - (t - self.START) * self.SPEED
+
+    def loco(self, pix, X, t):
+        D, R, G, Y, BR = (62, 65, 77), (170, 50, 50), (150, 150, 160), (255, 214, 0), (200, 170, 80)
+
+        def box(x0, x1, y0, y1, c):
+            for x in range(X + x0, X + x1 + 1):
+                for y in range(y0, y1 + 1):
+                    pix[(x, y)] = c
+
+        for i in range(4):  # cowcatcher
+            for y in range(18 + i, 22):
+                pix[(X + i, y)] = G
+        box(3, 20, 12, 19, D)          # boiler
+        box(3, 20, 12, 12, (90, 94, 106))
+        box(8, 8, 12, 19, BRAND_BLUE)   # boiler bands
+        box(14, 14, 12, 19, BRAND_BLUE)
+        box(5, 7, 7, 11, D)            # chimney
+        box(4, 8, 6, 6, D)
+        box(11, 13, 10, 11, BR)        # dome
+        box(20, 28, 7, 19, R)          # cab
+        box(22, 26, 9, 12, Y)          # lit window
+        box(19, 29, 6, 6, D)           # roof
+        box(1, 29, 20, 21, D)          # frame
+        box(32, 44, 14, 21, D)         # coal car
+        box(32, 44, 15, 15, R)
+        for x in range(32, 45, 2):
+            pix[(X + x, 13)] = (40, 40, 44)
+        box(29, 31, 20, 20, G)         # coupling
+        a = t * self.SPEED / 2.5
+        for cx, r in ((6, 2.5), (12, 2.5), (18, 2.5), (25, 3.2), (35, 2.5), (41, 2.5)):
+            disc(pix, X + cx + 0.5, 24.5 - (r - 2.5), r, G)
+            pix[(X + cx + round(math.cos(a) * (r - 1)), 24 - round(r - 2.5) + round(math.sin(a) * (r - 1)))] = D
+        line(pix, X + 6 + math.cos(a) * 1.5, 24 + math.sin(a) * 1.5,
+             X + 18 + math.cos(a) * 1.5, 24 + math.sin(a) * 1.5, R)  # connecting rod
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = self.gone + 1.6
+        prompt_line(text, 0, "sl", t, 0.1, 8)
+        for x in range(STAGE_W):  # rails and sleepers
+            pix[(x, 27)] = (150, 150, 160)
+            if x % 3 == 0:
+                pix[(x, 28)] = (110, 80, 50)
+        if self.START <= t < self.gone:
+            for i in range(int((t - self.START) / 0.18) + 1):  # smoke trailing behind the chimney
+                born = self.START + i * 0.18
+                age = t - born
+                if age < 1.6:
+                    disc(pix, self.x_at(born) + 6 + age * 5, max(3.5, 5 - age * 5), 0.8 + age * 1.4,
+                         scale((200, 200, 210), 1 - age / 1.8))
+            self.loco(pix, round(self.x_at(t)), t)
+        if t >= self.gone and prompt_line(text, 1, "ls", t, self.gone, 10):
+            for i in range(2):
+                put_text(text, 1, 2 + i, self.ls[i * 38:(i + 1) * 38], BRAND_BLUE)
+        return pix, text
+
+
+class GitGraph:
+    """A commit graph growing: a feature branch splits off, merges back, gets tagged and pushed."""
+    NODES = [  # (time, x, y, parents, branch, message)
+        (0.6, 3, 10, (), "main", "init: hello tux"),
+        (1.2, 9, 10, (0,), "main", "add flippers"),
+        (1.8, 15, 20, (1,), "feat", "feat: learn to waddle"),
+        (2.4, 17, 10, (1,), "main", "fix: beak colour"),
+        (3.0, 22, 20, (2,), "feat", "feat: waddle faster"),
+        (3.6, 25, 10, (3,), "main", "docs: add README"),
+        (4.3, 31, 10, (5, 4), "merge", "merge feature/waddle"),
+        (5.0, 37, 10, (6,), "main", "release v1.0"),
+    ]
+    COLORS = {"main": BRAND_BLUE, "feat": (255, 150, 40), "merge": (236, 236, 228)}
+
+    def over(self, t):
+        return t > 6.6 + HOLD
+
+    def frame(self, t, done):
+        import zlib
+        pix, text = {}, {}
+        if done:
+            t = 7.0
+        prompt_line(text, 0, "git log --graph", t, 0.0, 30)
+        for tn, x, y, parents, br, msg in self.NODES:
+            for p in parents:
+                _, px, py, _, pbr, _ = self.NODES[p]
+                k = max(0.0, min(1.0, (t - (tn - 0.35)) / 0.35))
+                if k > 0:
+                    color = self.COLORS["feat" if "feat" in (br, pbr) else "main"]
+                    line(pix, px, py, px + (x - px) * k, py + (y - py) * k, scale(color, 0.8))
+        for tn, x, y, parents, br, msg in self.NODES:
+            if t >= tn:
+                r = min(1.6, (t - tn) / 0.15 * 1.6)
+                disc(pix, x + 0.5, y + 0.5, r, self.COLORS[br])
+        put_text(text, 1, 3, "main", BRAND_BLUE)
+        if t >= 1.8:
+            put_text(text, 13, 12, "feature/waddle", (255, 150, 40))
+        if t >= 5.0:
+            put_text(text, 35, 3, "v1.0", (255, 214, 0))
+        if t < 5.6:
+            latest = [n for n in self.NODES if n[0] <= t]
+            if latest:
+                msg = latest[-1][5]
+                put_text(text, 1, 13, "*", self.COLORS[latest[-1][4]])
+                put_text(text, 3, 13, f"{zlib.crc32(msg.encode()):08x}"[:7], (255, 214, 0))
+                put_text(text, 11, 13, msg, (200, 200, 205))
+        elif prompt_line(text, 13, "git push --tags", t, 5.6, 30):
+            put_text(text, 1, 14, " * [new tag]  v1.0 -> v1.0", GREEN)
+        return pix, text
+
+
+class Sandwich:
+    """make me a sandwich. What? Make it yourself. sudo make me a sandwich. Okay."""
+    STAGE = (62, 15)  # Tux holds the sandwich out past column 40
+    SANDWICH = ["..BBBBBB..", ".BBBBBBBB.", "LLLLLLLLLL", "TTTTTTTTTT", "CCCCCCCCCC", ".bbbbbbbb."]
+    COLS = {"B": (225, 170, 95), "L": (90, 200, 90), "T": (230, 70, 60), "C": (255, 210, 60), "b": (200, 145, 75)}
+
+    def over(self, t):
+        return t > 8.0 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 8.0
+        prompt_line(text, 0, "make me a sandwich", t, 0.1)
+        if t > 1.6:
+            put_text(text, 1, 1, "make: What? Make it yourself.", (238, 120, 120))
+        prompt_line(text, 3, "sudo make me a sandwich", t, 2.2)
+        if t > 3.9:
+            put_text(text, 1, 4, "[sudo] password: " + "*" * min(4, int((t - 3.9) * 10)), (150, 160, 175))
+        if t > 4.6:
+            put_text(text, 1, 5, "Okay.", GREEN)
+        if t > 4.8:
+            k = min(1.0, (t - 4.8) / 0.7)
+            ox, oy = round(40 - k * 20), 8
+            if k < 1:
+                pose = "walk"
+            elif t < 7.6:
+                pose = ("pose", 1.3, 1.3, (0, 0))
+            else:
+                pose = "wave"
+            tux(pix, ox, oy, t, pose)
+            if 5.5 < t < 7.6:  # the sandwich drops into his flippers, then gets eaten bite by bite
+                drop = min(1.0, (t - 5.5) / 0.5)
+                bites = max(0, int((t - 6.2) / 0.3)) * 2
+                rows = [r[:max(0, 10 - bites)] for r in self.SANDWICH]
+                sprite(pix, rows, self.COLS, ox + 5, round(-6 + drop * (oy + 18)))
+                if t > 6.2:
+                    put_text(text, 33, 6 + int((t - 6.2) / 0.3) % 2, "nom", (255, 214, 0))
+            if t >= 7.6:
+                for i in range(3):
+                    if math.sin(t * 4 + i * 2) > -0.2:
+                        text[(32 + i * 2, 5 - (i % 2))] = ("♥", (255, 105, 140))
+        return pix, text
+
+
+class Breakout:
+    """Breakout plays itself until every brick is gone (the ball catches fire, then the last bricks chain-pop)."""
+    STAGE = (40, 15)
+    ROWS = 3
+    COLORS = [(238, 62, 62), (255, 150, 40), (255, 214, 0)]
+
+    def __init__(self):
+        self.bricks = {(c, r) for c in range(8) for r in range(self.ROWS)}
+        self.x, self.y, self.vx, self.vy = 20.0, 26.0, 20.0, -70.0
+        self.px, self.last, self.cleared, self.trail, self.pops = 16.0, 0.0, None, [], []
+
+    def over(self, t):
+        return (self.cleared is not None and t > self.cleared + 0.6 + HOLD) or t > 18
+
+    def brick_at(self, x, y):
+        xi, yi = int(x), int(y) - 2
+        if 0 <= xi < STAGE_W and xi % 5 != 4 and 0 <= yi < self.ROWS * 3 and yi % 3 != 2:
+            return (xi // 5, yi // 3)
+
+    def aim(self):  # send the ball toward the column with the most bricks left
+        cols = {}
+        for c, r in self.bricks:
+            cols[c] = cols.get(c, 0) + 1
+        c = max(cols, key=lambda k: (cols[k], random.random()))
+        rise = (self.y - 2) / 70
+        self.vx = max(-45.0, min(45.0, (c * 5 + 1.5 - self.x) / rise + random.uniform(-3, 3)))
+        self.vy = -70.0
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        dt, self.last = max(0.0, min(0.1, t - self.last)), t
+        fire = t > 2.5
+        if done:
+            self.bricks.clear()
+            self.cleared = self.cleared or t
+        steps = int(dt / 0.004) + 1
+        for _ in range(steps):
+            if self.cleared is not None:
+                break
+            h = dt / steps
+            self.x += self.vx * h
+            self.y += self.vy * h
+            if self.x < 0:
+                self.x, self.vx = -self.x, abs(self.vx)
+            if self.x > 39.9:
+                self.x, self.vx = 79.8 - self.x, -abs(self.vx)
+            if self.y < 0:
+                self.y, self.vy = -self.y, abs(self.vy)
+            b = self.brick_at(self.x, self.y)
+            if b in self.bricks:
+                self.bricks.discard(b)
+                self.pops.append((b, t))
+                if not fire:
+                    self.vy = -self.vy
+            if self.vy > 0 and self.y >= 27:
+                self.y = 27.0
+                self.aim()
+            if not self.bricks:
+                self.cleared = t
+        if t > 9 and self.bricks and int(t * 10) != int((t - dt) * 10):  # chain reaction: last ones pop
+            b = min(self.bricks)
+            self.bricks.discard(b)
+            self.pops.append((b, t))
+            if not self.bricks:
+                self.cleared = t
+        self.px += max(-110 * dt, min(110 * dt, self.x - 4 - self.px))
+        self.px = max(0.0, min(31.0, self.px))
+        for c, r in self.bricks:
+            for dx in range(4):
+                pix[(c * 5 + dx, 2 + r * 3)] = self.COLORS[r]
+                pix[(c * 5 + dx, 3 + r * 3)] = scale(self.COLORS[r], 0.7)
+        for (c, r), born in self.pops:
+            age = t - born
+            if age < 0.35:
+                for dx in (0, 3):
+                    pix[(c * 5 + dx + round((dx - 1.5) * age * 6), 2 + r * 3 + round(age * 8))] = self.COLORS[r]
+        for x in range(round(self.px), round(self.px) + 9):
+            pix[(x, 28)] = BRAND_BLUE
+            pix[(x, 29)] = scale(BRAND_BLUE, 0.6)
+        if self.cleared is None:
+            self.trail = (self.trail + [(round(self.x), round(self.y))])[-3:]
+            for i, p in enumerate(self.trail):
+                pix[p] = scale((255, 140, 40) if fire else (236, 236, 228), 0.4 + 0.3 * i)
+        else:
+            for i, ch in enumerate("CLEAR!"):
+                text[(17 + i, 6)] = (ch, hsv(t * 0.8 + i * 0.1, 0.6))
+        return pix, text
+
+
+class Snake:
+    """A python (the snake kind) eats its way to a high score."""
+    GW, GH, GOAL = 20, 13, 14
+    HEAD, BLUE, YELLOW = (75, 140, 200), (55, 118, 171), (255, 212, 59)
+
+    def __init__(self):
+        self.rng = random.Random()
+        self.body = [(5, 6), (4, 6), (3, 6)]
+        self.apple = self.place()
+        self.steps, self.end, self.won = 0, None, False
+
+    def place(self):
+        return self.rng.choice([(x, y) for x in range(self.GW) for y in range(self.GH) if (x, y) not in self.body])
+
+    def neighbours(self, p):
+        x, y = p
+        for n in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= n[0] < self.GW and 0 <= n[1] < self.GH:
+                yield n
+
+    def path_to(self, goal):
+        from collections import deque
+        blocked = set(self.body[:-1])
+        start = self.body[0]
+        prev, q = {start: None}, deque([start])
+        while q:
+            p = q.popleft()
+            if p == goal:
+                while prev[p] != start:
+                    p = prev[p]
+                return p
+            for n in self.neighbours(p):
+                if n not in prev and n not in blocked:
+                    prev[n] = p
+                    q.append(n)
+
+    def step(self, t):
+        nxt = self.path_to(self.apple)
+        if nxt is None:
+            safe = [n for n in self.neighbours(self.body[0]) if n not in self.body[:-1]]
+            if not safe:
+                self.end = t
+                return
+            nxt = self.rng.choice(safe)
+        self.body.insert(0, nxt)
+        if nxt == self.apple:
+            if len(self.body) >= self.GOAL:
+                self.end, self.won = t, True
+                return
+            self.apple = self.place()
+        else:
+            self.body.pop()
+
+    def over(self, t):
+        return (self.end is not None and t > self.end + 0.8 + HOLD) or t > 18
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        while self.end is None and self.steps < int(t * 16):
+            self.steps += 1
+            self.step(self.steps / 16)
+        while done and self.end is None and self.steps < 2000:  # skipped: play the game out instantly
+            self.steps += 1
+            self.step(t)
+
+        def cell(p, c):
+            for dx in (0, 1):
+                pix[(p[0] * 2 + dx, p[1] * 2)] = c
+                pix[(p[0] * 2 + dx, p[1] * 2 + 1)] = scale(c, 0.75)
+
+        for x in range(0, STAGE_W, 4):  # faint dotted floor so the board has edges
+            for y in range(1, self.GH * 2, 4):
+                pix[(x, y)] = (38, 40, 46)
+        if self.end is None or not self.won:
+            cell(self.apple, (238, 62, 62))
+            pix[(self.apple[0] * 2 + 1, self.apple[1] * 2)] = (90, 200, 90)
+        for i, p in enumerate(self.body):
+            cell(p, self.HEAD if i == 0 else self.BLUE if i % 2 else self.YELLOW)
+        hx, hy = self.body[0]
+        pix[(hx * 2 + 1, hy * 2)] = (16, 16, 20)  # eye
+        put_text(text, 1, 14, f"python  len {len(self.body)}", (150, 160, 175))
+        if self.end is not None:
+            msg = "high score!" if self.won else "game over"
+            for i, ch in enumerate(msg):
+                text[(26 + i, 14)] = (ch, hsv(t * 0.8 + i * 0.08, 0.6) if self.won else (238, 120, 120))
+        return pix, text
+
+
+class Cowsay:
+    """fortune | cowsay, with a cow that blinks."""
+    FORTUNES = [f"I use {BRAND['word']}, btw.", "There's no place like 127.0.0.1", "It's not a bug, it's a feature.",
+                "Talk is cheap. Show me the code. -- Linus", "Have you tried turning it off and on again?",
+                "Real programmers count from 0.", "Penguins can't fly. Tux can.", "sudo !!",
+                "Read The Fine Manual: man man", "Moo-ve fast and break things."]
+    COW = [r"        \   ^__^", r"         \  (oo)\_______", r"            (__)\       )\/\ ",
+           r"                ||----w |", r"                ||     ||"]
+
+    def __init__(self):
+        import textwrap
+        lines = textwrap.wrap(random.choice(self.FORTUNES), 26)
+        w = max(map(len, lines))
+        bubble = [" " + "_" * (w + 2)]
+        if len(lines) == 1:
+            bubble.append(f"< {lines[0]:<{w}} >")
+        else:
+            for i, l in enumerate(lines):
+                ends = ("/", "\\") if i == 0 else ("\\", "/") if i == len(lines) - 1 else ("|", "|")
+                bubble.append(f"{ends[0]} {l:<{w}} {ends[1]}")
+        bubble.append(" " + "-" * (w + 2))
+        self.bubble, self.lines = len(bubble), bubble + self.COW
+        self.printed = 1.0 + len(self.lines) * 0.12
+
+    def over(self, t):
+        return t > self.printed + 1.5 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = self.printed + 1.0
+        prompt_line(text, 0, "fortune | cowsay", t, 0.0, 24)
+        blink = t > self.printed and (t % 2.2) < 0.15
+        for i, l in enumerate(self.lines[:max(0, int((t - 1.0) / 0.12) + 1) if t >= 1.0 else 0]):
+            if blink:
+                l = l.replace("(oo)", "(--)")
+            put_text(text, 1, 1 + i, l, (236, 236, 228) if i < self.bubble else (200, 200, 205))
+        return pix, text
+
+
+# ── scenes: classic terminal and OS styles ──
+
+# ── batch A: classic terminal / OS styles ──
+
+A_LOGO = r"""
+                   -`
+                  .o+`
+                 `ooo/
+                `+oooo:
+               `+oooooo:
+               -+oooooo+:
+             `/:-:++oooo+:
+            `/++++/+++++++:
+           `/++++++++++++++:
+          `/+++ooooooooooooo/`
+         ./ooosssso++osssssso+`
+        .oossssso-````/ossssss+`
+       -osssssso.      :ssssssso.
+      :osssssss/        osssso+++.
+     /ossssssss/        +ssssooo/-
+   `/ossssso+/:-        -:/+osssso+-
+  `+sso+:-`                 `.-/+oso:
+ `++:.                           `-/+/
+ .`                                 `/
+""".strip("\n").splitlines()
+
+
+F_LOGO = r"""
+             .',;::::;,'.
+         .';:cccccccccccc:;,.
+      .;cccccccccccccccccccccc;.
+    .:cccccccccccccccccccccccccc:.
+  .;ccccccccccccc;.:dddl:.;ccccccc;.
+ .:ccccccccccccc;OWMKOOXMWd;ccccccc:.
+.:ccccccccccccc;KMMc;cc;xMMc;ccccccc:.
+,cccccccccccccc;MMM.;cc;;WW:;cccccccc,
+:cccccccccccccc;MMM.;cccccccccccccccc:
+:ccccccc;oxOOOo;MMM000k.;cccccccccccc:
+cccccc;0MMKxdd:;MMMkddc.;cccccccccccc;
+ccccc;XMO';cccc;MMM.;cccccccccccccccc'
+ccccc;MMo;ccccc;MMW.;ccccccccccccccc;
+ccccc;0MNc.ccc.xMMd;ccccccccccccccc;
+cccccc;dNMWXXXWM0:;cccccccccccccc:,
+cccccccc;.:odl:.;cccccccccccccc:,.
+ccccccccccccccccccccccccccccc:'.
+:ccccccccccccccccccccccc:;,..
+ ':cccccccccccccccc::;,.
+""".strip("\n").splitlines()
+F_LOGO_WHITE = [  # 2 = the white f, 1 = the blue background
+    "             111111111111",
+    "         11111111111111111111",
+    "      11111111111111111111111111",
+    "    111111111111111111111111111111",
+    "  1111111111111111222222221111111111",
+    " 111111111111111122222222221111111111",
+    "11111111111111112222111122221111111111",
+    "11111111111111112222111122221111111111",
+    "11111111111111112222111111111111111111",
+    "11111111122222212222222211111111111111",
+    "11111112222222212222222211111111111111",
+    "11111122221111112222111111111111111111",
+    "1111112221111111222211111111111111111",
+    "111111222221112222211111111111111111",
+    "11111112222222222211111111111111111",
+    "1111111112222222111111111111111111",
+    "11111111111111111111111111111111",
+    "11111111111111111111111111111",
+    " 11111111111111111111111",
+]
+
+
+class Neofetch:
+    """The OG Arch look: neofetch's ASCII logo, revealed line by line."""
+    W, ROWS = 40, 19
+    TOP, LOW = (64, 190, 240), (23, 137, 204)
+
+    LOGO = F_LOGO if FEDORA else A_LOGO
+
+    def over(self, t):
+        return t > 0.15 + len(self.LOGO) * 0.16 + 0.3 + 0.9 + HOLD
+
+    def frame(self, t, done):
+        text = {}
+        n = len(self.LOGO)
+        shimmer_at = 0.15 + n * 0.16 + 0.3      # one sweep down the finished logo
+        for i, ln in enumerate(self.LOGO):
+            base = self.TOP if i < n // 2 + 1 else self.LOW
+            if done:
+                shown, front = len(ln), None
+            else:
+                k = (t - (0.15 + i * 0.16)) / 0.25
+                if k <= 0:
+                    continue
+                shown = int(len(ln) * min(1.0, k))
+                front = shown if k < 1 else None
+            for j, ch in enumerate(ln[:shown]):
+                if ch == " ":
+                    continue
+                c = base
+                if FEDORA:  # Fedora's logo: a blue disc with the white f
+                    c = (236, 238, 242) if F_LOGO_WHITE[i][j:j + 1] == "2" else (60, 110, 180)
+                if front is not None and front - j < 4:      # bright edge of the reveal
+                    c = tuple(int(a + (255 - a) * (1 - (front - j) / 4)) for a in base)
+                elif not done:
+                    d = (i + j * 0.35) - (t - shimmer_at) * 30
+                    if -3 < d < 0:
+                        c = tuple(int(a + (255 - a) * (1 + d / 3) * 0.8) for a in base)
+                text[(1 + j, i)] = (ch, c)
+        return {}, text
+
+
+A_FONT = {
+    "A": [".###.", "#...#", "#####", "#...#", "#...#"], "B": ["####.", "#...#", "####.", "#...#", "####."],
+    "C": [".####", "#....", "#....", "#....", ".####"], "D": ["####.", "#...#", "#...#", "#...#", "####."],
+    "E": ["#####", "#....", "####.", "#....", "#####"], "F": ["#####", "#....", "####.", "#....", "#...."],
+    "G": [".####", "#....", "#..##", "#...#", ".####"], "H": ["#...#", "#...#", "#####", "#...#", "#...#"],
+    "I": ["###", ".#.", ".#.", ".#.", "###"], "J": ["..###", "...#.", "...#.", "#..#.", ".##.."],
+    "K": ["#...#", "#..#.", "###..", "#..#.", "#...#"], "L": ["#....", "#....", "#....", "#....", "#####"],
+    "M": ["#...#", "##.##", "#.#.#", "#...#", "#...#"], "N": ["#...#", "##..#", "#.#.#", "#..##", "#...#"],
+    "O": [".###.", "#...#", "#...#", "#...#", ".###."], "P": ["####.", "#...#", "####.", "#....", "#...."],
+    "Q": [".###.", "#...#", "#.#.#", "#..#.", ".##.#"], "R": ["####.", "#...#", "####.", "#..#.", "#...#"],
+    "S": [".####", "#....", ".###.", "....#", "####."], "T": ["#####", "..#..", "..#..", "..#..", "..#.."],
+    "U": ["#...#", "#...#", "#...#", "#...#", ".###."], "V": ["#...#", "#...#", "#...#", ".#.#.", "..#.."],
+    "W": ["#...#", "#...#", "#.#.#", "##.##", "#...#"], "X": ["#...#", ".#.#.", "..#..", ".#.#.", "#...#"],
+    "Y": ["#...#", ".#.#.", "..#..", "..#..", "..#.."], "Z": ["#####", "...#.", "..#..", ".#...", "#####"],
+    "0": [".###.", "#..##", "#.#.#", "##..#", ".###."], "1": [".#.", "##.", ".#.", ".#.", "###"],
+    "2": ["####.", "....#", ".###.", "#....", "#####"], "3": ["####.", "....#", ".###.", "....#", "####."],
+    "4": ["#..#.", "#..#.", "#####", "...#.", "...#."], "5": ["#####", "#....", "####.", "....#", "####."],
+    "6": [".###.", "#....", "####.", "#...#", ".###."], "7": ["#####", "....#", "...#.", "..#..", "..#.."],
+    "8": [".###.", "#...#", ".###.", "#...#", ".###."], "9": [".###.", "#...#", ".####", "....#", ".###."],
+    "-": ["...", "...", "###", "...", "..."], " ": ["...", "...", "...", "...", "..."],
+}
+
+
+class Figlet:
+    """figlet $USER | lolcat: your name as a big rainbow banner."""
+    W, ROWS = 78, 9
+    TOP = 2  # text row where the glyphs start
+
+    def __init__(self):
+        import pwd, socket
+        user = pwd.getpwuid(os.getuid()).pw_name
+        self.host = socket.gethostname()
+        word = "".join(ch for ch in user.upper() if ch in A_FONT) or "HELLO"
+        if self.width(word) > self.W - 2:
+            word = "HELLO"
+        self.word, self.cmd = word, f"figlet {user} | lolcat"
+        w = self.width(word)
+        self.cells = []  # (col, row) of every lit glyph cell
+        x = (self.W - w) // 2
+        for ch in word:
+            g = A_FONT[ch]
+            for gy, row in enumerate(g):
+                for gx, on in enumerate(row):
+                    if on == "#":
+                        self.cells.append((x + gx, self.TOP + gy))
+            x += len(g[0]) + 1
+        self.left = (self.W - w) // 2
+        self.sub = f"welcome back to {self.host}"
+
+    @staticmethod
+    def width(word):
+        return sum(len(A_FONT[ch][0]) + 1 for ch in word) - 1
+
+    def over(self, t):
+        return t > 4.6 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 6.0
+        prompt_line(text, 0, self.cmd, t, 0.0, 34)
+        # diagonal wipe reveals the banner, the rainbow scrolls, then eases to a stop
+        reveal = (t - 0.8) * 60
+        u = min(1.0, max(0.0, (t - 3.0) / 1.6))
+        phase = t if t < 3.0 else 3.0 + 0.8 * (1 - (1 - u) ** 2)
+        for col, row in self.cells:
+            d = (col - self.left) + (row - self.TOP) * 3
+            if d > reveal:
+                continue
+            c = hsv(d * 0.012 - phase * 0.2, 0.65, 1.0)
+            if reveal - d < 4:  # white-hot leading edge
+                c = (255, 255, 255)
+            y = row * 2
+            pix[(col, y)] = c
+            pix[(col, y + 1)] = scale(c, 0.82)
+            for sy in (y + 2, y + 3):  # drop shadow, one cell right and half a cell down
+                if (col + 1, sy) not in pix:
+                    pix[(col + 1, sy)] = (38, 40, 48)
+        if t > 3.0:
+            put_text(text, (self.W - len(self.sub)) // 2, 8, self.sub[:int((t - 3.0) * 30)], (150, 160, 175))
+        return pix, text
+
+
+class Donut:
+    """donut.c: the famous spinning ASCII torus, spinning down to a stop."""
+    W, ROWS = 40, 15
+    CHARS = ".,-~:;=!*#$@"
+
+    def __init__(self):
+        self.th = [(math.cos(a * 0.13), math.sin(a * 0.13)) for a in range(int(2 * math.pi / 0.13) + 1)]
+        self.ph = [(math.cos(a * 0.06), math.sin(a * 0.06)) for a in range(int(2 * math.pi / 0.06) + 1)]
+
+    def over(self, t):
+        return t > 5.5 + HOLD
+
+    @staticmethod
+    def spin(t):  # constant speed for 4 s, then an ease-out to a standstill over 1.5 s
+        if t < 4.0:
+            return t
+        u = min(1.0, (t - 4.0) / 1.5)
+        return 4.0 + 0.75 * (1 - (1 - u) ** 2)
+
+    def frame(self, t, done):
+        text = {}
+        s = self.spin(5.5 if done else t)
+        A, B = 1.0 + s * 1.1, 1.0 + s * 0.55
+        cA, sA, cB, sB = math.cos(A), math.sin(A), math.cos(B), math.sin(B)
+        W, H, K2 = self.W, self.ROWS, 5.0
+        XS, YS = 18.0, 9.0  # visible |x/z|, |y/z| reach 0.75: 27 cols by 13.5 rows, 2:1 for terminal cells
+        zbuf = {}
+        for ct, st in self.th:
+            cx, cy = 2 + ct, st
+            for cp, sp in self.ph:
+                x = cx * (cB * cp + sA * sB * sp) - cy * cA * sB
+                y = cx * (sB * cp - sA * cB * sp) + cy * cA * cB
+                ooz = 1 / (K2 + cA * cx * sp + cy * sA)
+                xp = int(W / 2 + XS * ooz * x)
+                yp = int(H / 2 - YS * ooz * y)
+                L = cp * ct * sB - cA * ct * sp - sA * st + cB * (cA * st - ct * sA * sp)
+                if L > 0 and 0 <= xp < W and 0 <= yp < H and ooz > zbuf.get((xp, yp), 0):
+                    zbuf[(xp, yp)] = ooz
+                    text[(xp, yp)] = L
+        for k, L in text.items():
+            lv = min(1.0, L / 1.42)
+            ch = self.CHARS[min(11, int(L * 8))]
+            text[k] = (ch, (int(40 + 200 * lv), int(70 + 170 * lv), int(130 + 125 * lv)))
+        if done or t > 5.0:
+            put_text(text, 1, H - 1, "donut.c", (90, 90, 110))
+        return {}, text
+
+
+A_GUN = [
+    "........................O...........",
+    "......................O.O...........",
+    "............OO......OO............OO",
+    "...........O...O....OO............OO",
+    "OO........O.....O...OO..............",
+    "OO........O...O.OO....O.O...........",
+    "..........O.....O.......O...........",
+    "...........O...O....................",
+    "............OO......................",
+]
+
+
+class Life:
+    """Conway's Game of Life: a glider gun fires, then the hacker emblem takes a bow."""
+    W, ROWS = 40, 15
+    GPS, GENS = 12, 78          # generations per second, total generations
+    PAD = 14                    # simulate a margin beyond the screen so gliders leave cleanly
+
+    def __init__(self):
+        self.live = {(x + 2, y + 2) for y, row in enumerate(A_GUN) for x, ch in enumerate(row) if ch == "O"}
+        self.gen, self.trail = 0, {}
+        self.stop = self.GENS / self.GPS
+        self.glider = None
+
+    def over(self, t):
+        return t > self.stop + 1.6 + HOLD
+
+    def step(self):
+        counts = {}
+        for (x, y) in self.live:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx or dy:
+                        k = (x + dx, y + dy)
+                        counts[k] = counts.get(k, 0) + 1
+        lim_w, lim_h = self.W + self.PAD, self.ROWS * 2 + self.PAD
+        new = {k for k, n in counts.items() if (n == 3 or (n == 2 and k in self.live))
+               and -2 <= k[0] < lim_w and -2 <= k[1] < lim_h}
+        for k in self.live - new:
+            self.trail[k] = 1.0
+        self.live = new
+        self.gen += 1
+
+    def find_glider(self):
+        """A 5-cell group clear of the gun, fully on screen: the one to show off."""
+        seen, best = set(), None
+        for c in sorted(self.live, key=lambda p: -(p[0] + p[1])):
+            if c in seen:
+                continue
+            group, stack = set(), [c]
+            while stack:
+                p = stack.pop()
+                if p in group:
+                    continue
+                group.add(p)
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        q = (p[0] + dx, p[1] + dy)
+                        if q in self.live and q not in group:
+                            stack.append(q)
+            seen |= group
+            xs, ys = [p[0] for p in group], [p[1] for p in group]
+            if len(group) == 5 and min(xs) > 1 and max(xs) < self.W - 1 and max(ys) < self.ROWS * 2 - 3 \
+                    and max(xs) - min(xs) == 2 and max(ys) - min(ys) == 2 and min(ys) > 11:
+                best = group
+                break
+        return best
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        target = self.GENS if done else min(self.GENS, int(t * self.GPS))
+        while self.gen < target:
+            self.step()
+            for k in list(self.trail):
+                self.trail[k] -= 0.25
+                if self.trail[k] <= 0:
+                    del self.trail[k]
+        ended = done or t >= self.stop
+        if ended and self.glider is None:
+            self.glider = self.find_glider() or set()
+            self.trail.clear()
+        fade = 1.0 if done else min(1.0, max(0.0, (t - self.stop) / 0.6)) if ended else 0.0
+        for (x, y), a in self.trail.items():
+            if 0 <= x < self.W and 0 <= y < self.ROWS * 2:
+                pix[(x, y)] = scale((40, 120, 70), a * 0.5)
+        for x, y in self.live:
+            if 0 <= x < self.W and 0 <= y < self.ROWS * 2:
+                hot = self.glider and (x, y) in self.glider
+                c = (80, 250, 123) if hot or not ended else \
+                    tuple(int(a + (b - a) * fade) for a, b in zip((80, 250, 123), (38, 52, 44)))
+                pix[(x, y)] = c
+        if self.glider and fade >= 1.0:
+            xs, ys = [p[0] for p in self.glider], [p[1] for p in self.glider]
+            x0, x1, y0, y1 = min(xs) - 2, max(xs) + 2, min(ys) - 2, max(ys) + 2
+            for x in range(x0, x1 + 1):  # a little frame around the emblem
+                for y in (y0, y1):
+                    if 0 <= x < self.W and 0 <= y < self.ROWS * 2:
+                        pix.setdefault((x, y), (150, 160, 175))
+            for y in range(y0, y1 + 1):
+                for x in (x0, x1):
+                    if 0 <= x < self.W and 0 <= y < self.ROWS * 2:
+                        pix.setdefault((x, y), (150, 160, 175))
+        if ended and (done or t > self.stop + 0.8):
+            cap = " the glider: hacker emblem "
+            col = (self.W - len(cap)) // 2
+            for i, ch in enumerate(cap):
+                text[(col + i, 0)] = (ch, (236, 236, 228), (22, 24, 28))
+        else:
+            gen = f" gen {self.gen} "
+            for i, ch in enumerate(gen):
+                text[(self.W - len(gen) + i, 0)] = (ch, (110, 115, 130), (22, 24, 28))
+        return pix, text
+
+
+class Bios:
+    """An old-school BIOS POST screen: memory test, drive detection, then off to GRUB."""
+    W, ROWS = 78, 20
+    GREY, WHITE, DIM = (170, 170, 170), (255, 255, 255), (110, 110, 110)
+
+    def __init__(self):
+        import pwd, socket
+        self.user = pwd.getpwuid(os.getuid()).pw_name
+        self.host = socket.gethostname()
+        self.kernel = os.uname().release
+        mem = 0
+        for line in read("/proc/meminfo").splitlines():
+            if line.startswith("MemTotal:"):
+                mem = int(line.split()[1])
+        self.mem = mem or 655360
+        self.cpu, self.mhz = "Unknown CPU", "?"
+        for line in read("/proc/cpuinfo").splitlines():
+            if line.startswith("model name") and self.cpu == "Unknown CPU":
+                self.cpu = " ".join(line.split(":", 1)[1].split()).replace("(R)", "").replace("(TM)", "")
+            if line.startswith("cpu MHz") and self.mhz == "?":
+                self.mhz = str(int(float(line.split(":", 1)[1])))
+        self.disk = "None"
+        try:
+            for dev in sorted(os.listdir("/sys/block")):
+                if dev.startswith(("loop", "ram", "zram", "sr", "dm-")):
+                    continue
+                model = read(f"/sys/block/{dev}/device/model").strip()
+                if model:
+                    self.disk = f"{model[:34]}  ({dev})"
+                    break
+        except OSError:
+            pass
+        self.build = time.strftime("%m/%d/%Y") + f"-TUX686-{BRAND['caps']}-1337"
+
+    def over(self, t):
+        return t > 7.6 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 9.0
+        G, Wh, D = self.GREY, self.WHITE, self.DIM
+        put_text(text, 1, 0, "Penguin Megatrends BIOS v4.20, A Free Software Ally", Wh)
+        put_text(text, 1, 1, "Copyright (C) 1996-2026, Penguin Megatrends, Inc.", G)
+        if t > 0.3:
+            put_text(text, 1, 3, "TUX686 ACPI BIOS Revision 1337", G)
+        if t > 0.5:
+            put_text(text, 1, 5, f"CPU   : {self.cpu[:44]}", G)
+            put_text(text, 1, 6, f"Speed : {self.mhz} MHz", G)
+        if t > 0.8:
+            k = min(1.0, (t - 0.8) / 2.0)
+            k = 1 - (1 - k) ** 2
+            n = int(self.mem * k) // 1024 * 1024 if k < 1 else self.mem
+            put_text(text, 1, 8, "Memory Test :", G)
+            put_text(text, 15, 8, f"{n:>9}K", Wh)
+            if k >= 1:
+                put_text(text, 26, 8, "OK", Wh)
+        drives = [("Primary Master  ", self.disk), ("Primary Slave   ", "None"),
+                  ("Secondary Master", "None"), ("Secondary Slave ", "None")]
+        for i, (slot, what) in enumerate(drives):
+            at = 3.0 + i * 0.35
+            if t > at:
+                put_text(text, 1, 11 + i, f"Detecting IDE {slot} ...", G)
+                if t > at + 0.2:
+                    put_text(text, 36, 11 + i, what, Wh if what != "None" else D)
+        if t < 4.6:  # POST footer
+            if int(t * 2.5) % 2 == 0:
+                put_text(text, 1, 18, "Press DEL to enter SETUP", Wh)
+            put_text(text, 1, 19, self.build, D)
+        else:
+            dots = min(8, int((t - 4.6) * 12))
+            put_text(text, 1, 15, "Verifying DMI Pool Data " + "." * dots, G)
+            if t > 5.4:
+                put_text(text, 1, 16, "Boot from Hard Disk...", G)
+            if t > 5.8:
+                put_text(text, 1, 17, "GRUB loading.", G)
+            if t > 6.2:
+                put_text(text, 1, 18, f"{BRAND['name']} {self.kernel} ({self.host}) (tty1)", Wh)
+            if t > 6.5:
+                typed = self.user[:max(0, int((t - 6.7) * 14))]
+                line = f"{self.host} login: {typed}"
+                put_text(text, 1, 19, line, G)
+                if int(t * 3) % 2:
+                    text[(1 + len(line), 19)] = ("█", G)
+        # the vendor logo in the corner: a small penguin, like the old Energy-saver badge
+        tux(pix, 56, 0, 0.5, ("pose", 0.45, 0.45, (0, 0)))
+        return pix, text
+
+
+NEW_A = {"neofetch": Neofetch, "figlet": Figlet, "donut": Donut, "life": Life, "bios": Bios}
+
+
+# ── scenes: retro computing, early web and demoscene ──
+
+# ── batch B: retro computing, early web and demoscene scenes ──
+
+B_FONT = {  # 5×5 pixel capitals, for chunky big text drawn with half-blocks
+    "A": [".###.", "#...#", "#####", "#...#", "#...#"], "B": ["####.", "#...#", "####.", "#...#", "####."],
+    "C": [".####", "#....", "#....", "#....", ".####"], "D": ["####.", "#...#", "#...#", "#...#", "####."],
+    "E": ["#####", "#....", "####.", "#....", "#####"], "F": ["#####", "#....", "####.", "#....", "#...."],
+    "G": [".####", "#....", "#..##", "#...#", ".###."], "H": ["#...#", "#...#", "#####", "#...#", "#...#"],
+    "I": ["#####", "..#..", "..#..", "..#..", "#####"], "J": ["..###", "...#.", "...#.", "#..#.", ".##.."],
+    "K": ["#...#", "#..#.", "###..", "#..#.", "#...#"], "L": ["#....", "#....", "#....", "#....", "#####"],
+    "M": ["#...#", "##.##", "#.#.#", "#...#", "#...#"], "N": ["#...#", "##..#", "#.#.#", "#..##", "#...#"],
+    "O": [".###.", "#...#", "#...#", "#...#", ".###."], "P": ["####.", "#...#", "####.", "#....", "#...."],
+    "Q": [".###.", "#...#", "#.#.#", "#..#.", ".##.#"], "R": ["####.", "#...#", "####.", "#..#.", "#...#"],
+    "S": [".####", "#....", ".###.", "....#", "####."], "T": ["#####", "..#..", "..#..", "..#..", "..#.."],
+    "U": ["#...#", "#...#", "#...#", "#...#", ".###."], "V": ["#...#", "#...#", "#...#", ".#.#.", "..#.."],
+    "W": ["#...#", "#...#", "#.#.#", "##.##", "#...#"], "X": ["#...#", ".#.#.", "..#..", ".#.#.", "#...#"],
+    "Y": ["#...#", ".#.#.", "..#..", "..#..", "..#.."], "Z": ["#####", "...#.", "..#..", ".#...", "#####"],
+    "0": [".###.", "#..##", "#.#.#", "##..#", ".###."], "1": ["..#..", ".##..", "..#..", "..#..", ".###."],
+    "2": ["####.", "....#", ".###.", "#....", "#####"], "3": ["####.", "....#", ".###.", "....#", "####."],
+    "4": ["#...#", "#...#", "#####", "....#", "....#"], "5": ["#####", "#....", "####.", "....#", "####."],
+    "6": [".###.", "#....", "####.", "#...#", ".###."], "7": ["#####", "....#", "...#.", "..#..", "..#.."],
+    "8": [".###.", "#...#", ".###.", "#...#", ".###."], "9": [".###.", "#...#", ".####", "....#", ".###."],
+    " ": ["....."] * 5, "*": ["..#..", "#.#.#", ".###.", "#.#.#", "..#.."],
+    ".": [".....", ".....", ".....", ".....", "..#.."], "!": ["..#..", "..#..", "..#..", ".....", "..#.."],
+    "-": [".....", ".....", "#####", ".....", "....."], ":": [".....", "..#..", ".....", "..#..", "....."],
+}
+
+
+def B_big_text(pix, s, x0, y0, color, w, h, sx=1, sy=1, wave=None):
+    """Draw s in B_FONT. color is an (r,g,b) or a function (x, glyph_row) -> (r,g,b);
+    wave(x) -> extra y offset per pixel column (for sine scrollers). Clipped to w×h."""
+    x = x0
+    for ch in s:
+        if x > w:
+            break
+        if x + 5 * sx >= 0:
+            for gy, grow in enumerate(B_FONT.get(ch.upper(), B_FONT[" "])):
+                for gx, on in enumerate(grow):
+                    if on != "#":
+                        continue
+                    for ax in range(sx):
+                        px = x + gx * sx + ax
+                        if not 0 <= px < w:
+                            continue
+                        dy = wave(px) if wave else 0
+                        c = color(px, gy) if callable(color) else color
+                        for ay in range(sy):
+                            py = y0 + gy * sy + ay + dy
+                            if 0 <= py < h:
+                                pix[(px, py)] = c
+        x += 6 * sx
+    return x - x0 - sx  # width drawn
+
+
+def B_center(text_s, row, w):
+    return max(0, (w - len(text_s)) // 2)
+
+
+class Cracktro:
+    """A demoscene cracktro: copper bars, a parallax starfield and a sine-wave greetings scroller."""
+    W, ROWS = 78, 15
+    MSG = f"{BRAND['caps']} CREW PRESENTS * GREETZ TO ALL PENGUINS * USE {BRAND['caps']} BTW *    "
+    TITLE = f"{BRAND['caps']} CREW"
+    SPEED, DECEL = 60.0, 1.5
+
+    def __init__(self):
+        r = random.Random()
+        self.stars = [(r.uniform(0, 78), r.randrange(3, 27), layer) for layer in (0, 1, 2) for _ in range(22)]
+        prefix = len(self.MSG) * 6
+        title_w = len(self.TITLE) * 6 - 1
+        self.pos_end = (self.W - (self.W - title_w) // 2) + prefix
+        self.t1 = self.pos_end / self.SPEED - self.DECEL / 2
+        self.end = self.t1 + self.DECEL
+
+    def over(self, t):
+        return t > self.end + 0.8 + HOLD
+
+    def pos(self, t):
+        if t < self.t1:
+            return self.SPEED * t
+        tau = min(t - self.t1, self.DECEL)
+        return self.SPEED * self.t1 + self.SPEED * (tau - tau * tau / (2 * self.DECEL))
+
+    def frame(self, t, done):
+        W, H = self.W, self.ROWS * 2
+        pix, text = {}, {}
+        if done:
+            t = max(t, self.end + 0.8)
+        for sx, sy, layer in self.stars:  # parallax starfield
+            speed = (6, 14, 30)[layer]
+            x = int((sx - t * speed) % W)
+            pix[(x, sy)] = ((70, 70, 90), (140, 140, 170), (235, 235, 255))[layer]
+        for k in range(3):  # copper bars
+            yc = 14.5 + math.sin(t * 1.7 + k * 2.1) * 10
+            hue = (0.0, 0.33, 0.6)[k] + t * 0.05
+            for dy in range(-3, 4):
+                y = int(round(yc + dy))
+                if 2 <= y < H - 2:
+                    c = hsv(hue, 0.75, max(0.15, 1 - abs(dy) / 3.4) * 0.85)
+                    for x in range(W):
+                        pix[(x, y)] = c
+        settle = min(1.0, max(0.0, (t - self.t1) / self.DECEL))
+        amp = 6 * (1 - settle)
+        wave = lambda px: int(round(math.sin(px * 0.075 + t * 3.0) * amp))
+        x0 = int(round(W - self.pos(t)))
+        msg = self.MSG + self.TITLE
+        B_big_text(pix, msg, x0 + 1, 11, (0, 0, 0), W, H, sy=2, wave=wave)  # drop shadow
+        final = t >= self.end
+        color = (lambda px, gy: hsv(px * 0.015 - t * 0.6, 0.55 if final else 0.6, 1.0))
+        B_big_text(pix, msg, x0, 10, color, W, H, sy=2, wave=wave)
+        top = f"-=*  {BRAND['caps']} CREW  *  MMXXVI  *=-"
+        for i, ch in enumerate(top):
+            text[(B_center(top, 0, W) + i, 0)] = (ch, hsv(i * 0.03 + t * 0.4, 0.5))
+        if final:
+            if int(t * 3) % 2 == 0:
+                s = "~ press any key ~"
+                put_text(text, B_center(s, 14, W), 14, s, (200, 200, 220))
+        else:
+            s = "cracked by TUX    +3 trainer    call our BBS!"
+            put_text(text, B_center(s, 14, W), 14, s, (110, 120, 160))
+        return pix, text
+
+
+class Geocities:
+    """A 90s personal homepage: starry tiles, blinking WELCOME, under construction, visitor counter."""
+    W, ROWS = 78, 17
+    NAVY = (14, 14, 76)
+    MARQUEE = "  ~*~ Welcome to Tux's Homepage!!! ~*~ Last updated 10/05/1998 ~*~ You need a 56k modem for this page ~*~ "
+    WORKER = [[".YYY...", ".SSS..T", "OOOO.T.", ".OO.T..", ".B.BG..", ".B.BGG."],
+              [".YYY...", ".SSS...", "OOOOTTT", ".OO....", ".B.B.GG", ".B.B.GG"]]
+    WORKER_COL = {"Y": (255, 214, 0), "S": (240, 190, 150), "O": (255, 140, 0), "B": (40, 60, 160),
+                  "T": (150, 105, 60), "G": (175, 175, 185)}
+
+    def over(self, t):
+        return t > 6.8 + HOLD
+
+    def tile(self, text, c, r):
+        if (c * 5 + r * 11) % 17 == 0:
+            text[(c, r)] = ("*", (255, 250, 170), self.NAVY)
+        elif (c * 3 + r * 7) % 13 == 0:
+            text[(c, r)] = ("·", (130, 130, 230), self.NAVY)
+        else:
+            text[(c, r)] = (" ", None, self.NAVY)
+
+    def frame(self, t, done):
+        W, H = self.W, self.ROWS * 2
+        pix, text = {}, {}
+        if done:
+            t = 7.0
+        loaded = int(t / 0.17) + 1  # rows arrive top to bottom, dial-up style
+
+        def row_text(r, col, s, fg, bg=None):
+            for i, ch in enumerate(s):
+                if 0 <= col + i < W:
+                    text[(col + i, r)] = (ch, fg, bg or self.NAVY)
+
+        for r in range(self.ROWS):
+            if r >= loaded or r in (2, 3, 4) or (r in (9, 10, 11)):
+                continue
+            for c in range(W):
+                self.tile(text, c, r)
+        if loaded > 0:  # marquee
+            off = int(t * 14)
+            m = self.MARQUEE
+            for c in range(W):
+                text[(c, 0)] = (m[(c + off) % len(m)], (120, 255, 120), (0, 0, 0))
+        if loaded > 2:  # big blinking WELCOME on the starry band
+            for x in range(W):
+                for y in range(4, 10):
+                    pix[(x, y)] = self.NAVY
+            for (sx, sy) in ((5, 5), (13, 8), (60, 4), (71, 7), (30, 9), (48, 4)):
+                pix[(sx, sy)] = (255, 250, 170)
+            if t > 6 or (t % 0.85) < 0.6:
+                word = "WELCOME"
+                x0 = (W - (len(word) * 6 - 1) * 1) // 2
+                B_big_text(pix, word, x0, 4, lambda px, gy: hsv((px - x0) / 42 + t * 0.3, 0.75, 1.0), W, H)
+        if loaded > 5:
+            s = "~ to my homepage ~"
+            row_text(5, B_center(s, 5, W), s, (255, 110, 230))
+        if loaded > 7:  # rainbow <hr>
+            for c in range(4, W - 4):
+                text[(c, 7)] = ("━", hsv(c / 70 - t * 0.5, 0.8, 1.0), self.NAVY)
+        if loaded > 9:  # under construction banner + digging worker
+            for r in (9, 10, 11):
+                for c in range(W):
+                    if 10 <= c < W - 6:
+                        stripe = ((c + r * 2 + int(t * 4)) // 3) % 2
+                        text[(c, r)] = (" ", None, (255, 205, 0) if stripe else (20, 20, 20))
+                    elif c >= W - 6:
+                        self.tile(text, c, r)
+            s = " UNDER CONSTRUCTION "
+            col = B_center(s, 10, W) + 2
+            row_text(10, col, s, (20, 20, 20), (255, 205, 0))
+            for x in range(10):
+                for y in range(18, 24):
+                    pix[(x, y)] = self.NAVY
+            sprite(pix, self.WORKER[int(t * 3) % 2], self.WORKER_COL, 2, 18)
+            for i, y in enumerate((22, 23)):  # a pile of dirt
+                for x in range(7, 10 - i * 0):
+                    pix[(x, y)] = (120, 80, 45) if (x + y) % 2 else (100, 66, 36)
+            text[(W - 4, 11)] = ("▲", (255, 120, 0), self.NAVY)
+        if loaded > 13:  # visitor counter rolling up to 42
+            k = min(1.0, max(0.0, (t - 3.2) / 1.8))
+            n = int(42 * (1 - (1 - k) ** 3))
+            label = "You are visitor #"
+            digits = f"{n:06d}"
+            col = B_center(label + " " + digits, 13, W)
+            row_text(13, col, label, (255, 255, 255))
+            for i, d in enumerate(digits):
+                text[(col + len(label) + 1 + i, 13)] = (d, (120, 255, 140), (0, 0, 0))
+        if loaded > 14:
+            s = "Best viewed in 800x600 with 256 colours"
+            row_text(14, B_center(s, 14, W), s, (190, 190, 255))
+        if loaded > 15:
+            s = "[ Sign my guestbook! ]"
+            col = B_center(s, 15, W) - 4
+            row_text(15, col, s, (0, 0, 128), (192, 192, 192))
+            if int(t * 4) % 2:
+                row_text(15, col + len(s) + 2, "NEW!", (255, 255, 0), (200, 0, 0))
+        if loaded > 16:
+            s = "(c) 1998 Tux  ·  made in vi  ·  << prev | webring | next >>"
+            row_text(16, B_center(s, 16, W), s, (160, 160, 200))
+        return pix, text
+
+
+class Bouncer:
+    """The bouncing screensaver logo, changing colour on every wall, until it hits the corner."""
+    W, ROWS = 78, 15
+    LW, LH = len(BRAND["caps"]) * 6 - 1, 15
+    T = 7.2
+    COLORS = [(23, 147, 209), (238, 62, 62), (80, 250, 123), (255, 214, 0), (190, 110, 255),
+              (255, 140, 40), (90, 230, 230), (255, 110, 200)]
+
+    def __init__(self):
+        r = random.Random()
+        self.lx, self.ly = self.W - self.LW, self.ROWS * 2 - self.LH
+        corner = r.choice(((0, 0), (1, 0), (0, 1), (1, 1)))
+        # unfolded coordinates: u(T) must land on an odd/even multiple of the span -> exactly a corner
+        x0, y0 = r.uniform(8, self.lx - 8), r.uniform(3, self.ly - 3)
+        ux_end = (2 + corner[0]) * self.lx  # even multiple of the span folds to 0, odd to the far edge
+        uy_end = (4 + corner[1]) * self.ly
+        self.x0, self.y0 = x0, y0
+        self.vx = (ux_end - x0) / self.T
+        self.vy = (uy_end - y0) / self.T
+        self.confetti = [(r.uniform(-1, 1), r.uniform(0.2, 1.0), r.random()) for _ in range(60)]
+
+    def over(self, t):
+        return t > self.T + 2.2 + HOLD
+
+    def fold(self, u, span):
+        u = u % (2 * span)
+        return u if u <= span else 2 * span - u
+
+    def state(self, t):
+        t = min(t, self.T)
+        ux, uy = self.x0 + self.vx * t, self.y0 + self.vy * t
+        hits = int(ux // self.lx) + int(uy // self.ly)
+        return self.fold(ux, self.lx), self.fold(uy, self.ly), hits
+
+    def frame(self, t, done):
+        W, H = self.W, self.ROWS * 2
+        pix, text = {}, {}
+        if done:
+            t = max(t, self.T + 1.6)
+        x, y, hits = self.state(t)
+        x, y = int(round(x)), int(round(y))
+        c = self.COLORS[hits % len(self.COLORS)]
+        hit = t >= self.T
+        if hit and (t - self.T) < 0.9 and int((t - self.T) * 8) % 2 == 0:  # the whole screen flashes
+            for px in range(W):
+                for py in range(H):
+                    pix[(px, py)] = (40, 40, 52)
+        B_big_text(pix, BRAND["caps"], x, y, c, W, H, sy=2)
+        for py in range(y + 11, y + 15):  # the disc under the letters
+            for px in range(x, x + self.LW):
+                dx, dy = (px - x - self.LW // 2) / (self.LW / 2), (py - y - 12.5) / 2.2
+                d = dx * dx + dy * dy
+                if d <= 1 and 0 <= px < W and 0 <= py < H:
+                    pix[(px, py)] = (12, 12, 16) if d < 0.12 else c
+        if not hit and t > self.T - 1.8:
+            s = "it's getting close..." if t < self.T - 0.8 else "come on... come on..."
+            put_text(text, B_center(s, 0, W), 7 if y > 10 else 12, s, (200, 200, 210))
+        if hit:  # celebration: confetti from the corner and the big news
+            cx = 0 if x < W / 2 else W - 1
+            cy = 0 if y < H / 2 else H - 1
+            age = t - self.T
+            for dx, sp, hue in self.confetti:
+                px = cx + (1 if cx == 0 else -1) * abs(dx) * sp * age * 40
+                py = cy + (1 if cy == 0 else -1) * sp * age * 22 + (age * age * 8 if cy == 0 else -age * 4)
+                if 0 <= px < W and 0 <= py < H:
+                    pix[(int(px), int(py))] = hsv(hue, 0.7, 1.0)
+            s = "IT HIT THE CORNER!"
+            row = 6 if y > 10 else 10
+            for i, ch in enumerate(s):
+                text[(B_center(s, row, W) + i, row)] = (ch, hsv(t * 1.5 + i * 0.08, 0.7), (20, 20, 28))
+        return pix, text
+
+
+RED_HAT = [  # the Red Hat fedora, 18x10 pixels
+    "......RRRRRR......",
+    ".....RRRRRRRR.....",
+    "....RRRRRRRRRR....",
+    "....RRRRRRRRRR....",
+    "...RRRRRRRRRRRR...",
+    "...KKKKKKKKKKKK...",
+    "..RRRRRRRRRRRRRR..",
+    "RRRRRRRRRRRRRRRRRR",
+    ".RRRRRRRRRRRRRRRR.",
+    "...RRRRRRRRRRRR...",
+]
+RED_HAT_COL = {"R": (238, 0, 0), "K": (20, 20, 20)}
+
+
+class Crt:
+    """An old CRT telly warming up: power dot, static, colour bars, then the ARCH TV ident."""
+    W, ROWS = 60, 16
+    SX0, SX1, SY0, SY1 = 3, 44, 2, 28  # the glass
+    BARS = [(235, 235, 235), (235, 235, 30), (30, 235, 235), (30, 235, 30), (235, 30, 235), (235, 30, 30), (30, 30, 235)]
+
+    def __init__(self):
+        self.glass = []
+        for y in range(self.SY0, self.SY1 + 1):
+            for x in range(self.SX0, self.SX1 + 1):
+                cx = min(x - self.SX0, self.SX1 - x)
+                cy = min(y - self.SY0, self.SY1 - y)
+                if cx + cy < 2:  # rounded corners
+                    continue
+                vig = min(1.0, 0.72 + 0.06 * min(cx, 5) + 0.06 * min(cy, 3))
+                self.glass.append((x, y, vig))
+
+    def over(self, t):
+        return t > 7.4 + HOLD
+
+    def cabinet(self, pix, t):
+        W, H = self.W, self.ROWS * 2
+        for x in range(W):
+            for y in range(H):
+                edge = x in (0, W - 1) or y in (0, H - 1)
+                grain = 0.92 + 0.08 * math.sin(x * 0.7 + (y % 3))
+                pix[(x, y)] = (70, 44, 24) if edge else scale((128, 82, 46), grain)
+        for x in range(self.SX0 - 1, self.SX1 + 2):  # bezel
+            for y in (self.SY0 - 1, self.SY1 + 1):
+                pix[(x, y)] = (40, 38, 36)
+        for y in range(self.SY0 - 1, self.SY1 + 2):
+            pix[(self.SX0 - 1, y)] = pix[(self.SX1 + 1, y)] = (40, 38, 36)
+        for x in range(47, 58):  # control panel
+            for y in range(2, 30):
+                pix[(x, y)] = (52, 50, 48)
+        click = 0.0 if t < 5.6 else math.pi / 3
+        for cy in (8, 17):
+            disc(pix, 52.5, cy + 0.5, 3.2, (160, 160, 165))
+            disc(pix, 52.5, cy + 0.5, 2.2, (110, 110, 115))
+            a = (click if cy == 8 else 0.4) - math.pi / 2
+            pix[(int(round(52 + math.cos(a) * 2)), int(round(cy + math.sin(a) * 2)))] = (20, 20, 20)
+        for y in range(23, 28, 2):  # speaker grille
+            for x in range(49, 57):
+                pix[(x, y)] = (30, 30, 30)
+        pix[(55, 21)] = (80, 230, 90) if t > 0.25 else (90, 20, 20)  # power LED
+
+    def frame(self, t, done):
+        W, H = self.W, self.ROWS * 2
+        pix, text = {}, {}
+        if done:
+            t = 7.0
+        self.cabinet(pix, t)
+        mx, my = (self.SX0 + self.SX1) / 2, (self.SY0 + self.SY1) / 2
+        sw, sh = self.SX1 - self.SX0, self.SY1 - self.SY0
+        dark = (14, 18, 16)
+        rnd = random.random
+        for x, y, vig in self.glass:
+            c = dark
+            if t < 0.6:  # power dot
+                if t > 0.25 and abs(x - mx) < 1.2 and abs(y - my) < 0.8:
+                    c = (255, 255, 255)
+            elif t < 1.1:  # line opens out, then the picture tube lights up
+                k = (t - 0.6) / 0.2
+                half_w = min(1.0, k) * sw / 2
+                half_h = 0.6 if t < 0.8 else (t - 0.8) / 0.3 * sh / 2
+                if abs(x - mx) <= half_w and abs(y - my) <= half_h:
+                    c = (245, 250, 255)
+            elif t < 3.6:  # static, with a rolling bar and the odd tear
+                bright = 0.3 + 0.7 * rnd()
+                if ((y - self.SY0 + int(t * 22)) % sh) < 4:
+                    bright *= 0.45
+                if t > 3.1 and rnd() < (t - 3.1) / 0.5:  # picture starts to come through
+                    c = self.bar_color(x, y, t)
+                else:
+                    v = int(bright * 220)
+                    c = (v, v, v + 10 if v < 245 else v)
+            elif t < 5.6:
+                wob = 0.0
+                if t < 4.3:  # degauss wobble
+                    amp = 3 * (1 - (t - 3.6) / 0.7)
+                    wob = math.sin(y * 0.55 + t * 30) * amp
+                c = self.bar_color(x - wob, y, t)
+                if t < 4.3:
+                    tint = hsv(t * 3 + y * 0.05, 0.9, 1.0)
+                    k = 0.35 * (1 - (t - 3.6) / 0.7)
+                    c = tuple(int(a * (1 - k) + b * k) for a, b in zip(c, tint))
+            else:  # station ident on a deep blue gradient
+                c = scale((20, 40, 110), 0.6 + 0.4 * (1 - (y - self.SY0) / sh))
+            pix[(x, y)] = scale(c, vig)
+        if 3.9 < t < 5.6:
+            s = " PLEASE STAND BY "
+            col = (self.SX0 + self.SX1) // 2 - len(s) // 2
+            for i, ch in enumerate(s):
+                text[(col + i, 6)] = (ch, (240, 240, 240), (10, 10, 10))
+        if t >= 5.6:
+            k = min(1.0, (t - 5.6) / 0.5)
+            if FEDORA:  # the Red Hat fedora, then "TV"
+                ww = len(RED_HAT[0]) + 4 + 11
+                x0 = self.SX0 + (sw + 1 - ww) // 2
+                sprite(pix, RED_HAT, {k_: scale(c_, k) for k_, c_ in RED_HAT_COL.items()}, x0, 7)
+                B_big_text(pix, "TV", x0 + len(RED_HAT[0]) + 4, 7,
+                           lambda px, gy: scale((245, 245, 245), k), W, H, sy=2)
+            else:
+                ww = 23 + 3 + 11  # "ARCH", a narrow gap, "TV"
+                x0 = self.SX0 + (sw + 1 - ww) // 2
+                col = lambda px, gy: scale(hsv(0.55 + gy * 0.02 + 0.03 * math.sin(t * 3 + px * 0.2), 0.35, 1.0), k)
+                B_big_text(pix, "ARCH", x0, 7, col, W, H, sy=2)
+                B_big_text(pix, "TV", x0 + 26, 7, lambda px, gy: scale(hsv(0.08, 0.6, 1.0), k), W, H, sy=2)
+            if t > 6.0:
+                s = ("RED HAT TV · since " if FEDORA else "ch 03 · since ") + BRAND["since"]
+                col0 = (self.SX0 + self.SX1) // 2 - len(s) // 2 + 1
+                for i, ch in enumerate(s):
+                    text[(col0 + i, 11)] = (ch, (180, 200, 240), (18, 34, 88))
+        s = BRAND["vision"]
+        for i, ch in enumerate(s):
+            text[(18 - (len(s) - 10) // 2 + i, 15)] = (ch, (230, 200, 140), (100, 64, 36))
+        return pix, text
+
+    def bar_color(self, x, y, t):
+        rel_x = (x - self.SX0) / (self.SX1 - self.SX0 + 1)
+        rel_y = (y - self.SY0) / (self.SY1 - self.SY0)
+        i = max(0, min(6, int(rel_x * 7)))
+        if rel_y < 0.66:
+            return self.BARS[i]
+        if rel_y < 0.76:  # reversed castellations
+            return self.BARS[6 - i] if i % 2 == 0 else (16, 16, 16)
+        j = int(rel_x * 6)
+        return ((0, 30, 70), (235, 235, 235), (40, 0, 90), (16, 16, 16), (8, 8, 8), (28, 28, 28))[min(5, j)]
+
+
+class Visualizer:
+    """A 2000s music player: bouncing spectrum bars with peak hold, LCD ticker, oscilloscope."""
+    W, ROWS = 78, 15
+    END = 8.0
+    TICKER = "now playing: kernel_panic.mod  —  128kbps  —  44kHz stereo  ***  "
+    NB = 26
+
+    def __init__(self):
+        self.peaks = [0.0] * self.NB
+        self.last = 0.0
+        self.phase = [random.uniform(0, 6) for _ in range(self.NB)]
+
+    def over(self, t):
+        return t > self.END + 1.2 + HOLD
+
+    def level(self, i, t):
+        beat = (t * 128 / 60) % 1
+        kick = math.exp(-beat * 6)
+        env = 0.95 - 0.55 * (i / self.NB) + 0.15 * math.exp(-((i - 9) / 3) ** 2)
+        wobble = 0.65 + 0.35 * math.sin(t * (3 + i * 0.37) + self.phase[i]) * math.sin(t * 1.3 + i)
+        v = env * (0.45 + 0.55 * (kick if i < 8 else 0.5 + 0.5 * kick)) * wobble
+        if t > self.END:
+            v *= max(0.0, 1 - (t - self.END) / 0.7)
+        return max(0.0, min(1.0, v))
+
+    def frame(self, t, done):
+        W, H = self.W, self.ROWS * 2
+        pix, text = {}, {}
+        if done:
+            t = max(t, self.END + 1.2)
+            self.peaks = [0.0] * self.NB
+        dt, self.last = max(0.0, min(0.1, t - self.last)), t
+        title = " » TUX PLAYER "
+        for c in range(W):  # title bar
+            text[(c, 0)] = (" ", None, scale((60, 80, 140), 1 - c / W * 0.6))
+        put_title = lambda col, s, fg: [text.__setitem__((col + i, 0), (ch, fg, text[(col + i, 0)][2])) for i, ch in enumerate(s)]
+        put_title(1, title, (240, 240, 255))
+        put_title(W - 9, "_  □  x", (200, 205, 225))
+        lcd_bg, lcd = (8, 20, 12), (110, 255, 140)
+        for c in range(W):  # LCD row
+            text[(c, 1)] = (" ", None, lcd_bg)
+        pos = min(240, 232 + t)
+        stopped = t >= self.END
+        clock = f"{int(pos) // 60:02d}:{int(pos) % 60:02d}"
+        for i, ch in enumerate(" " + clock):
+            text[(1 + i, 1)] = (ch, lcd, lcd_bg)
+        if stopped:
+            msg = "■ stopped"
+            for i, ch in enumerate(msg):
+                text[(9 + i, 1)] = (ch, (255, 190, 90), lcd_bg)
+        else:
+            off = int(t * 9)
+            for i in range(44):
+                text[(9 + i, 1)] = (self.TICKER[(i + off) % len(self.TICKER)], lcd, lcd_bg)
+        for i, ch in enumerate("128kbps 44kHz stereo"):
+            text[(W - 22 + i, 1)] = (ch, scale(lcd, 0.7), lcd_bg)
+        for x in range(W):  # spectrum panel
+            for y in range(4, 24):
+                pix[(x, y)] = (8, 11, 16) if (y % 2) else (10, 14, 20)
+        for i in range(self.NB):
+            h = self.level(i, t) * 19
+            self.peaks[i] = max(h, self.peaks[i] - 14 * dt)
+            for k in range(int(h)):
+                y = 23 - k
+                g = k / 19
+                c = (60, 220, 90) if g < 0.5 else (240, 220, 60) if g < 0.8 else (240, 70, 50)
+                pix[(i * 3, y)] = c
+                pix[(i * 3 + 1, y)] = scale(c, 0.8)
+            py = 23 - int(round(self.peaks[i]))
+            if self.peaks[i] > 0.5 and 4 <= py < 24:
+                pix[(i * 3, py)] = pix[(i * 3 + 1, py)] = (235, 235, 245)
+        amp = 0.0 if stopped else 1.8 * (0.6 + 0.4 * math.exp(-((t * 128 / 60) % 1) * 5))
+        for x in range(W):  # oscilloscope
+            for y in range(24, 28):
+                pix[(x, y)] = (6, 10, 14)
+            v = math.sin(x * 0.45 + t * 9) * 0.6 + math.sin(x * 0.17 - t * 4) * 0.4
+            pix[(x, int(round(25.5 + v * amp)))] = (90, 230, 255)
+        bar_bg = (24, 27, 38)
+        for c in range(W):
+            text[(c, 14)] = (" ", None, bar_bg)
+        ctrl = " |<   >   ||   []   >| "
+        for i, ch in enumerate(ctrl):
+            text[(i, 14)] = (ch, (255, 190, 90) if (ch == "[" or ch == "]") and stopped else (200, 205, 225), bar_bg)
+        prog_w = 34
+        done_w = int(prog_w * pos / 240)
+        for i in range(prog_w):
+            ch = "●" if i == done_w and not stopped else "━" if i < done_w or stopped else "─"
+            text[(len(ctrl) + i, 14)] = (ch, BRAND_BLUE if i <= done_w or stopped else (90, 95, 110), bar_bg)
+        s = f" {clock} / 04:00"
+        for i, ch in enumerate(s):
+            text[(len(ctrl) + prog_w + i, 14)] = (ch, (200, 205, 225), bar_bg)
+        return pix, text
+
+
+NEW_B = {"cracktro": Cracktro, "geocities": Geocities, "dvd": Bouncer, "crt": Crt, "visualizer": Visualizer}
+
+
+# ── scenes: internet memes ──
+
+# ── batch C: internet-meme scenes (original homage art, no copied images or lyrics) ──
+
+C_FONT = {  # chunky 5-row pixel font, variable width
+    "A": [".#.", "#.#", "###", "#.#", "#.#"], "B": ["##.", "#.#", "##.", "#.#", "##."],
+    "C": [".##", "#..", "#..", "#..", ".##"], "D": ["##.", "#.#", "#.#", "#.#", "##."],
+    "E": ["###", "#..", "##.", "#..", "###"], "F": ["###", "#..", "##.", "#..", "#.."],
+    "G": [".##", "#..", "#.#", "#.#", ".##"], "H": ["#.#", "#.#", "###", "#.#", "#.#"],
+    "I": ["###", ".#.", ".#.", ".#.", "###"], "J": ["..#", "..#", "..#", "#.#", ".#."],
+    "K": ["#.#", "#.#", "##.", "#.#", "#.#"], "L": ["#..", "#..", "#..", "#..", "###"],
+    "M": ["#...#", "##.##", "#.#.#", "#...#", "#...#"], "N": ["#..#", "##.#", "#.##", "#..#", "#..#"],
+    "O": [".#.", "#.#", "#.#", "#.#", ".#."], "P": ["##.", "#.#", "##.", "#..", "#.."],
+    "Q": [".#.", "#.#", "#.#", "##.", ".##"], "R": ["##.", "#.#", "##.", "#.#", "#.#"],
+    "S": [".##", "#..", ".#.", "..#", "##."], "T": ["###", ".#.", ".#.", ".#.", ".#."],
+    "U": ["#.#", "#.#", "#.#", "#.#", "###"], "V": ["#.#", "#.#", "#.#", "#.#", ".#."],
+    "W": ["#...#", "#...#", "#.#.#", "##.##", "#...#"], "X": ["#.#", "#.#", ".#.", "#.#", "#.#"],
+    "Y": ["#.#", "#.#", ".#.", ".#.", ".#."], "Z": ["###", "..#", ".#.", "#..", "###"],
+    "0": ["###", "#.#", "#.#", "#.#", "###"], "1": [".#.", "##.", ".#.", ".#.", "###"],
+    "2": ["###", "..#", "###", "#..", "###"], "3": ["###", "..#", ".##", "..#", "###"],
+    "4": ["#.#", "#.#", "###", "..#", "..#"], "5": ["###", "#..", "###", "..#", "###"],
+    "6": ["###", "#..", "###", "#.#", "###"], "7": ["###", "..#", ".#.", ".#.", ".#."],
+    "8": ["###", "#.#", "###", "#.#", "###"], "9": ["###", "#.#", "###", "..#", "###"],
+    "!": ["#", "#", "#", ".", "#"], "'": ["#", "#", ".", ".", "."], ".": [".", ".", ".", ".", "#"],
+    " ": ["..", "..", "..", "..", ".."],
+}
+
+
+def C_width(s, size=1):
+    return sum((len(C_FONT.get(ch.upper(), C_FONT[" "])[0]) + 1) * size for ch in s) - size
+
+
+def C_draw(pix, s, x, y, size, color, outline=None):
+    """Big pixel text. color is an rgb, or fn(char_index, gx, gy) -> rgb."""
+    lit = {}
+    cx = x
+    for i, ch in enumerate(s):
+        g = C_FONT.get(ch.upper(), C_FONT[" "])
+        for gy, row in enumerate(g):
+            for gx, on in enumerate(row):
+                if on == "#":
+                    c = color(i, gx, gy) if callable(color) else color
+                    for sy in range(size):
+                        for sx in range(size):
+                            lit[(cx + gx * size + sx, y + gy * size + sy)] = c
+        cx += (len(g[0]) + 1) * size
+    if outline:
+        for (px, py) in lit:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if (px + dx, py + dy) not in lit:
+                        pix[(px + dx, py + dy)] = outline
+    pix.update(lit)
+
+
+def C_put(text, col, row, s, fg, bg=None):
+    for i, ch in enumerate(s):
+        if bg is not None:
+            text[(col + i, row)] = (ch, fg, bg)
+        elif ch != " ":
+            text[(col + i, row)] = (ch, fg)
+
+
+def C_clip(pix, text, w, rows):
+    return ({k: v for k, v in pix.items() if 0 <= k[0] < w and 0 <= k[1] < rows * 2},
+            {k: v for k, v in text.items() if 0 <= k[0] < w and 0 <= k[1] < rows})
+
+
+def C_fill(pix, w, h, color):
+    for x in range(w):
+        for y in range(h):
+            pix[(x, y)] = color
+
+
+# ── doge ──
+C_SHIBA = [r.ljust(22, ".") for r in [
+    "..O................O..",
+    ".OOO..............OOO.",
+    ".OIOO............OOIO.",
+    ".OIIOO..........OOIIO.",
+    ".OIIOOOOOOOOOOOOOOIIO.",
+    "OOOOOOOOOOOOOOOOOOOOOO",
+    "OOOCCOOOOOOOOOOOOCCOOO",
+    "OOOOOOOOOOOOOOOOOOOOOO",
+    "OOOKKWOOOOOOOOOOKKWOOO",
+    "OOOKKKOOOOOOOOOOKKKOOO",
+    "OOOOOOOOOCCCCOOOOOOOOO",
+    "OOOOOOOCCCCCCCCOOOOOOO",
+    "OCCOOOCCCCKKCCCCOOOCCO",
+    "OCCCOCCCCCKKCCCCCOCCCO",
+    ".CCCCCCCCCCCCCCCCCCCC.",
+    ".CCCCCCCKCCCCKCCCCCCC.",
+    "..CCCCCCCKKKKCCCCCCC..",
+    "...CCCCCCCCCCCCCCCC...",
+    ".....CCCCCCCCCCCC.....",
+    "........CCCCCC........",
+]]
+C_SHIBA_COL = {"O": (222, 160, 80), "I": (245, 190, 180), "C": (252, 238, 210), "K": (30, 25, 25),
+               "W": (255, 255, 255)}
+
+
+class Doge:
+    """wow. such terminal. much arch. very penguin. so kernel."""
+    W, ROWS = 64, 17
+    WORDS = ["such terminal", f"much {BRAND['word'].lower()}", "very penguin", "so kernel", "many packages",
+             "such uptime", "very sudo", f"much {BRAND['pm']}", "so bash", "amaze", "very tiling", "such rice"]
+    SLOTS = [(2, 1), (5, 4), (1, 7), (3, 10), (1, 13), (2, 15),
+             (44, 0), (47, 3), (45, 6), (44, 9), (49, 12), (49, 15)]
+    START, GAP = 0.3, 0.45
+
+    def __init__(self):
+        r = random.Random()
+        self.items = list(zip(r.sample(self.WORDS, 9), r.sample(self.SLOTS, 9), [r.random() for _ in range(9)]))
+        self.wow_at = self.START + len(self.items) * self.GAP + 0.2
+
+    def over(self, t):
+        return t > self.wow_at + 1.0 + HOLD
+
+    def frame(self, t, done):
+        if done:
+            t = self.wow_at + 1.0
+        pix, text = {}, {}
+        tilt = 1 if (t % 3) > 2.4 else 0  # the head-tilt every few seconds
+        sprite(pix, C_SHIBA, C_SHIBA_COL, 21 + tilt, 1)
+        for i, (word, (col, row), hue) in enumerate(self.items):
+            born = self.START + i * self.GAP
+            if t < born:
+                continue
+            age = t - born
+            n = len(word)
+            shown = min(n, int(age / 0.14 * n) + 1)  # grows out from the middle
+            lo = (n - shown) // 2
+            for j, ch in enumerate(word):
+                if lo <= j < lo + shown and ch != " ":
+                    c = (255, 255, 255) if age < 0.12 else hsv(hue + t * 0.12 + j * 0.03, 0.75, 1.0)
+                    text[(col + j, row)] = (ch, c)
+        if t >= self.wow_at:
+            age = t - self.wow_at
+            w = C_width("WOW", 2)
+            jolt = random.choice((-1, 0, 1)) if age < 0.3 and not done else 0
+            C_draw(pix, "WOW", (self.W - w) // 2 + jolt, 23, 2,
+                   lambda i, gx, gy: hsv(t * 0.4 + (i * 4 + gx) * 0.07, 0.8, 1.0), outline=(20, 20, 24))
+        return C_clip(pix, text, self.W, self.ROWS)
+
+
+# ── nyan ──
+C_CAT_HEAD = [
+    ".GG....GG.",
+    ".GGG..GGG.",
+    "GGGGGGGGGG",
+    "GGWKGGGWKG",
+    "GGKKGGGKKG",
+    "GPGGGKGGGP",
+    "GPGKGKGKGP",
+    "GGGGGGGGGG",
+    ".GGGGGGGG.",
+]
+C_CAT_COL = {"G": (156, 156, 164), "W": (255, 255, 255), "K": (24, 24, 28), "P": (255, 160, 170)}
+
+
+class Nyan:
+    """A rainbow pop-tart cat streaks across a starry sky. nyan~"""
+    W, ROWS = 78, 15
+    SKY = (16, 38, 86)
+    RAINBOW = [(255, 45, 45), (255, 150, 0), (255, 232, 0), (60, 225, 40), (30, 150, 255), (120, 70, 255)]
+    END = 6.0
+
+    def __init__(self):
+        r = random.Random()
+        self.stars = [(r.uniform(0, self.W), r.randrange(1, 29), r.randrange(4)) for _ in range(16)]
+        self.sprinkles = [(r.randrange(3, 17), r.randrange(3, 11), r.random() < 0.5) for _ in range(9)]
+
+    def over(self, t):
+        return t > self.END + HOLD
+
+    def frame(self, t, done):
+        if done:
+            t = self.END
+        pix, text = {}, {}
+        C_fill(pix, self.W, 30, self.SKY)
+        for x0, y, ph in self.stars:  # twinkling stars drifting past
+            x = round((x0 - t * 28) % (self.W + 6) - 3)
+            k = int(t * 6 + ph) % 4
+            star = (250, 250, 255)
+            pix[(x, y)] = star if k != 3 else self.SKY
+            arms = {0: [], 1: [(1, 0)], 2: [(2, 0), (1, 0)], 3: [(2, 2), (1, 1)]}[k]
+            for dx, dy in arms:
+                for sx, sy in ((dx, dy), (-dx, -dy), (dy, -dx), (-dy, dx)):
+                    pix[(x + sx, y + sy)] = star
+        frame8 = int(t * 8)
+        bx = round(min(30.0, -26 + t * 24))
+        by = 8 + frame8 % 2
+        for x in range(0, bx + 3):  # stepped, wavy rainbow trail
+            dy = ((x - bx) // 8 + frame8) % 2
+            for k, c in enumerate(self.RAINBOW):
+                pix[(x, 9 + k * 2 + dy)] = c
+                pix[(x, 10 + k * 2 + dy)] = c
+        legs = frame8 % 2
+        grey = C_CAT_COL["G"]
+        for lx in (1 + legs, 5 - legs, 12 + legs, 16 - legs):  # paws
+            for dx in (0, 1):
+                for dy in (0, 1):
+                    pix[(bx + lx + dx, by + 14 + dy)] = grey
+        for i, (dx, dy) in enumerate(((-1, 8), (-2, 7 - legs), (-3, 7 - legs), (-4, 6 - legs))):  # tail
+            pix[(bx + dx, by + dy)] = grey
+            pix[(bx + dx, by + dy + 1)] = grey
+        crust, frost = (250, 205, 150), (255, 153, 230)
+        for x in range(20):  # the pop-tart body
+            for y in range(14):
+                if (x, y) in ((0, 0), (19, 0), (0, 13), (19, 13)):
+                    continue
+                inner = 2 <= x < 18 and 2 <= y < 12 and (x, y) not in ((2, 2), (17, 2), (2, 11), (17, 11))
+                pix[(bx + x, by + y)] = frost if inner else crust
+        for sx, sy, alt in self.sprinkles:
+            pix[(bx + sx, by + sy)] = (255, 50, 150) if alt else (170, 60, 255)
+        sprite(pix, C_CAT_HEAD, C_CAT_COL, bx + 14, by + 4)
+        if t > 2.8:
+            msg = "nyan~ nyan~ nyan~"
+            shown = msg[:int((t - 2.8) * 12)]
+            col = (self.W - len(msg)) // 2
+            for i, ch in enumerate(shown):
+                text[(col + i, 13)] = (ch, hsv(t * 0.5 + i * 0.05, 0.45, 1.0), self.SKY)
+        return C_clip(pix, text, self.W, self.ROWS)
+
+
+# ── all your base ──
+class AllYourBase:
+    """In A.D. 2101, war was beginning. All your base are belong to us."""
+    W, ROWS = 64, 15
+    BLACK = (0, 0, 0)
+    GROUPS = [
+        (0.2, [("", "In A.D. 2101"), ("", "War was beginning.")]),
+        (1.9, [("Captain", "What happen ?")]),
+        (3.1, [("CATS", "All your base are belong to us.")]),
+        (4.9, [("CATS", "You are on the way to destruction.")]),
+        (6.2, [("Captain", "For great justice.")]),
+    ]
+    FINAL = 7.3
+
+    def __init__(self):
+        r = random.Random()
+        self.stars = [(r.uniform(0, self.W), r.randrange(0, 20), r.uniform(0.3, 1)) for _ in range(28)]
+
+    def over(self, t):
+        return t > self.FINAL + 1.2 + HOLD
+
+    def ship(self, pix, x0, y0, t):
+        hull, dark, glass = (176, 182, 194), (104, 110, 124), (90, 175, 255)
+        for x in range(20):
+            for y in range(3, 7):
+                pix[(x0 + x, y0 + y)] = hull if y < 6 else dark
+        for k in range(4):  # tapered nose
+            for y in range(3 + k // 2, 7 - (k + 1) // 2):
+                pix[(x0 + 20 + k, y0 + y)] = hull
+        for x in range(10, 17):
+            for y in (1, 2):
+                pix[(x0 + x, y0 + y)] = glass if 11 <= x <= 15 else hull
+        for x in range(2, 11):
+            pix[(x0 + x, y0 + 4)] = (200, 60, 60)
+        flick = random.randint(2, 4)
+        for x in range(1, flick + 1):  # engine glow
+            for y in (4, 5):
+                pix[(x0 - x, y0 + y)] = (255, 200, 80) if x < 2 else (255, 110, 40)
+
+    def cats(self, pix, t, dy=0):
+        body, trim = (46, 36, 62), (92, 80, 112)
+        sub = {}
+        pix, real = sub, pix
+        for y in range(1, 15):
+            for x in range(24, 41):
+                if ((x - 32) / 7.5) ** 2 + ((y - 8) / 7) ** 2 < 1:
+                    pix[(x, y)] = body
+        for y in range(14, 20):
+            half = 6 + (y - 14) * 2
+            for x in range(32 - half, 32 + half + 1):
+                pix[(x, y)] = body
+        line(pix, 25, 9, 20, 18, trim)  # cables
+        line(pix, 39, 9, 44, 18, trim)
+        glow = 0.65 + 0.35 * math.sin(t * 9)
+        for x in range(27, 38):  # the red visor
+            pix[(x, 7)] = scale((255, 40, 40), glow)
+            pix[(x, 8)] = scale((255, 40, 40), glow * 0.7)
+        for (x, y), c in sub.items():
+            real[(x, y + dy)] = c
+
+    def frame(self, t, done):
+        if done:
+            t = self.FINAL + 1.2
+        pix, text = {}, {}
+        C_fill(pix, self.W, 30, self.BLACK)
+        for x0, y, sp in self.stars:
+            pix[(round((x0 - t * 14 * sp) % self.W), y)] = scale((220, 225, 240), sp)
+        cats_on = 3.1 <= t < 4.9 or t >= self.FINAL
+        if 3.1 <= t < 3.25:
+            C_fill(pix, self.W, 22, (110, 0, 0))
+        if t < self.FINAL:
+            if cats_on:
+                self.cats(pix, t)
+            else:
+                self.ship(pix, round(6 + t * 3), 6 + round(math.sin(t * 2)), t)
+            group = [g for g in self.GROUPS if g[0] <= t]
+            if group:
+                start, lines = group[-1]
+                chars = int((t - start) * 30)
+                for li, (who, said) in enumerate(lines):
+                    full = (who + ": " if who else "") + said
+                    row = 11 + li if len(lines) > 1 else 12
+                    col = (self.W - len(full)) // 2
+                    shown = full[:max(0, chars)]
+                    chars -= len(full) + 6
+                    for i, ch in enumerate(shown):
+                        fg = (255, 220, 80) if i < len(who) + 1 and who else (240, 240, 240)
+                        text[(col + i, row)] = (ch, fg, self.BLACK)
+        else:
+            self.cats(pix, t, dy=-3)
+            age = t - self.FINAL
+            for k, (s, delay) in enumerate((("ALL YOUR BASE", 0.0), ("ARE BELONG TO US", 0.35))):
+                if age >= delay:
+                    C_draw(pix, s, (self.W - C_width(s, 1)) // 2, 18 + k * 6, 1,
+                           lambda i, gx, gy: hsv(0.13 - gy * 0.02, 0.85, 1.0), outline=(120, 0, 0))
+            if age > 0.8:
+                msg = "All your base are belong to us."
+                C_put(text, (self.W - len(msg)) // 2, 0, msg, (240, 240, 240), self.BLACK)
+        return C_clip(pix, text, self.W, self.ROWS)
+
+
+# ── over 9000 ──
+C_SEGS = {"0": "abcdef", "1": "bc", "2": "abged", "3": "abgcd", "4": "fgbc", "5": "afgcd", "6": "afgedc",
+          "7": "abc", "8": "abcdefg", "9": "abcdfg"}
+
+
+def C_seg_digit(pix, d, x, y, on, off):
+    rects = {"a": (1, 0, 5, 1), "b": (5, 1, 6, 5), "c": (5, 5, 6, 9), "d": (1, 9, 5, 10),
+             "e": (0, 5, 1, 9), "f": (0, 1, 1, 5), "g": (1, 5, 5, 5)}
+    lit = C_SEGS.get(d, "")
+    for seg, (x0, y0, x1, y1) in rects.items():
+        c = on if seg in lit else off
+        if c is None:
+            continue
+        for px in range(x0, x1 + 1):
+            for py in range(y0, y1 + 1):
+                pix[(x + px, y + py)] = c
+
+
+class Over9000:
+    """A scouter reads a power level... it's over 9000!!"""
+    W, ROWS = 78, 15
+    HUD = (60, 255, 120)
+    PEAK, SLAM, END = 3.0, 3.6, 4.8
+
+    def __init__(self):
+        r = random.Random()
+        self.cracks = []
+        for a in (0.4, 1.9, 3.0, 4.4, 5.5):
+            pts, x, y = [], 58.0, 7.0
+            for _ in range(7):
+                a += r.uniform(-0.5, 0.5)
+                x, y = x + math.cos(a) * r.uniform(3, 6), y + math.sin(a) * r.uniform(2, 4)
+                pts.append((x, y))
+            self.cracks.append(pts)
+
+    def over(self, t):
+        return t > self.END + HOLD
+
+    def level(self, t):
+        if t < 0.4:
+            return 0
+        if t >= self.PEAK:
+            return 9001
+        k = (t - 0.4) / (self.PEAK - 0.4)
+        return min(9000, int(9001 * k ** 3) + random.randint(0, 30))
+
+    def frame(self, t, done):
+        if done:
+            t = self.END
+        pix, text = {}, {}
+        alarm = self.PEAK <= t < self.SLAM and int(t * 14) % 2
+        dim = 0.45 if t >= self.SLAM else 1.0
+        lens = (110, 0, 0) if alarm else (0, 40, 20)
+        for x in range(self.W):
+            for y in range(30):
+                pix[(x, y)] = scale(lens, dim * (0.75 if y % 2 else 1.0))
+        hud = scale((255, 80, 80) if alarm else self.HUD, dim)
+        cx, cy = 19, 15
+        for a in range(0, 360, 5):  # reticle rings, the inner one spinning
+            r = math.radians(a)
+            pix[(round(cx + math.cos(r) * 15), round(cy + math.sin(r) * 11))] = hud
+            if (a // 30) % 2 == 0:
+                rr = r + t * 2
+                pix[(round(cx + math.cos(rr) * 6), round(cy + math.sin(rr) * 4.5))] = hud
+        for d in range(8, 20):
+            for sx, sy in ((d, 0), (-d, 0)):
+                pix[(cx + sx, cy + sy)] = hud
+        for d in range(6, 14):
+            pix[(cx, cy + d)] = hud
+            pix[(cx, cy - d)] = hud
+        fig = scale((0, 110, 55), dim)  # the target
+        disc(pix, cx + 0.5, cy - 4.5, 2.2, fig)
+        for y in range(cy - 2, cy + 6):
+            for x in range(cx - 2 - (y > cy), cx + 3 + (y > cy)):
+                pix[(x, y)] = fig
+        val = self.level(t)
+        on = scale((255, 70, 70) if val > 9000 else (255, 220, 60) if val > 7000 else self.HUD, dim)
+        ghost = scale((0, 70, 35), dim)
+        digits = f"{val:>4}"
+        for i, d in enumerate(digits):
+            C_seg_digit(pix, d, 42 + i * 9, 9, on, ghost)
+        bg = scale((0, 34, 18), dim)
+        if t < self.SLAM:
+            C_put(text, 42, 2, "POWER LEVEL", hud, bg)
+            if t < self.PEAK:
+                C_put(text, 42, 12, "SCANNING" + "." * (int(t * 3) % 4), hud, bg)
+            elif alarm:
+                C_put(text, 42, 12, "! WARNING !", (255, 255, 255), (110, 0, 0))
+        if t >= self.PEAK + 0.08:
+            for pts in self.cracks:
+                prev = (58, 7)
+                for p in pts:
+                    line(pix, prev[0], prev[1], p[0], p[1], scale((220, 255, 230), dim * 1.6 if dim < 1 else 1))
+                    prev = p
+        if t >= self.SLAM:
+            age = t - self.SLAM
+            shake = random.choice((-1, 0, 1)) if age < 0.45 and not done else 0
+            grad = lambda i, gx, gy: hsv(0.14 - gy * 0.025, 0.9, 1.0)
+            C_draw(pix, "IT'S", (self.W - C_width("IT'S", 2)) // 2 + shake, 2, 2, grad, outline=(90, 0, 0))
+            C_draw(pix, "OVER 9000!!", (self.W - C_width("OVER 9000!!", 2)) // 2 - shake, 15, 2, grad,
+                   outline=(90, 0, 0))
+        return C_clip(pix, text, self.W, self.ROWS)
+
+
+# ── stonks ──
+C_GUY = [
+    "..KKKK..",
+    ".KKKKKK.",
+    ".KSSSSK.",
+    ".SESSES.",
+    ".SSMMSS.",
+    "..SSSS..",
+    "NNNWWNNN",
+    "NNNWRNNN",
+    "NNNWRNNN",
+    "NNNNRNNN",
+    ".NNNNNN.",
+    ".NN..NN.",
+    ".NN..NN.",
+    ".KK..KK.",
+]
+
+
+class Stonks:
+    """A chart wobbles, crashes, then goes to the moon. STONKS."""
+    W, ROWS = 64, 15
+    CLOSES = [12, 11, 13, 12, 10, 13, 16, 21, 25, 22, 18, 13, 8, 3, -3, -12]
+    STEP, X0 = 0.2, 14
+    UP, DOWN = (60, 220, 120), (240, 70, 70)
+
+    def __init__(self):
+        r = random.Random()
+        self.candles = []
+        prev = 12
+        for c in self.CLOSES:
+            lo, hi = min(prev, c), max(prev, c)
+            self.candles.append((prev, c, lo - r.randint(0, 2), hi + r.randint(0, 2)))
+            prev = c
+        self.slam = 0.3 + len(self.CLOSES) * self.STEP + 0.3
+        self.base = 5.2069 ** (1 / 24)
+
+    def over(self, t):
+        return t > self.slam + 1.2 + HOLD
+
+    def pct(self, y):
+        return (self.base ** (12 - y) - 1) * 100
+
+    def frame(self, t, done):
+        if done:
+            t = self.slam + 1.2
+        pix, text = {}, {}
+        for y in range(2, 27, 4):  # grid
+            for x in range(13, self.W, 2):
+                pix[(x, y)] = (38, 40, 48)
+        for y in range(0, 28):
+            pix[(12, y)] = (90, 95, 108)
+        for x in range(12, self.W):
+            pix[(x, 27)] = (90, 95, 108)
+        cur = 12
+        for i, (o, c, lo, hi) in enumerate(self.candles):
+            start = 0.3 + i * self.STEP
+            if t < start:
+                break
+            k = min(1.0, (t - start) / self.STEP)
+            close = o + (c - o) * k
+            cur = close
+            color = self.UP if close <= o else self.DOWN
+            x = self.X0 + i * 3
+            for y in range(round(min(lo, close)), round(max(hi, o) if k >= 1 else max(o, close)) + 1):
+                pix[(x, y)] = scale(color, 0.6)  # wick
+            for y in range(round(min(o, close)), round(max(o, close)) + 1):
+                pix[(x, y)] = color
+                pix[(x + 1, y)] = color
+        if t >= self.slam - 0.3:  # the last candle leaves the chart: arrow off the top
+            for k in range(4):
+                for dx in range(-k, k + 1):
+                    pix[(self.X0 + 15 * 3 + 1 + dx, k)] = self.UP
+        crashed = 6 <= int((t - 0.3) / self.STEP) <= 10 and t < self.slam
+        arms_up = t >= self.slam
+        guy = [r.replace("M", "K") for r in C_GUY]
+        if arms_up:
+            guy[4] = ".SKSSKS."  # grin
+        elif crashed:
+            guy[3] = ".SKSSKS."
+        sprite(pix, guy, {"K": (30, 28, 30), "S": (240, 200, 160), "E": (30, 28, 30), "N": (40, 52, 96),
+                          "W": (240, 240, 240), "R": (220, 50, 50)}, 2, 13)
+        suit = (40, 52, 96)
+        for k in range(4):  # arms
+            if arms_up:
+                pix[(1, 17 - k)] = suit
+                pix[(10, 17 - k)] = suit
+            else:
+                pix[(1, 19 + k)] = suit
+                pix[(10, 19 + k)] = suit
+        if arms_up:
+            pix[(1, 13)] = pix[(10, 13)] = (240, 200, 160)
+        pct = 420.69 if t >= self.slam else self.pct(cur)
+        C_put(text, 14, 14, BRAND["ticker"], (236, 236, 228))
+        C_put(text, 20, 14, f"{pct:+.2f}%", self.UP if pct >= 0 else self.DOWN)
+        C_put(text, 30, 14, "▲" if pct >= 0 else "▼", self.UP if pct >= 0 else self.DOWN)
+        if t >= self.slam:
+            age = t - self.slam
+            w = C_width("STONKS", 2)
+            jolt = random.choice((-1, 0, 1)) if age < 0.3 and not done else 0
+            C_draw(pix, "STONKS", (self.W - w) // 2 + 6 + jolt, 8, 2,
+                   lambda i, gx, gy: hsv(0.33 - gy * 0.04 + math.sin(t * 3 + i) * 0.02, 0.8, 1.0),
+                   outline=(10, 30, 15))
+        return C_clip(pix, text, self.W, self.ROWS)
+
+
+# ── leeroy ──
+class Leeroy:
+    """The plan was perfect. Then: LEEEEROOOOY JENKINS!"""
+    W, ROWS = 78, 16
+    CHAT = [("[Raid Leader]", "ok: fear the whelps, then we AoE them down...", (255, 128, 0)),
+            ("[Raid Leader]", "that's a 32.33% (repeating) chance we survive.", (255, 128, 0)),
+            ("[Leeroy]", "All right chums, let's do this...", (255, 215, 90))]
+    LETTERS = "LEEEEROOOOY"
+    SIZES = [1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3]
+    YELL, JENKINS, CHICKEN, END = 2.6, 4.3, 5.4, 6.4
+
+    def over(self, t):
+        return t > self.END + HOLD
+
+    def frame(self, t, done):
+        if done:
+            t = self.END
+        pix, text = {}, {}
+        if t < self.YELL:
+            chars = int(t * 45)
+            for row, (who, said, color) in enumerate(self.CHAT):
+                full = f"{who} {said}"
+                shown = full[:max(0, chars)]
+                chars -= len(full) + 10
+                C_put(text, 2, 2 + row * 2, shown[:len(who)], color)
+                C_put(text, 2 + len(who), 2 + row * 2, shown[len(who):], (230, 230, 230))
+        shake = 0
+        if self.JENKINS <= t < self.JENKINS + 0.4 and not done:
+            shake = random.choice((-1, 1))
+        if t >= self.YELL:
+            n = min(len(self.LETTERS), int((t - self.YELL) / 0.13) + 1)
+            total = sum((len(C_FONT[c][0]) + 1) * s for c, s in zip(self.LETTERS, self.SIZES)) - 3
+            x = (self.W - total) // 2 + shake
+            for i in range(n):
+                ch, size = self.LETTERS[i], self.SIZES[i]
+                born = self.YELL + i * 0.13
+                jolt = random.choice((-1, 1)) if t - born < 0.1 and not done else 0
+                color = hsv(0.15 - i * 0.015, 0.75 + i * 0.02, 1.0)
+                C_draw(pix, ch, x, 17 - 5 * size + jolt, size, color, outline=(40, 10, 0))
+                x += (len(C_FONT[ch][0]) + 1) * size
+        if t >= self.JENKINS:
+            flash = t - self.JENKINS < 0.12 and not done
+            w = C_width("JENKINS!", 2)
+            C_draw(pix, "JENKINS!", (self.W - w) // 2 - shake, 19, 2,
+                   (255, 255, 255) if flash else (lambda i, gx, gy: hsv(0.02 + gy * 0.012, 0.85, 1.0)),
+                   outline=(60, 0, 0))
+        if t >= self.CHICKEN:
+            msg = "At least I have chicken."
+            C_put(text, (self.W - len(msg)) // 2, 15, msg[:int((t - self.CHICKEN) * 30)], (150, 150, 160))
+        return C_clip(pix, text, self.W, self.ROWS)
+
+
+NEW_C = {"doge": Doge, "nyan": Nyan, "allyourbase": AllYourBase, "over9000": Over9000,
+       "stonks": Stonks, "leeroy": Leeroy}
+
+
+# ── scenes: more internet and gaming memes ──
+
+# ── batch D: internet / gaming meme scenes ──
+
+D_FONT = {  # 3×5 pixel glyphs
+    "A": [".#.", "#.#", "###", "#.#", "#.#"], "B": ["##.", "#.#", "##.", "#.#", "##."],
+    "C": [".##", "#..", "#..", "#..", ".##"], "D": ["##.", "#.#", "#.#", "#.#", "##."],
+    "E": ["###", "#..", "##.", "#..", "###"], "F": ["###", "#..", "##.", "#..", "#.."],
+    "G": [".##", "#..", "#.#", "#.#", ".##"], "H": ["#.#", "#.#", "###", "#.#", "#.#"],
+    "I": ["###", ".#.", ".#.", ".#.", "###"], "J": ["..#", "..#", "..#", "#.#", ".#."],
+    "K": ["#.#", "#.#", "##.", "#.#", "#.#"], "L": ["#..", "#..", "#..", "#..", "###"],
+    "M": ["#.#", "###", "###", "#.#", "#.#"], "N": ["##.", "#.#", "#.#", "#.#", "#.#"],
+    "O": [".#.", "#.#", "#.#", "#.#", ".#."], "P": ["##.", "#.#", "##.", "#..", "#.."],
+    "Q": [".#.", "#.#", "#.#", "##.", ".##"], "R": ["##.", "#.#", "##.", "#.#", "#.#"],
+    "S": [".##", "#..", ".#.", "..#", "##."], "T": ["###", ".#.", ".#.", ".#.", ".#."],
+    "U": ["#.#", "#.#", "#.#", "#.#", "###"], "V": ["#.#", "#.#", "#.#", "#.#", ".#."],
+    "W": ["#.#", "#.#", "###", "###", "#.#"], "X": ["#.#", "#.#", ".#.", "#.#", "#.#"],
+    "Y": ["#.#", "#.#", ".#.", ".#.", ".#."], "Z": ["###", "..#", ".#.", "#..", "###"],
+    "0": ["###", "#.#", "#.#", "#.#", "###"], "1": [".#.", "##.", ".#.", ".#.", "###"],
+    "2": ["###", "..#", "###", "#..", "###"], "3": ["###", "..#", ".##", "..#", "###"],
+    "4": ["#.#", "#.#", "###", "..#", "..#"], "5": ["###", "#..", "###", "..#", "###"],
+    "6": ["###", "#..", "###", "#.#", "###"], "7": ["###", "..#", ".#.", ".#.", ".#."],
+    "8": ["###", "#.#", "###", "#.#", "###"], "9": ["###", "#.#", "###", "..#", "###"],
+    "+": ["...", ".#.", "###", ".#.", "..."], "!": [".#.", ".#.", ".#.", "...", ".#."],
+    ":": ["...", ".#.", "...", ".#.", "..."], "-": ["...", "...", "###", "...", "..."],
+    ".": ["...", "...", "...", "...", ".#."], "?": ["##.", "..#", ".#.", "...", ".#."],
+    " ": ["...", "...", "...", "...", "..."],
+}
+
+
+def D_text_width(s, sc=1):
+    return len(s) * 4 * sc - sc
+
+
+def D_text(pix, s, x, y, color, sc=1):
+    """Chunky 3×5 pixel lettering; `color` may be a function (index, gx, gy) -> rgb."""
+    for i, ch in enumerate(s.upper()):
+        glyph = D_FONT.get(ch, D_FONT["?"])
+        for gy, row in enumerate(glyph):
+            for gx, on in enumerate(row):
+                if on == "#":
+                    c = color(i, gx, gy) if callable(color) else color
+                    for dx in range(sc):
+                        for dy in range(sc):
+                            pix[(x + (i * 4 + gx) * sc + dx, y + gy * sc + dy)] = c
+    return D_text_width(s, sc)
+
+
+def D_clip(pix, text, w, rows):
+    pix = {k: v for k, v in pix.items() if 0 <= k[0] < w and 0 <= k[1] < rows * 2}
+    text = {k: v for k, v in text.items() if 0 <= k[0] < w and 0 <= k[1] < rows}
+    return pix, text
+
+
+def D_center(text, row, s, color, w, bg=None):
+    x = (w - len(s)) // 2
+    for i, ch in enumerate(s):
+        text[(x + i, row)] = (ch, color, bg) if bg else (ch, color)
+
+
+class PressF:
+    """Press [F] to pay respects: the key goes down, chat floods in with F's."""
+    W, ROWS = 60, 15
+    CHAT = ["tuxfan", f"xX_{BRAND['word'].lower()}_Xx", "kernel_panik", "gentoo_guy", "nano_enjoyer", "rm_rf_ricky",
+            BRAND["fan"], "vim_exit_help", "segfault_sam", "dotfiles_dan", "i3_btw", "sudo_sandwich"]
+
+    def __init__(self):
+        r = random.Random()
+        self.drops, pile = [], [0] * 40
+        for i in range(70):
+            x = r.choice([c for c in range(40) if not 13 <= c <= 26])
+            land = 14 - min(pile[x], 2)
+            pile[x] += 1
+            self.drops.append((x, 1.9 + i * 0.045, r.uniform(16, 26), land, hsv(r.random(), 0.45, 0.95)))
+        self.chat = [(r.choice(self.CHAT), hsv(r.random(), 0.5, 0.9)) for _ in range(30)]
+
+    def over(self, t):
+        return t > 6.6 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 7.0
+        title = "R.I.P. firefox  (OOM-killed)"
+        fade = min(1.0, t / 0.8)
+        D_center(text, 0, title, scale((170, 170, 180), fade), 40)
+        pressed = 1.5 <= t < 1.75
+        down = 1 if t >= 1.5 and t < 1.9 else 0
+        cap_bg = (230, 230, 235) if pressed else (58, 60, 68)
+        cap_fg = (20, 20, 24) if pressed else (236, 236, 228)
+        x0, y0 = 15, 3 + down
+        rows = ["╭───────╮", "│       │", "│   F   │", "│       │", "╰───────╯"]
+        for j, r in enumerate(rows):
+            for i, ch in enumerate(r):
+                text[(x0 + i, y0 + j)] = (ch, cap_fg if j == 2 and ch == "F" else (150, 152, 160), cap_bg)
+        if not down:
+            for i in range(9):
+                text[(x0 + i, y0 + 5)] = ("▀", (32, 33, 38))
+        blink = int(t * 2.5) % 2 or t > 1.5
+        prompt = "Press [F] to pay respects"
+        px = (40 - len(prompt)) // 2
+        for i, ch in enumerate(prompt):
+            col = (255, 214, 0) if 6 <= i <= 8 else (200, 200, 205)
+            if 6 <= i <= 8 and not blink:
+                col = (110, 100, 40)
+            text[(px + i, 10)] = (ch, col)
+        for x, start, speed, land, color in self.drops:
+            if t >= start:
+                row = min(land, 1 + int((t - start) * speed))
+                text.setdefault((x, row), ("F", color))
+        if t >= 1.8:
+            k = min(1.0, (t - 1.8) / 3.6)
+            n = int(1337 * (1 - (1 - k) ** 3))
+            D_center(text, 11, f"Respects paid: {n:,}", (255, 214, 0) if k >= 1 else (220, 220, 225), 40)
+        for y in range(15):  # chat panel divider
+            text[(41, y)] = ("│", (60, 62, 70))
+        put_text(text, 43, 0, "LIVE CHAT", (238, 62, 62))
+        shown = 0 if t < 1.8 else min(len(self.chat), int((t - 1.8) * 9))
+        visible = self.chat[max(0, shown - 13):shown]
+        for i, (name, col) in enumerate(visible):
+            put_text(text, 43, 2 + i, (name + ":")[:14], col)
+            put_text(text, 43 + min(len(name) + 2, 15), 2 + i, "F", (236, 236, 228))
+        return D_clip(pix, text, self.W, self.ROWS)
+
+
+class Konami:
+    """↑ ↑ ↓ ↓ ← → ← → B A: the cheat code goes in, thirty extra lives come out."""
+    W, ROWS = 72, 15
+    SEQ = "UUDDLRLRBA"
+    GLYPH = {"U": "↑", "D": "↓", "L": "←", "R": "→", "B": "B", "A": "A"}
+    ARROWS = {
+        "U": ["..#..", ".###.", "#####", "..#..", "..#.."],
+        "D": ["..#..", "..#..", "#####", ".###.", "..#.."],
+        "L": ["..#..", ".##..", "#####", ".##..", "..#.."],
+        "R": ["..#..", "..##.", "#####", "..##.", "..#.."],
+        "B": [".###.", "#####", "#####", "#####", ".###."],
+        "A": [".###.", "#####", "#####", "#####", ".###."],
+    }
+
+    def __init__(self):
+        r = random.Random()
+        self.sparks = [(r.uniform(1, 71), r.uniform(0, 30), r.uniform(0, 6), r.choice("✦*+·")) for _ in range(30)]
+
+    def over(self, t):
+        return t > 7.0 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 7.4
+        times = [0.5 + i * 0.3 for i in range(10)]
+        entered = sum(1 for x in times if t >= x)
+        activated = t >= times[-1] + 0.35
+        W = self.W
+        for x in range(W):  # frame
+            pix[(x, 0)] = pix[(x, 29)] = (70, 70, 120)
+        for y in range(30):
+            pix[(0, y)] = pix[(W - 1, y)] = (70, 70, 120)
+        if not activated:
+            w = D_text_width("ENTER CODE")
+            D_text(pix, "ENTER CODE", (W - w) // 2, 3,
+                   (236, 236, 228) if int(t * 2) % 2 else (140, 140, 160))
+        x_start = (W - 10 * 5 - 2) // 2
+        for i, key in enumerate(self.SEQ):  # input slots as keycaps; filled ones light up
+            x0 = x_start + i * 5 + (2 if i >= 8 else 0)
+            if i < entered:
+                pop = t - times[i] < 0.12
+                bg = (255, 255, 255) if pop else ((200, 50, 50) if key in "BA" else (40, 110, 190))
+                if activated:
+                    bg = hsv(t * 0.6 + i * 0.1, 0.6, 0.85)
+                fg = (20, 20, 24) if pop else (255, 255, 255)
+                for j, ch in enumerate(" " + self.GLYPH[key] + " "):
+                    text[(x0 + j, 6)] = (ch, fg, bg)
+                    text[(x0 + j, 7)] = ("▀", scale(bg, 0.5))
+            else:
+                for j in range(3):
+                    text[(x0 + j, 6)] = ("·" if j == 1 else " ", (90, 90, 110), (34, 35, 42))
+        if not activated:  # the pad, lighting up whatever was just pressed
+            cur = self.SEQ[entered - 1] if entered and t - times[entered - 1] < 0.2 else None
+            body, dark, lit = (88, 92, 104), (40, 41, 47), (255, 214, 0)
+            o = (W - 60) // 2
+            for x in range(14 + o, 46 + o):
+                for y in range(18, 28):
+                    if not ((x in (14 + o, 45 + o)) and y in (18, 27)):
+                        pix[(x, y)] = body
+            for dx, dy, k in ((0, -2, "U"), (0, 2, "D"), (-2, 0, "L"), (2, 0, "R"), (0, 0, "")):
+                for ex in range(-1, 1):
+                    for ey in range(-1, 1):
+                        pix[(21 + o + dx + ex, 23 + dy + ey)] = lit if cur == k and k else dark
+            disc(pix, 37.5 + o, 24, 1.8, lit if cur == "B" else (200, 50, 50))
+            disc(pix, 41.5 + o, 22, 1.8, lit if cur == "A" else (200, 50, 50))
+            for x in (28, 29, 31, 32):
+                pix[(x + o, 24)] = dark
+        else:
+            k = t - (times[-1] + 0.35)
+            if k < 0.12:  # flash
+                for x in range(1, W - 1):
+                    for y in range(1, 29):
+                        pix[(x, y)] = (255, 255, 255)
+            w = D_text_width("CHEAT ACTIVATED")
+            D_text(pix, "CHEAT ACTIVATED", (W - w) // 2, 3, lambda i, gx, gy: hsv(t * 0.8 + i * 0.07, 0.6))
+            big = "+30 LIVES"
+            w2 = D_text_width(big, 2)
+            if int(k * 4) % 2 or k > 2.0:
+                D_text(pix, big, (W - w2) // 2, 17, lambda i, gx, gy: (255, 214, 0) if gy < 3 else (255, 150, 40), 2)
+            hearts = min(30, int(k * 20))
+            put_text(text, (W - 30) // 2, 14, "♥" * hearts, (255, 90, 120))
+            for sx, sy, ph, ch in self.sparks:
+                if math.sin(t * 5 + ph) > 0.3 and (int(sx), int(sy) // 2) not in text:
+                    text[(int(sx), int(sy) // 2)] = (ch, hsv(ph / 6, 0.4))
+        return D_clip(pix, text, self.W, self.ROWS)
+
+
+class BarrelRoll:
+    """DO A BARREL ROLL! A wingman yells it, and the jet obliges, all 360 degrees of it."""
+    W, ROWS = 60, 15
+    JET = [
+        "..........#..........",
+        "..........#..........",
+        ".........#B#.........",
+        "#.......##B##.......#",
+        "##.....###B###.....##",
+        "#####################",
+        "...######WOW######...",
+        "......##..O..##......",
+    ]
+    JC = {"#": (200, 205, 215), "B": BRAND_BLUE, "W": (130, 135, 150), "O": (255, 150, 40)}
+    FROG = [".YY..YY.", "YWEYYWEY", "GGGGGGGG", "GGRRRRGG", "GGGGGGGG", ".BBBBBB."]
+    FC = {"Y": (200, 160, 60), "W": (240, 240, 245), "E": (16, 16, 20), "G": (90, 190, 90),
+          "R": (180, 60, 60), "B": BRAND_BLUE}
+    ROLL = (2.4, 3.6)
+
+    def __init__(self):
+        r = random.Random()
+        self.stars = [(r.uniform(0, 6.283), r.uniform(0, 1), r.uniform(0.6, 1.4)) for _ in range(40)]
+        self.cells = [(x, y, ch) for y, row in enumerate(self.JET) for x, ch in enumerate(row) if ch != "."]
+
+    def over(self, t):
+        return t > 5.6 + HOLD
+
+    def angle(self, t):
+        a, b = self.ROLL
+        if t < a:
+            return 0.0
+        k = min(1.0, (t - a) / (b - a))
+        return 2 * math.pi * (k * k * (3 - 2 * k))
+
+    def draw_jet(self, pix, ang, shade=1.0):
+        cx, cy = 30.0, 9.0
+        ca, sa = math.cos(ang), math.sin(ang)
+        for x, y, ch in self.cells:
+            dx, dy = x - 10, y - 4
+            px, py = cx + dx * ca - dy * sa, cy + dx * sa + dy * ca
+            c = self.JC[ch]
+            if ch == "O" and shade == 1.0:
+                c = (255, 220, 120) if random.random() < 0.5 else (255, 120, 40)
+            pix.setdefault((round(px), round(py)), scale(c, shade))
+            pix.setdefault((round(px + 0.5), round(py)), scale(c, shade))
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 6.0
+        speed = 1.0 + (2.5 if self.ROLL[0] <= t < self.ROLL[1] else 0)
+        for a, d0, sp in self.stars:  # warp starfield from the middle
+            d = ((d0 + t * 0.35 * sp * speed) % 1.0) * 34
+            x, y = 30 + math.cos(a) * d * 1.6, 9 + math.sin(a) * d * 0.55
+            if 0 <= y < 19:
+                pix[(round(x), round(y))] = scale((220, 225, 240), min(1.0, d / 12))
+        ang = self.angle(t)
+        self.draw_jet(pix, ang)
+        if self.ROLL[0] < t < self.ROLL[1]:  # motion blur: ghosts of where it just was
+            for k, f in ((0.35, 0.5), (0.7, 0.28)):
+                self.draw_jet(pix, self.angle(t - k * 0.15), f)
+        for c in range(60):  # dialog box
+            text[(c, 10)] = ("─", (120, 125, 140))
+            text[(c, 14)] = ("─", (120, 125, 140))
+        for r in range(11, 14):
+            text[(0, r)] = ("│", (120, 125, 140))
+            text[(59, r)] = ("│", (120, 125, 140))
+        text[(0, 10)], text[(59, 10)] = ("╭", (120, 125, 140)), ("╮", (120, 125, 140))
+        text[(0, 14)], text[(59, 14)] = ("╰", (120, 125, 140)), ("╯", (120, 125, 140))
+        talking = int(t * 8) % 2 and (0.3 < t < 1.8 or 3.7 < t < 4.6)
+        frog = [r.replace("R", "G") if not talking and i == 3 else r for i, r in enumerate(self.FROG)]
+        sprite(pix, frog, self.FC, 3, 22)
+        if t < self.ROLL[0]:
+            msg = "DO A BARREL ROLL!"
+            shown = msg[:int((t - 0.3) * 14)] if t > 0.3 else ""
+            put_text(text, 13, 11, "WINGMAN", (90, 190, 90))
+            put_text(text, 13, 12, shown, (255, 255, 255))
+            if t > 1.6:
+                put_text(text, 13, 13, "(press Z or R twice!)", (150, 160, 175))
+        elif t < self.ROLL[1]:
+            put_text(text, 13, 11, "WINGMAN", (90, 190, 90))
+            put_text(text, 13, 12, "W H O O O O S H", hsv(t * 2, 0.5))
+        else:
+            put_text(text, 13, 11, "WINGMAN", (90, 190, 90))
+            put_text(text, 13, 12, "Nice flying!"[:max(0, int((t - 3.7) * 14))], (255, 255, 255))
+        return D_clip(pix, text, self.W, self.ROWS)
+
+
+class Hackerman:
+    """Over-the-top 90s movie hacking: firewalls bypassed, globe spinning, ACCESS GRANTED. I'm in."""
+    W, ROWS = 78, 18
+    TASKS = ["BYPASSING FIREWALL", "TRACING IP 127.0.0.1", "DECRYPTING RSA-4096", "INJECTING SQL",
+             "DOWNLOADING MORE RAM", "ROUTING THRU 7 PROXIES", "ENHANCING... ENHANCE!"]
+    G, DIM = (80, 255, 120), (30, 110, 50)
+
+    def __init__(self):
+        self.globe = []
+        for lat in (-60, -30, 0, 30, 60):
+            for lon in range(0, 360, 10):
+                self.globe.append((math.radians(lat), math.radians(lon)))
+        for lon in range(0, 360, 30):
+            for lat in range(-80, 81, 10):
+                self.globe.append((math.radians(lat), math.radians(lon)))
+        r = random.Random(7)
+        self.hex = [" ".join(f"{r.randrange(256):02x}" for _ in range(8)) for _ in range(200)]
+
+    def over(self, t):
+        return t > 7.8 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 8.2
+        spin = "|/-\\"[int(t * 12) % 4]
+        put_text(text, 1, 0, "[ H4CK3R TERMINAL v6.6.6 ]", self.G)
+        put_text(text, 30, 0, spin, self.G)
+        per = 0.62
+        for i, task in enumerate(self.TASKS):
+            start = 0.2 + i * per
+            if t < start:
+                break
+            k = min(1.0, (t - start) / (per * 0.9))
+            bar = "█" * int(k * 10) + "░" * (10 - int(k * 10))
+            row = 2 + i
+            put_text(text, 1, row, f"> {task}...", self.G if k >= 1 else (150, 255, 170))
+            put_text(text, 31, row, f"[{bar}]", self.G if k >= 1 else self.DIM)
+            put_text(text, 44, row, "OK" if k >= 1 else f"{int(k * 100):3d}%", self.G)
+        # rotating wireframe globe (pixels), top right
+        rot = t * 1.2
+        cx, cy, rad = 63.0, 13.0, 12.0
+        for lat, lon in self.globe:
+            x = math.cos(lat) * math.sin(lon + rot)
+            z = math.cos(lat) * math.cos(lon + rot)
+            y = math.sin(lat)
+            px, py = round(cx + x * rad * 1.15), round(cy - y * rad)
+            if z > 0:
+                pix[(px, py)] = self.G
+            else:
+                pix.setdefault((px, py), (20, 70, 35))
+        put_text(text, 55, 14, "TARGET LOCKED" if int(t * 3) % 2 else "", (255, 80, 80))
+        # hex dump scrolling, bottom left
+        off = int(t * 14)
+        for i in range(5):
+            line_ = self.hex[(off + i) % len(self.hex)]
+            put_text(text, 1, 11 + i, f"0x{(off + i) * 16:06x}: {line_}", self.DIM)
+        if t > 4.7:  # ACCESS GRANTED
+            k = t - 4.7
+            flash = k < 0.6 and int(k * 10) % 2
+            bg = (80, 255, 120) if flash else (6, 20, 10)
+            x0, x1, y0, y1 = 9, 68, 5, 11
+            for c in range(x0, x1 + 1):
+                for r in range(y0, y1 + 1):
+                    edge_h, edge_v = r in (y0, y1), c in (x0, x1)
+                    ch = "═" if edge_h else "║" if edge_v else " "
+                    if edge_h and edge_v:
+                        ch = {(x0, y0): "╔", (x1, y0): "╗", (x0, y1): "╚", (x1, y1): "╝"}[(c, r)]
+                    text[(c, r)] = (ch, self.G, bg) if ch != " " else None
+            for c in range(x0 + 1, x1):
+                for y in range(y0 * 2 + 2, y1 * 2):
+                    pix[(c, y)] = bg
+            text = {k_: v for k_, v in text.items() if v is not None and not (x0 < k_[0] < x1 and y0 < k_[1] < y1)}
+            w = D_text_width("ACCESS GRANTED", 1)
+            D_text(pix, "ACCESS GRANTED", (78 - w) // 2, 13, (6, 20, 10) if flash else self.G)
+            if t > 6.0:
+                shown = "> " + "I'm in."[:int((t - 6.0) * 5)] + ("█" if int(t * 3) % 2 else " ")
+                for i, ch in enumerate(shown.ljust(10)):
+                    text[(34 + i, 10)] = (ch, (236, 236, 228), (6, 20, 10))
+        return D_clip(pix, text, self.W, self.ROWS)
+
+
+class ThisIsFine:
+    """this is fine. (Tux, a coffee, and a room that is very much on fire.)"""
+    W, ROWS = 56, 16
+    CHARS = " .:-=+*#%@"
+
+    def __init__(self):
+        self.heat = [[0.0] * self.W for _ in range(self.ROWS + 2)]
+        self.steps = 0
+        self.rng = random.Random()
+
+    def step(self, intensity):
+        h, W = self.heat, self.W
+        bottom = len(h) - 1
+        for x in range(W):
+            side = 1.0 if (x < 15 or x > 41) else 0.55
+            h[bottom][x] = self.rng.random() * intensity * side + (0.4 * intensity * side)
+        for y in range(bottom - 1, -1, -1):
+            row, below, below2 = h[y], h[y + 1], h[min(bottom, y + 2)]
+            for x in range(W):
+                v = (below[x - 1 if x else 0] + below[x] + below[x + 1 if x < W - 1 else x] + below2[x]) / 4.0
+                row[x] = max(0.0, v - 0.035 - (0.02 if 16 <= x <= 40 else 0))
+
+    def over(self, t):
+        return t > 6.4 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 6.8
+        target = int(t * 20)
+        while self.steps < target:
+            self.steps += 1
+            self.step(min(1.0, 0.25 + self.steps / 30))
+        for y in range(self.ROWS):
+            for x in range(self.W):
+                v = min(1.0, self.heat[y][x] * 1.25)
+                if v < 0.08:
+                    continue
+                ch = self.CHARS[min(9, int(v * 10))]
+                if v < 0.35:
+                    c = (int(110 + 300 * v), 20, 10)
+                elif v < 0.7:
+                    c = (255, int(60 + 280 * (v - 0.35)), 20)
+                else:
+                    c = (255, int(160 + 260 * (v - 0.7)), int(40 + 330 * (v - 0.7)))
+                text[(x, y)] = (ch, tuple(min(255, k) for k in c))
+        for x in range(self.W):  # smoke along the ceiling
+            for y in range(2):
+                if math.sin(x * 0.35 + t * 1.5 + y * 2) > -0.2:
+                    text[(x, y)] = ("░▒"[(x + y + int(t * 3)) % 2], (90 - y * 20, 90 - y * 20, 98 - y * 20))
+        sip = 1.4 < t < 2.4 or 4.3 < t < 5.2
+        ar = 2.3 if sip else 1.05
+        ox, oy = 18, 8
+        tux(pix, ox, oy, t, ("pose", 0.5, ar, (0, 0)))
+        mx = round(ox + 16.5 + math.sin(ar) * 6.5)
+        my = round(oy + 10 + math.cos(ar) * 6.5) - 2
+        for dx in range(3):
+            for dy in range(3):
+                pix[(mx + dx, my + dy)] = (236, 236, 228) if dy == 0 else (230, 120, 60)
+        pix[(mx + 3, my + 1)] = (230, 120, 60)
+        if not sip:
+            for k in range(4):
+                age = (t * 1.3 + k / 4) % 1
+                pix.setdefault((mx + 1 + round(math.sin(t * 3 + k)), my - 1 - round(age * 5)), (170, 170, 175))
+        for x in range(12, 46):  # table
+            pix[(x, 26)] = (130, 85, 50)
+            pix[(x, 27)] = (100, 65, 38)
+        for x in (14, 15, 42, 43):
+            for y in range(28, 32):
+                pix[(x, y)] = (90, 58, 34)
+        if t > 2.9:
+            msg = " this is fine. "
+            shown = msg[:max(0, int((t - 2.9) * 12)) + 1]
+            bx = 4
+            for i, ch in enumerate(shown):
+                text[(bx + i, 3)] = (ch, (20, 20, 24), (245, 245, 240))
+            for i in range(len(msg)):
+                text.setdefault((bx + i, 3), (" ", (20, 20, 24), (245, 245, 240)))
+                text[(bx + i, 2)] = ("▄", (245, 245, 240))
+                text[(bx + i, 4)] = ("▀", (245, 245, 240))
+            pix[(bx + 10, 10)] = pix[(bx + 11, 10)] = pix[(bx + 11, 11)] = pix[(bx + 12, 11)] = (245, 245, 240)
+            pix[(bx + 13, 12)] = (245, 245, 240)
+        return D_clip(pix, text, self.W, self.ROWS)
+
+
+class Y2K:
+    """Midnight, 31 Dec 1999: the countdown, the Y2K bug, and the patch that saved us."""
+    W, ROWS = 78, 15
+    SEG = {  # a b c d e f g
+        "0": "abcdef", "1": "bc", "2": "abged", "3": "abgcd", "4": "fgbc", "5": "afgcd",
+        "6": "afgedc", "7": "abc", "8": "abcdefg", "9": "abcdfg", "-": "g", " ": "",
+    }
+    LCD, GHOST, RED = (90, 255, 180), (22, 48, 40), (255, 70, 70)
+
+    def __init__(self):
+        r = random.Random()
+        self.confetti = [(r.uniform(0, 78), r.uniform(-30, 0), r.uniform(8, 16), hsv(r.random(), 0.6))
+                         for _ in range(60)]
+
+    def digit(self, pix, ch, x, y, color, ghost=True):
+        on = self.SEG.get(ch, "")
+        segs = {
+            "a": [(x + i, y) for i in range(1, 5)], "d": [(x + i, y + 10) for i in range(1, 5)],
+            "g": [(x + i, y + 5) for i in range(1, 5)],
+            "f": [(x, y + i) for i in range(1, 5)], "b": [(x + 5, y + i) for i in range(1, 5)],
+            "e": [(x, y + i) for i in range(6, 10)], "c": [(x + 5, y + i) for i in range(6, 10)],
+        }
+        for s, pts in segs.items():
+            if s in on or ghost:
+                for p in pts:
+                    pix[p] = color if s in on else self.GHOST
+
+    def clock(self, pix, s, x, y, color):
+        for ch in s:
+            if ch == ":":
+                pix[(x + 1, y + 3)] = pix[(x + 1, y + 7)] = color
+                x += 4
+            else:
+                self.digit(pix, ch, x, y, color)
+                x += 8
+
+    def over(self, t):
+        return t > 7.6 + HOLD
+
+    def frame(self, t, done):
+        pix, text = {}, {}
+        if done:
+            t = 8.0
+        sec = 55 + min(4, int(t / 0.7))
+        if t < 3.5:
+            date, time_, col = "1999-12-31", f"23:59:{sec}", self.LCD
+        elif t < 5.6:
+            date, time_, col = "1900-01-01", "00:00:00", self.RED
+        else:
+            k = min(1.0, (t - 5.6) / 0.8)  # digits correct one by one
+            fixed = "2000-01-01"
+            n = int(k * 4)
+            date, time_, col = fixed[:n] + "1900-01-01"[n:], "00:00:0" + str(min(9, int((t - 3.5)))), self.LCD
+        glitch = 3.5 <= t < 4.1
+        dx = random.randint(-3, 3) if glitch else 0
+        w_date = D_text_width(date, 2)
+        D_text(pix, date, (78 - w_date) // 2 + dx, 2, col, 2)
+        clock_w = 6 * 8 + 2 * 4 - 2
+        self.clock(pix, time_, (78 - clock_w) // 2 - dx, 15, col)
+        if glitch:  # tearing and static
+            for _ in range(160):
+                pix[(random.randrange(78), random.randrange(30))] = random.choice(
+                    ((255, 255, 255), (255, 70, 70), (90, 255, 180), (40, 40, 50)))
+        if t < 3.5:
+            chant = ["5..", "4..", "3..", "2..", "1.."][:min(5, int(t / 0.7) + 1)]
+            s = "  ".join(chant)
+            D_center(text, 13, s, (255, 214, 0), 78)
+            D_center(text, 0, "~ party.exe ~  everyone's watching the clock", (150, 160, 175), 78)
+        elif t < 5.6:
+            on = int(t * 4) % 2
+            msg = " ▲  Y2K BUG DETECTED  ▲ "
+            D_center(text, 13, msg, (255, 255, 255) if on else self.RED, 78, (200, 30, 30) if on else (40, 10, 10))
+            for x0 in (2, 73):  # spinning warning beacons
+                a = t * 10
+                for k in range(6):
+                    disc(pix, x0 + 1 + math.cos(a + k * 1.05) * 1.5, 25 + math.sin(a + k * 1.05) * 1.5, 0.7,
+                         self.RED if k % 2 else (255, 160, 60))
+            D_center(text, 0, "ERR: year = 19 + \"00\"   (two digits seemed like plenty)", (255, 140, 140), 78)
+        else:
+            D_center(text, 13, "...oh wait, it was patched.", (180, 180, 190), 78)
+            if t > 6.4:
+                D_center(text, 0, "HAPPY NEW YEAR 2000!", hsv(t * 0.5, 0.5), 78)
+                for x, y0, sp, c in self.confetti:
+                    y = y0 + (t - 6.4) * sp
+                    if 2 <= y < 30:
+                        pix[(round(x + math.sin(t * 3 + x)), round(y))] = c
+        return D_clip(pix, text, self.W, self.ROWS)
+
+
+NEW_D = {"pressf": PressF, "konami": Konami, "barrelroll": BarrelRoll, "hackerman": Hackerman,
+       "thisisfine": ThisIsFine, "y2k": Y2K}
+
+
+# ── the parade: cowsay characters take turns walking on and saying a fortune ──
+PARADE_CHARS = ["default", "tux", "dragon", "stegosaurus", "turtle", "koala", "sheep", "elephant", "moose",
+                "bunny", "kitty", "llama", "fox", "small", "daemon", "vader", "www", "bud-frogs", "blowfish",
+                "cheese", "ghostbusters", "skeleton", "turkey", "three-eyes", "meow", "hellokitty", "cower"]
+PARADE_FALLBACK = {  # without cowsay installed: the cow and Tux, thought trail marked with ╲
+    "cow": ["╲   ^__^", " ╲  (oo)\\_______", "    (__)\\       )\\/\\", "        ||----w |", "        ||     ||"],
+    "tux": ["╲", " ╲", "     .--.", "    |o_o |", "    |:_/ |", "   //   \\ \\", "  (|     | )",
+            " /'\\_   _/`\\", " \\___)=(___/"],
+}
+
+
+def cow_art(name):
+    """A cowsay character without its speech bubble, as (lines, trail): the backslashes leading up to the
+    bubble become ╲ and are listed in trail. Found by diffing cowsay against cowthink, whose trail is o's."""
+    import subprocess
+    try:
+        say, think = (subprocess.run([cmd, "-f", name, "x"], capture_output=True, text=True, timeout=2).stdout
+                      .splitlines()[3:] for cmd in ("cowsay", "cowthink"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not say or len(say) != len(think):
+        return None
+    lines, trail = [], []
+    for y, (a, b) in enumerate(zip(say, think)):
+        row = list(a)
+        for x, (ca, cb) in enumerate(zip(a, b)):
+            if ca == "\\" and cb == "o":
+                row[x] = "╲"
+                trail.append((x, y))
+        lines.append("".join(row).rstrip())
+    while lines and not lines[-1].strip():
+        lines.pop()
+    pad = min(len(l) - len(l.lstrip()) for l in lines if l.strip())
+    return [l[pad:] for l in lines], [(x - pad, y) for x, y in trail]
+
+
+def fallback_art(name):
+    lines = PARADE_FALLBACK[name]
+    return lines, [(x, y) for y, l in enumerate(lines) for x, ch in enumerate(l) if ch == "╲"]
+
+
+class Parade:
+    """fortune | cowsay, live: characters take turns walking on, saying a fortune, and walking off."""
+    STAGE = (76, 20)
+    MAX = 30.0  # two characters, longer than the usual scene
+    ENTER, EXIT, HOLD_S, CPS = 2.2, 1.8, 2.6, 30
+    FRAME, TEXT, BODY, GROUND = (200, 200, 196), (236, 236, 228), (138, 141, 147), (55, 58, 64)
+
+    def __init__(self):
+        import shutil as sh, textwrap
+        w, h = self.STAGE
+        self.acts, start = [], 0.3
+        names = random.sample(PARADE_CHARS, len(PARADE_CHARS)) if sh.which("cowsay") else []
+        fallbacks = random.sample(list(PARADE_FALLBACK), len(PARADE_FALLBACK))
+        while len(self.acts) < 2:
+            lines = textwrap.wrap(self.fortune(), 34) or ["Moo."]
+            art = None
+            while names and art is None:
+                art = cow_art(names.pop())
+                if art and (len(art[0]) + len(lines) + 2 > h - 1 or max(map(len, art[0])) > w - 4):
+                    art = None  # too big for the stage
+            art = art or fallback_art(fallbacks[len(self.acts) % len(fallbacks)])
+            art_w = max(map(len, art[0]))
+            typed = sum(map(len, lines)) / self.CPS
+            act = {"art": art, "lines": lines, "w": art_w, "start": start,
+                   "x": (w - art_w) // 2 - 4, "talk": start + self.ENTER + 0.3}
+            act["quiet"] = act["talk"] + typed + self.HOLD_S
+            act["gone"] = act["quiet"] + self.EXIT
+            self.acts.append(act)
+            start = act["gone"] - 0.4  # the next one is already on its way in
+        self.end = self.acts[-1]["gone"]
+
+    @staticmethod
+    def fortune():
+        import shutil as sh, subprocess
+        if sh.which("fortune"):
+            try:
+                out = subprocess.run(["fortune", "-s", "-n", "110"], capture_output=True, text=True, timeout=2).stdout
+                if out.strip():
+                    return " ".join(out.split())
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return random.choice(Cowsay.FORTUNES)
+
+    def over(self, t):
+        return t > self.end + HOLD
+
+    def frame(self, t, done):
+        w, h = self.STAGE
+        pix, text = {}, {}
+        if done:  # the splash's last frame: the first one, mid-sentence finished
+            t = self.acts[0]["quiet"] - 0.5
+        for x in range(w):
+            text[(x, h - 1)] = ("─", self.GROUND)
+        for act in self.acts:
+            if not act["start"] <= t <= act["gone"]:
+                continue
+            lines, trail = act["art"]
+            if t < act["start"] + self.ENTER:  # walk in from the right, slowing down
+                k = smooth((t - act["start"]) / self.ENTER)
+                cx = round(w + (act["x"] - w) * k)
+            elif t < act["quiet"]:
+                cx = act["x"]
+            else:  # and off to the left, speeding up
+                k = (t - act["quiet"]) / self.EXIT
+                cx = round(act["x"] - (act["x"] + act["w"] + 2) * k * k)
+            top = h - 1 - len(lines)
+            for y, line in enumerate(lines):
+                for x, ch in enumerate(line):
+                    if ch != " " and 0 <= cx + x < w:
+                        text[(cx + x, top + y)] = (ch, self.BODY)
+            if act["talk"] <= t < act["quiet"]:
+                self.bubble(text, act, cx, top, trail, t)
+        return pix, text
+
+    def bubble(self, text, act, cx, top, trail, t):
+        w = self.STAGE[0]
+        lines = act["lines"]
+        bw = max(map(len, lines)) + 4
+        tx = cx + (min(trail, key=lambda p: p[1])[0] if trail else 2)
+        bx = max(0, min(w - bw, tx - 3))
+        by = top - len(lines) - 2
+        shown = int((t - act["talk"]) * self.CPS)
+        rows = ["╭" + "─" * (bw - 2) + "╮"] + ["│" + " " * (bw - 2) + "│" for _ in lines]
+        bottom = list("╰" + "─" * (bw - 2) + "╯")
+        if 0 < tx - bx < bw - 1:
+            bottom[tx - bx] = "┬"
+        for y, row in enumerate(rows + ["".join(bottom)]):
+            put_text(text, bx, by + y, row, self.FRAME)
+        left = shown
+        for y, line in enumerate(lines):
+            part = line[:max(0, left)]
+            put_text(text, bx + 2, by + 1 + y, part, self.TEXT)
+            if 0 <= left < len(line):
+                text[(bx + 2 + len(part), by + 1 + y)] = ("▌", self.FRAME)
+            left -= len(line)
+
+
+class Pipes:
+    """pipes.sh: pipes snake across the screen in every colour, turning at random."""
+    STAGE = (76, 20)
+    COLORS = [(138, 173, 244), (198, 160, 246), (139, 213, 202), (166, 218, 149), (238, 212, 159),
+              (245, 169, 127), (237, 135, 150)]
+    # (heading in, heading out) -> the corner piece; 0 up, 1 right, 2 down, 3 left
+    CORNER = {(0, 1): "┏", (0, 3): "┓", (2, 1): "┗", (2, 3): "┛", (1, 0): "┛", (1, 2): "┓", (3, 0): "┗", (3, 2): "┏"}
+
+    def __init__(self):
+        w, h = self.STAGE
+        self.r = random.Random()
+        self.cells, self.steps = {}, 0
+        self.pipes = [[self.r.randrange(w), self.r.randrange(h), self.r.randrange(4), self.COLORS[i]] for i in range(5)]
+
+    def over(self, t):
+        return t > 11 + HOLD
+
+    def step(self):
+        w, h = self.STAGE
+        for p in self.pipes:
+            x, y, d, c = p
+            nd = (d + self.r.choice((1, 3))) % 4 if self.r.random() < 0.13 else d
+            self.cells[(x, y)] = (("┃" if d in (0, 2) else "━") if nd == d else self.CORNER[(d, nd)], c)
+            dx, dy = ((0, -1), (1, 0), (0, 1), (-1, 0))[nd]
+            x, y = x + dx, y + dy
+            if not (0 <= x < w and 0 <= y < h):  # off an edge: like pipes.sh, it comes back in a new colour
+                x, y, c = x % w, y % h, self.r.choice(self.COLORS)
+            p[:] = [x, y, nd, c]
+
+    def frame(self, t, done):
+        if done:
+            t = 11.0
+        while self.steps < t * 40:
+            self.steps += 1
+            self.step()
+        return {}, dict(self.cells)
+
+
+class Matrix:
+    """cmatrix: green code rain falling down the screen, then a message from the machine."""
+    STAGE = (76, 20)
+    GLYPHS = "0123456789ABCDEFabcdef$#*+=<>{}[]:;!?%&@"
+
+    def __init__(self):
+        r = random.Random()
+        w, h = self.STAGE
+        self.cols = [(r.uniform(6, 16), r.uniform(-h, h), r.randint(4, 12)) for _ in range(w)]
+        self.seed = r.randrange(1000)
+        self.msg = r.choice(["Wake up, Neo...", "Follow the white rabbit.", "There is no spoon.",
+                             f"I use {BRAND['word']} btw."])
+
+    def over(self, t):
+        return t > 10.5 + HOLD
+
+    def frame(self, t, done):
+        w, h = self.STAGE
+        if done:
+            t = 9.5
+        text = {}
+        thin = 1.0 if t < 6.5 else max(0.15, 1 - (t - 6.5))  # the rain dims for the message
+        for x, (speed, off, length) in enumerate(self.cols):
+            head = (t * speed + off) % (h + length + 6)
+            for k in range(length):
+                y = int(head) - k
+                if 0 <= y < h:
+                    g = self.GLYPHS[(x * 7 + y * 13 + self.seed + int(t * 10) * (k % 4 == 0)) % len(self.GLYPHS)]
+                    c = (220, 255, 225) if k == 0 else scale((60, 230, 110), (1 - k / length) * 0.9 + 0.1)
+                    text[(x, y)] = (g, scale(c, thin))
+        if t > 7.0:  # typed out in the middle, with a blinking cursor
+            shown = self.msg[:int((t - 7.0) * 14)]
+            col = (w - len(self.msg)) // 2
+            for i in range(-1, len(self.msg) + 2):
+                text.pop((col + i, h // 2), None)
+            put_text(text, col, h // 2, shown, (190, 255, 200))
+            if int(t * 2.5) % 2:
+                text[(col + len(shown), h // 2)] = ("▌", (190, 255, 200))
+        return {}, text
+
+
+SCENES = {"dance": Dance, "pacman": Pacman, "snow": Snow, "arch": ArchLogo, "hacker": Hacker,
+          "fishing": Fishing, "rocket": Rocket, "tetris": Tetris, "debug": Debug,
+          "aquarium": Aquarium, "campfire": Campfire, "serverroom": ServerRoom, "fireworks": Fireworks,
+          "panic": Panic, "runner": Runner, "sl": Train, "git": GitGraph, "sandwich": Sandwich,
+          "breakout": Breakout, "snake": Snake, "cowsay": Cowsay, "parade": Parade, "pipes": Pipes,
+          "cmatrix": Matrix}
+FUN = ["parade", "pipes", "cmatrix", "cowsay"]  # the fun CLI tools: the screensaver deals one every third scene
+for _more in (NEW_A, NEW_B, NEW_C, NEW_D):
+    SCENES.update(_more)
+if FEDORA:
+    SCENES = {("fedora" if k == "arch" else k): (FedoraLogo if v is ArchLogo else v) for k, v in SCENES.items()}
+    for _cls in SCENES.values():
+        for _a, _b in (("pacman -Syu", "dnf upgrade"), ("an Arch-blue", "a Fedora-blue"), ("Arch-blue", "Fedora-blue"), ("ARCH TV", "RED HAT TV"),
+                       ("The OG Arch look", "The OG Fedora look"), ("much arch", "much fedora")):
+            if _cls.__doc__:
+                _cls.__doc__ = _cls.__doc__.replace(_a, _b)
+
+
+def pick_scene(wanted=None, avoid=None, fits=lambda name: True):
+    """Deal scenes like a shuffled deck shared by every terminal: each one shows once before
+    any repeats, and a scene never follows itself, neither the last one dealt anywhere nor
+    `avoid`. `fits` skips scenes too big for this terminal (they stay in the deck for later)."""
+    if wanted:
+        return wanted
+    import fcntl
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "archboot.deck")
+    try:
+        f = open(path, "a+")
+        fcntl.flock(f, fcntl.LOCK_EX)  # two terminals opening at once mustn't deal the same card
+        f.seek(0)
+        lines = f.read().splitlines() + ["", ""]
+    except OSError:
+        f, lines = None, ["", ""]
+    last = lines[0].strip()
+    deck = [n for n in lines[1].split() if n in SCENES]
+    banned = {last, avoid}
+    ok = lambda n: n not in banned and fits(n)
+    if not any(ok(n) for n in deck):
+        deck = random.sample(list(SCENES), len(SCENES))
+    name = next((n for n in deck if ok(n)), None)
+    if name is None:  # nothing fits at all
+        if f:
+            f.close()
+        return None
+    deck.remove(name)
+    if f:
+        f.seek(0)
+        f.truncate()
+        f.write(f"{name}\n{' '.join(deck)}\n")
+        f.close()
+    return name
+
+
+DEFAULT_LENGTH, MAX_LENGTH = 5.0, 12.0  # seconds, for scenes without their own ending
+
+
+def stage_size(cls):
+    """(columns, rows) of the stage a scene is shown on. A scene sets STAGE when what it draws doesn't
+    fit the default 40x15, or when W/ROWS mean something else to it (a Tetris well, rows of bricks)."""
+    return getattr(cls, "STAGE", None) or (getattr(cls, "W", STAGE_W), getattr(cls, "ROWS", STAGE_ROWS))
+
+
+def scene_size(cls):
+    """(columns, rows) a scene needs on screen. Narrow scenes get the system info beside them;
+    wide ones get a one-line summary underneath instead."""
+    w, h = stage_size(cls)
+    return (w + 42, h) if w <= STAGE_W else (w, h + 2)
+
+
+def info_line(info, cols):
+    vals = dict(info)
+    bits = [info[0][1], vals.get("OS", ""), vals.get("Kernel", ""), "up " + vals.get("Uptime", ""),
+            vals.get("Packages", "?").split()[0] + " pkgs", vals.get("Memory", "")]
+    p = Painter()
+    for i, bit in enumerate(bits):
+        if i:
+            p.text("  ·  ", (90, 90, 110))
+        p.text(bit, BRAND_BLUE if i == 0 else (180, 180, 190), bold=i == 0)
+    return p.done()
+
+
+def stage_rows(pix, text, info, t, typed, width=STAGE_W, rows=STAGE_ROWS):
+    """The scene plus the system info (beside it, or a summary line under a wide scene)."""
+    side = width <= STAGE_W
+    top = max(0, (rows - len(info) - 2) // 2)
+    out_rows = []
+    for i in range(rows):
+        p = Painter()
+        compose(p, pix, text, i, width)
+        k = i - top
+        if side:
+            p.text("  ")
+            if 0 <= k < len(info):
+                label, val = info[k]
+                shown = ((f"{label}: " if label else "") + val)[:max(0, typed - k * 4)]
+                if label:
+                    cut = len(label) + 2
+                    p.text(shown[:cut], BRAND_BLUE, bold=True)
+                    p.text(shown[cut:], (215, 215, 222))
+                else:
+                    p.text(shown, hsv(0.55 + 0.05 * math.sin(t * 3), 0.55), bold=True)
+            elif k == len(info) + 1 and typed > 450:
+                for c in range(8):
+                    p.parts.append(f"{ESC}4{c}m   ")
+        out_rows.append(p.done())
+    if not side:
+        out_rows += ["", info_line(info, width)]
+    return out_rows
+
+
+def splash(keys, info, scene_name):
+    """Play one scene once, then leave its last frame (and the system info) above the prompt."""
+    cls = SCENES[scene_name]
+    scene = cls()
+    width, rows = stage_size(cls)
+    out(ESC + "2J" + ESC + "H")
+    fps, f = 30, 0
+    while True:
+        t = f / fps
+        if keys.escaped:
+            break
+        ended = scene.over(t) if hasattr(scene, "over") else t >= DEFAULT_LENGTH
+        cap = getattr(scene, "MAX", MAX_LENGTH)
+        done = keys.hit or ended or t >= cap
+        final = keys.hit or t >= cap or (ended and not hasattr(scene, "over"))
+        pix, text = scene.frame(t, final)
+        out(ESC + "H" + "\n".join(stage_rows(pix, text, info, t, 10_000 if done else int(t * 70),
+                                               width, rows)))
+        if done:
+            break
+        keys.wait(1 / fps)
+        f += 1
+    out("\n\n")
+
+
+BOOT = [
+    "Mounted /boot", "Started Journal Service", "Reached target Local File Systems",
+    "Started Network Manager", "Started User Login Management",
+    "Reached target Graphical Interface", "Waking up the penguin",
+]
+
+
+def boot_sequence(keys):
+    for msg in BOOT:
+        out(f"{ESC}38;2;90;90;110m[{ESC}38;2;80;250;123m  OK  {ESC}38;2;90;90;110m]{RESET} {msg}\n")
+        if keys.wait(random.uniform(0.02, 0.06)):
+            return
+    keys.wait(0.15)
+
+
+# ── code rain, a big clock, and Tux waddling past (screensaver fallback for tiny screens) ──
+GLYPHS = "01$#~/|<>{}[]=+-*&!?:;%@" + "sudopacmanSyugrepawksedkillforkexecdevnulltuxinitbashrootchmod"
+FONT = {  # 3×5 pixel digits
+    "0": ["###", "#.#", "#.#", "#.#", "###"], "1": [".#.", "##.", ".#.", ".#.", "###"],
+    "2": ["###", "..#", "###", "#..", "###"], "3": ["###", "..#", ".##", "..#", "###"],
+    "4": ["#.#", "#.#", "###", "..#", "..#"], "5": ["###", "#..", "###", "..#", "###"],
+    "6": ["###", "#..", "###", "#.#", "###"], "7": ["###", "..#", ".#.", ".#.", ".#."],
+    "8": ["###", "#.#", "###", "#.#", "###"], "9": ["###", "#.#", "###", "..#", "###"],
+    ":": [".", "#", ".", "#", "."],
+}
+
+
+def rain(keys):
+    cols, rows = shutil.get_terminal_size((80, 24))
+    drops = [[random.uniform(-rows, 0), random.uniform(8, 22), random.randint(6, 20)] for _ in range(cols)]
+    chars = [[random.choice(GLYPHS) for _ in range(rows)] for _ in range(cols)]
+    bg = (6, 7, 9)
+    fps, t0 = 24, time.monotonic()
+    walk_every, walk_len = 25.0, (cols + 30) / 12.0
+    out(ESC + "2J")
+    while not keys.wait(1 / fps):
+        t = time.monotonic() - t0
+        text, pix = {}, {}
+        clock, size = time.strftime("%H:%M"), 3
+        cw = sum((len(FONT[ch][0]) + 1) * size for ch in clock) - size
+        px0, py0 = (cols - cw) // 2, (rows * 2 - 5 * size) // 2 - 2  # each text row is 2 pixels
+        quiet = (px0 - 4, py0 // 2 - 2, px0 + cw + 4, (py0 + 5 * size) // 2 + 3)
+        for x, d in enumerate(drops):
+            d[0] += d[1] / fps
+            if d[0] - d[2] > rows:
+                d[:] = [random.uniform(-10, 0), random.uniform(8, 22), random.randint(6, 20)]
+            head = int(d[0])
+            for k in range(d[2]):
+                y = head - k
+                if 0 <= y < rows:
+                    if random.random() < 0.02:
+                        chars[x][y] = random.choice(GLYPHS)
+                    if k == 0:
+                        c = (225, 240, 255)
+                    else:
+                        c = scale(BRAND_BLUE, (1 - k / d[2]) ** 1.5 * 0.75 + 0.06)
+                    if quiet[0] <= x < quiet[2] and quiet[1] <= y < quiet[3]:
+                        c = scale(c, 0.22)  # keep the clock readable
+                    text[(x, y)] = (chars[x][y], c)
+
+        # clock, centred, with a soft shimmer
+        x = px0
+        for ch in clock:
+            g = FONT[ch]
+            for gy, line in enumerate(g):
+                for gx, on in enumerate(line):
+                    if on == "#":
+                        shade = 0.9 + 0.1 * math.sin(t * 2 + (x + gx * size) * 0.08)
+                        for sy in range(size):
+                            for sx in range(size):
+                                pix[(x + gx * size + sx, py0 + gy * size + sy)] = scale((230, 236, 245), shade)
+            x += (len(g[0]) + 1) * size
+        date = time.strftime("%A, %d %B").lower()
+        dy = (py0 + 5 * size) // 2 + 1
+        for i, ch in enumerate(date):
+            text[((cols - len(date)) // 2 + i, dy)] = (ch, (150, 160, 175))
+
+        # Tux waddles across the bottom every so often, alternating direction
+        cycle = t % walk_every
+        if cycle < walk_len:
+            lap = int(t // walk_every)
+            pos = cycle * 12 - 25
+            tx = int(pos) if lap % 2 == 0 else int(cols - pos - 20)
+            tux(pix, tx, rows * 2 - 23, t, "walk")
+
+        frame = []
+        p = Painter()
+        for r in range(rows):
+            compose(p, pix, text, r, cols, bg)
+            frame.append(p.done().replace(ESC + "K", ""))
+        out(ESC + "H" + "\n".join(frame))
+
+
+
+def smooth(x):
+    """0..1 with a soft start and finish (smoothstep), clamped."""
+    x = min(1.0, max(0.0, x))
+    return x * x * (3 - 2 * x)
+
+
+def screensaver(keys):
+    """Every scene, one after another (never the same twice in a row), centred on a big-font
+    full-screen terminal with the time underneath. Any key or mouse movement quits."""
+    shown, fps, turn = None, 30, 0
+    started = time.monotonic()
+    out(ESC + "?1003h")  # report every mouse movement, so moving the mouse quits too
+    while True:
+        cols, rows = shutil.get_terminal_size((80, 24))
+
+        def fits(name):
+            cls = SCENES[name]
+            w, h = stage_size(SCENES[name])
+            return w <= cols and h + 2 <= rows
+
+        turn += 1
+        fun = [n for n in FUN if n in SCENES and n != shown and fits(n)]
+        shown = random.choice(fun) if turn % 3 == 0 and fun else pick_scene(avoid=shown, fits=fits)
+        if shown is None:
+            rain(keys)
+            return
+        cls = SCENES[shown]
+        scene, f, ended_at = cls(), 0, None
+        w, h = stage_size(cls)
+        ox, oy = max(0, (cols - w) // 2), max(0, (rows - h - 2) // 2)
+        out(ESC + "2J")
+        while True:
+            if shutil.get_terminal_size((80, 24)) != (cols, rows):  # kitty goes fullscreen after starting
+                cols, rows = shutil.get_terminal_size((80, 24))
+                ox, oy = max(0, (cols - w) // 2), max(0, (rows - h - 2) // 2)
+                out(ESC + "2J")
+            t = f / fps
+            ended = scene.over(t) if hasattr(scene, "over") else t >= 8.0
+            if ended and ended_at is None:
+                ended_at = t
+            # fade up from black when the screensaver opens, and through black between scenes
+            cap = getattr(cls, "MAX", MAX_LENGTH)
+            left = min(3.0 - (t - ended_at) if ended_at is not None else 99, cap + 3 - t)
+            entry = smooth((time.monotonic() - started) / 1.2)
+            Painter.fade = entry * smooth(t / 0.6) * smooth(left / 0.6)
+            pix, text = scene.frame(t, ended and not hasattr(scene, "over"))
+            frame = []
+            for i in range(h):
+                p = Painter()
+                compose(p, pix, text, i, w)
+                frame.append(f"{ESC}{oy + i + 1};{ox + 1}H" + p.done().replace(ESC + "K", ""))
+            clock = time.strftime("%H:%M") + "  ·  " + time.strftime("%A %d %B").lower()
+            fade, Painter.fade = Painter.fade, entry  # the clock stays put between scenes
+            cc = Painter.faded((110, 115, 130))
+            Painter.fade = fade
+            frame.append(f"{ESC}{min(rows, oy + h + 2)};{max(1, (cols - len(clock)) // 2 + 1)}H"
+                         f"{ESC}38;2;{cc[0]};{cc[1]};{cc[2]}m{clock}{RESET}")
+            out("".join(frame))
+            if keys.wait(1 / fps):
+                if time.monotonic() - started < 1.5:  # ignore stray input while the window opens
+                    keys.hit = keys.escaped = False
+                else:
+                    return
+            f += 1
+            if (ended_at is not None and t - ended_at > 3.0) or t > cap + 3:
+                break  # hold the last frame a moment, then on to the next scene
+
+
+def main():
+    cols, rows = shutil.get_terminal_size((80, 24))
+    if "--list" in sys.argv:
+        for name, cls in SCENES.items():
+            print(f"{name:11} {cls.__doc__}")
+        return
+    if not sys.stdout.isatty():
+        return
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    out(ESC + "?25l")
+    try:
+        with KeyWatch() as keys:
+            if "--screensaver" in sys.argv:
+                screensaver(keys)
+                return
+            args = sys.argv[1:]
+            wanted = None
+            if "--scene" in args and args.index("--scene") + 1 < len(args):
+                wanted = args[args.index("--scene") + 1]
+                if wanted not in SCENES:
+                    raise SystemExit(f"unknown scene {wanted!r}; pick one of: {' '.join(SCENES)}")
+
+            def fits(name):
+                w, h = scene_size(SCENES[name])
+                return cols >= w + 2 and rows >= h + 2
+
+            name = pick_scene(wanted, fits=fits)
+            if name is None or not fits(name):
+                return
+            if "--no-boot" not in args:
+                boot_sequence(keys)
+            if not keys.escaped:
+                splash(keys, sysinfo(), name)
+            if keys.escaped:  # in a hurry: wipe the splash and hand over a clean prompt
+                out(RESET + ESC + "2J" + ESC + "3J" + ESC + "H")
+    finally:
+        out(RESET + ESC + "?1003l" + ESC + "?25h")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        out(RESET + ESC + "?25h\n")

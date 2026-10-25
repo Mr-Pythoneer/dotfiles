@@ -1,0 +1,7 @@
+[Hotkey]
+# Shift alone does not switch; only Caps Lock (sent as F13 by the Hyprland keymap)
+AltTriggerKeys=
+EnumerateWithTriggerKeys=True
+
+[Hotkey/TriggerKeys]
+0=F13

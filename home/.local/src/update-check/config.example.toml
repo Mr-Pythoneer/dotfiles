@@ -1,0 +1,44 @@
+# update-check settings. Copy to ~/.config/update-check/config.toml.
+
+# Things you build yourself (local PKGBUILDs, AUR, plugins). After an update,
+# `update-check --after` checks every program/library in each one for:
+#   - missing shared libraries (ldd says "not found")
+#   - being built against an older Qt than the one installed now
+#   - its own check command failing (if you give one)
+#
+#   package = "name"          a pacman package: all of its files are checked
+#   files   = ["~/path.so"]   files that aren't in a package (or extra ones)
+#   name    = "..."           how it's shown in the report (default: the package name)
+#   rebuild = "command"       the fix (default: yay -S --rebuild <package>;
+#                             for -bin packages: check whether a newer version is out)
+#   after   = ["command"]     what has to run once the rebuild worked, for it to be in use
+#                             (each runs once, after all the rebuilds; e.g. restart the shell)
+#   check   = "command"       must exit 0 when it's working; also used to re-check after a fix
+#
+# Entries are fixed in this order, so list things before whatever is built on top of them.
+
+[[custom]]
+package = "quickshell-pinned"
+rebuild = "arch-update --build-local quickshell-pinned"
+after = ["caelestia-patch"]           # restarts the shell on the new build
+check = "quickshell --private-check-compat"
+
+[[custom]]
+package = "caelestia-shell-topbar"
+rebuild = "arch-update --build-local caelestia-shell-topbar"
+after = ["caelestia-patch"]           # your patched copy is made from this package
+
+[[custom]]
+name = "hymission (window overview plugin)"
+files = ["~/.local/lib/hyprland/libhymission.so"]
+rebuild = "arch-update --build-hymission"   # Hyprland loads it at login: log out and back in afterwards
+
+# Claude repair (off unless enabled here): problems no built-in fix covers are handed to Claude Code
+# (`claude -p`) after the built-in fixes, at login, at 7:00 and in the fix terminal. It edits only your
+# config folders (snapshotted first; `update-check --undo` puts them back), never uses sudo, deletes,
+# installs or rebuilds, and reports why each thing broke and what it did.
+[ai]
+enabled = true
+model = "claude-opus-5-5"
+budget_usd = 3.0          # most a single repair run may spend
+timeout_minutes = 20

@@ -1,0 +1,30 @@
+--- a/modules/sidebar/NotifCenter.qml	2026-10-12 06:48:32.201157466 -0400
++++ b/modules/sidebar/NotifCenter.qml	2026-10-12 06:49:18.680316306 -0400
+@@ -126,6 +126,27 @@
+                 Anim {}
+             }
+         }
++
++        // Power: opens the session menu (lock, log out, sleep, restart, shut down) beside the centre
++        StyledRect {
++            implicitWidth: 28
++            implicitHeight: 28
++            radius: Tokens.rounding.full
++            color: root.screenState.session ? Colours.palette.m3secondaryContainer : Colours.layer(Colours.palette.m3surfaceContainerHigh, 2)
++
++            StateLayer {
++                radius: Tokens.rounding.full
++                color: Colours.palette.m3onSurface
++                onClicked: root.screenState.session = !root.screenState.session
++            }
++
++            MaterialIcon {
++                anchors.centerIn: parent
++                text: "power_settings_new"
++                color: Colours.palette.m3onSurfaceVariant
++                fontStyle: Tokens.font.icon.small
++            }
++        }
+     }
+ 
+     // Empty state

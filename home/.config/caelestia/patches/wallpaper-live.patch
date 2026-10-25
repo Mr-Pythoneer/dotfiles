@@ -1,0 +1,63 @@
+Live wallpapers (rice, 2026-10-10): a wallpaper named "name.live.png" plays "name.mp4" from the same
+folder over the still while on AC power (QtMultimedia, looping, no audio), and pauses and fades back
+to the still on battery. Used by ~/.local/bin/rice-wall.
+diff -ruN a/modules/background/Wallpaper.qml b/modules/background/Wallpaper.qml
+--- a/modules/background/Wallpaper.qml	2026-10-10 21:46:10.484231059 -0400
++++ b/modules/background/Wallpaper.qml	2026-10-10 21:46:10.484842918 -0400
+@@ -1,6 +1,8 @@
+ pragma ComponentBehavior: Bound
+ 
+ import QtQuick
++import QtMultimedia
++import Quickshell.Services.UPower
+ import Caelestia.Config
+ import Caelestia.I18n
+ import qs.components
+@@ -130,6 +132,47 @@
+                 interval: anim.duration
+                 onTriggered: img.destroy()
+             }
++
++            // A wallpaper named "name.live.png" plays "name.mp4" over the still while on AC power;
++            // on battery it pauses and fades back to the still.
++            readonly property string liveSource: /\.live\.(png|jpe?g|webp)$/i.test(path) ? path.replace(/\.live\.(png|jpe?g|webp)$/i, ".mp4") : ""
++            readonly property bool livePlaying: liveSource !== "" && !UPower.onBattery && root.current === img
++
++            Loader {
++                anchors.fill: parent
++                active: img.liveSource !== ""
++
++                sourceComponent: Item {
++                    id: live
++
++                    readonly property bool shouldPlay: img.livePlaying
++
++                    onShouldPlayChanged: shouldPlay ? player.play() : player.pause()
++                    Component.onCompleted: if (shouldPlay) player.play()
++
++                    MediaPlayer {
++                        id: player
++
++                        source: "file://" + img.liveSource
++                        loops: MediaPlayer.Infinite
++                        videoOutput: video
++                    }
++
++                    VideoOutput {
++                        id: video
++
++                        anchors.fill: parent
++                        fillMode: VideoOutput.PreserveAspectCrop
++                        opacity: live.shouldPlay && player.playbackState === MediaPlayer.PlayingState && player.hasVideo ? 1 : 0
++
++                        Behavior on opacity {
++                            Anim {
++                                type: Anim.SlowEffects
++                            }
++                        }
++                    }
++                }
++            }
+         }
+     }
+ }

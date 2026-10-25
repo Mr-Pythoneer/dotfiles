@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""cowtune: a random cowsay character says a random fortune, in a rounded speech bubble.
+
+Shown when a terminal opens (~/.bashrc; switch with eyecandy on|off). Uses cowsay's characters and
+fortune's sayings when they're installed, a cow or Tux with a few built-in lines otherwise.
+
+    cowtune              a random character and fortune
+    cowtune -f tux       pick the character (cowtune -l lists them)
+    cowtune some words   say these instead of a fortune
+"""
+import json
+import os
+import random
+import shutil
+import subprocess
+import sys
+import textwrap
+
+# hand-picked from cowsay's characters: good-looking at terminal size, nothing crude
+CHARACTERS = ["default", "tux", "dragon", "stegosaurus", "turtle", "koala", "sheep", "elephant", "moose",
+              "bunny", "kitty", "llama", "fox", "small", "daemon", "vader", "www", "bud-frogs", "blowfish",
+              "cheese", "ghostbusters", "skeleton", "turkey", "three-eyes", "meow", "hellokitty", "cower"]
+FALLBACK = {  # without cowsay: thought trail marked with ╲
+    "cow": ["╲   ^__^", " ╲  (oo)\\_______", "    (__)\\       )\\/\\", "        ||----w |", "        ||     ||"],
+    "tux": ["╲", " ╲", "     .--.", "    |o_o |", "    |:_/ |", "   //   \\ \\", "  (|     | )",
+            " /'\\_   _/`\\", " \\___)=(___/"],
+}
+SAYINGS = ["There's no place like 127.0.0.1", "It's not a bug, it's a feature.", "sudo !!",
+           "Talk is cheap. Show me the code. -- Linus Torvalds", "Real programmers count from 0.",
+           "Have you tried turning it off and on again?", "Read The Fine Manual: man man",
+           "Penguins can't fly. Tux can.", "Works on my machine.", "Moo-ve fast and break things."]
+
+# the terminal's graphite palette: white words, a lighter frame, the character in soft grey
+TEXT, FRAME, BODY = (236, 236, 228), (200, 200, 196), (138, 141, 147)
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "cowtune")
+
+
+def paint(rgb, s):
+    return "\x1b[38;2;%d;%d;%dm%s\x1b[0m" % (*rgb, s)
+
+
+def art_from_cowsay(name):
+    """The character without its bubble, as (lines, trail). The backslashes leading up to the bubble become ╲;
+    they're found by diffing cowsay against cowthink (whose trail is o's). Cached, cowsay is slow-ish perl."""
+    cowsay = shutil.which("cowsay")
+    if not cowsay:
+        return None
+    stamp = os.path.getmtime(cowsay)
+    path = os.path.join(CACHE, name + ".json")
+    try:
+        with open(path) as f:
+            cached = json.load(f)
+        if cached["stamp"] == stamp:
+            return cached["lines"], [tuple(p) for p in cached["trail"]]
+    except (OSError, ValueError, KeyError):
+        pass
+    try:
+        say, think = (subprocess.run([cmd, "-f", name, "x"], capture_output=True, text=True, timeout=3).stdout
+                      .splitlines()[3:] for cmd in ("cowsay", "cowthink"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not say or len(say) != len(think):
+        return None
+    lines, trail = [], []
+    for y, (a, b) in enumerate(zip(say, think)):
+        row = list(a)
+        for x, (ca, cb) in enumerate(zip(a, b)):
+            if ca == "\\" and cb == "o":
+                row[x] = "╲"
+                trail.append((x, y))
+        lines.append("".join(row).rstrip())
+    while lines and not lines[-1].strip():
+        lines.pop()
+    pad = min(len(l) - len(l.lstrip()) for l in lines if l.strip())
+    lines, trail = [l[pad:] for l in lines], [(x - pad, y) for x, y in trail]
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"stamp": stamp, "lines": lines, "trail": trail}, f)
+    except OSError:
+        pass
+    return lines, trail
+
+
+def fallback(name):
+    lines = FALLBACK.get(name) or FALLBACK[random.choice(list(FALLBACK))]
+    return lines, [(x, y) for y, l in enumerate(lines) for x, ch in enumerate(l) if ch == "╲"]
+
+
+def fortune():
+    if shutil.which("fortune"):
+        try:
+            out = subprocess.run(["fortune", "-s"], capture_output=True, text=True, timeout=3).stdout
+            if out.strip():
+                return out
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return random.choice(SAYINGS)
+
+
+def wrap(text, width):
+    """Keep the fortune's own line breaks for quotes and attributions, wrap the rest"""
+    out = []
+    for para in text.expandtabs(4).strip("\n").split("\n"):
+        out += textwrap.wrap(para.strip(), width) if para.strip() else [""]
+    return out or [""]
+
+
+def main(argv):
+    if argv[:1] == ["-l"]:
+        print(" ".join(CHARACTERS if shutil.which("cowsay") else FALLBACK))
+        return 0
+    name = None
+    if argv[:1] == ["-f"] and len(argv) > 1:
+        name, argv = argv[1], argv[2:]
+    cols = shutil.get_terminal_size((80, 24)).columns
+    lines = wrap(" ".join(argv) if argv else fortune(), max(20, min(56, cols - 8)))
+
+    art = None
+    if shutil.which("cowsay"):
+        names = [name] if name else random.sample(CHARACTERS, len(CHARACTERS))
+        for n in names:
+            art = art_from_cowsay(n)
+            if art and max(map(len, art[0])) < cols:
+                break
+            art = None
+    art_lines, trail = art or fallback(name)
+
+    # bubble at the left; the character placed so its thought trail starts right under the ┬
+    bw = max(map(len, lines)) + 4
+    tx = min(trail, key=lambda p: p[1])[0] if trail else 2
+    tee = min(bw - 2, 3)
+    shift = tee - tx                 # how far right the character moves (negative: the bubble moves instead)
+    bx, ax = max(0, -shift) + 1, max(0, shift) + 1
+    out = [" " * bx + paint(FRAME, "╭" + "─" * (bw - 2) + "╮")]
+    for line in lines:
+        out.append(" " * bx + paint(FRAME, "│ ") + paint(TEXT, line.ljust(bw - 4)) + paint(FRAME, " │"))
+    out.append(" " * bx + paint(FRAME, "╰" + "─" * (tee - 1) + "┬" + "─" * (bw - tee - 2) + "╯"))
+    for line in art_lines:
+        out.append(" " * ax + paint(BODY, line))
+    print("\n".join(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

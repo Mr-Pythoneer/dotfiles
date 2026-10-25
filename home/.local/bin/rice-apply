@@ -1,0 +1,9 @@
+#!/bin/bash
+# Switches the rice on (safe to run again): GitHub Dark scheme in Caelestia, which also recolours
+# GTK, Qt, btop, cava, fuzzel, Discord and Spotify themes, plus the rotating wallpapers.
+set -euo pipefail
+caelestia scheme set -n github -f default -m dark
+systemctl --user daemon-reload
+systemctl --user enable --now rice-wall.timer
+"$HOME/.local/bin/rice-wall" restore
+echo "Rice is on. Open a new kitty window to see it there too; Super+W changes the wallpaper."

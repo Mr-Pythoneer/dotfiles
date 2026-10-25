@@ -1,0 +1,6 @@
+[Unit]
+Description=Show the next rice wallpaper
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/rice-wall next

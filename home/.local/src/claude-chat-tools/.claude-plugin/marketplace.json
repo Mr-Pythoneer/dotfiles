@@ -1,0 +1,5 @@
+{
+  "name": "claude-chat-tools",
+  "owner": { "name": "mrpythoneer" },
+  "plugins": [{ "name": "chat-tools", "source": "./" }]
+}

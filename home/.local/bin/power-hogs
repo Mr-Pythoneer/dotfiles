@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Spot apps that drain the battery, for the rice bar's battery icon and popout.
+
+  power-hogs watch        print one JSON line every 10 s: {"onBattery": .., "hogs": [..]}
+                          (does nothing but read the AC state while plugged in)
+  power-hogs once         sample for 10 s and print the list, whatever the power state
+  power-hogs quit KIND ID stop one: KIND app = a systemd unit (whole app), vm = a qemu pid
+                          (asked to shut down cleanly), proc = a single process
+
+A hog is anything averaging 15% of a CPU core or more over the last 30 s. A process counts
+toward the app it was started from (every Chrome process together, each Claude session apart):
+its family tree is followed up to the first launcher (Hyprland, a terminal, a shell, systemd).
+Quit is offered for launcher apps, VMs and programs started in a terminal; desktop parts and
+background services (Hyprland, the shells, audio, daemons) are listed without one.
+Pretend to be on battery for testing: touch $XDG_RUNTIME_DIR/power-hogs-pretend
+"""
+import glob
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+
+HZ = os.sysconf("SC_CLK_TCK")
+STEP = 10           # seconds per sample
+WINDOW = 3          # samples averaged (30 s)
+THRESHOLD = 15.0    # % of one core
+NOTIFY_AT = 50.0    # also send a notification (once per unplug) at this much
+PRETEND = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "power-hogs-pretend")
+DESKTOP = {"Hyprland", "qs", "quickshell", "pipewire", "pipewire-pulse", "wireplumber",
+           "systemd", "dbus-broker", "dbus-daemon", "xdg-desktop-portal", "Xwayland",
+           "xdg-desktop-portal-hyprland", "xdg-desktop-portal-gtk", "power-hogs", "hypridle",
+           "start-hyprland", "fcitx5", "(sd-pam)", "kwin_wayland", "gnome-shell"}
+TERMINAL_PARENTS = {"bash", "zsh", "fish", "sh", "dash", "kitty", "foot", "alacritty", "wezterm-gui",
+                    "tmux: server"}
+# parents that only start things: a process right below one of these is an app of its own
+LAUNCHERS = {"systemd", "Hyprland", "uwsm", "uwsm-app", "kitty", "foot", "alacritty", "wezterm-gui",
+             "bash", "zsh", "fish", "sh", "dash", "setsid", "sudo", "tmux: server", "login-later",
+             "session", "flatpak-session-helper", "bwrap", "init", "timeout", "nice", "env", "nohup",
+             "systemd-run", "flatpak"}
+NICE = {"claude": "Claude Code", "btop": "btop (system monitor)", "python3": "Python script"}
+ME = os.getpid()
+
+
+def on_battery():
+    if os.path.exists(PRETEND):
+        return True
+    try:
+        return open("/sys/class/power_supply/AC/online").read().strip() == "0"
+    except OSError:
+        return False
+
+
+def unit_of(pid):
+    try:
+        cg = open(f"/proc/{pid}/cgroup").read().strip().split("::", 1)[-1]
+    except OSError:
+        return None
+    if "/user@" not in cg:
+        return None                      # kernel threads and system services: not yours to quit
+    return cg.rsplit("/", 1)[-1]
+
+
+def app_name(unit):
+    # app-com.google.Chrome-21261.scope, app-Hyprland-kitty@abc.scope, app-flatpak-com.valvesoftware.Steam-123.scope
+    n = re.sub(r"\.(scope|service)$", "", unit)
+    n = re.sub(r"^app-(flatpak-|Hyprland-|gnome-)?", "", n)
+    n = re.sub(r"(@[^@]*|-\d+)$", "", n)
+    n = n.encode().decode("unicode_escape") if "\\x" in n else n
+    if n.count(".") >= 2:                # reverse-DNS ids: keep the app part
+        n = n.rsplit(".", 1)[-1]
+    return n[:1].upper() + n[1:]
+
+
+def snapshot():
+    """pid -> (cpu ticks, comm, unit, ppid)"""
+    out = {}
+    for p in glob.glob("/proc/[0-9]*"):
+        pid = int(p[6:])
+        try:
+            st = open(p + "/stat").read()
+            comm = st[st.index("(") + 1:st.rindex(")")]
+            f = st[st.rindex(")") + 2:].split()
+            ticks, ppid = int(f[11]) + int(f[12]), int(f[1])
+        except (OSError, ValueError):
+            continue
+        unit = unit_of(pid)
+        if unit is None or pid == ME:
+            continue
+        out[pid] = (ticks, comm, unit, ppid)
+    return out
+
+
+def top(pid, snap):
+    """the app a process belongs to: its highest ancestor that isn't a launcher"""
+    seen = set()
+    while pid in snap and pid not in seen:
+        seen.add(pid)
+        if snap[pid][1] in DESKTOP:
+            return pid
+        ppid = snap[pid][3]
+        if ppid not in snap or snap[ppid][1] in LAUNCHERS:
+            return pid
+        pid = ppid
+    return pid
+
+
+def cmdline(pid):
+    try:
+        return open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+    except OSError:
+        return []
+
+
+def group(a, b, dt):
+    """CPU % per group between two snapshots"""
+    groups = {}
+    for pid, (ticks, _, _, _) in b.items():
+        if pid not in a:
+            continue
+        cpu = (ticks - a[pid][0]) / HZ / dt * 100
+        pid = top(pid, b)
+        _, comm, unit, _ = b[pid]
+        if comm.startswith("qemu-system"):
+            args = [x.decode(errors="replace") for x in cmdline(pid)]
+            name = args[args.index("-name") + 1].split(",")[0] if "-name" in args else "virtual machine"
+            key, g = ("vm", str(pid)), {"name": "VM " + name, "kind": "vm"}
+        elif unit.startswith("app-") and unit.endswith(".scope") and comm not in DESKTOP:
+            key, g = ("app", unit), {"name": app_name(unit), "kind": "app"}
+        else:
+            parent = b.get(b[pid][3], (0, ""))[1]
+            kind = "proc" if comm not in DESKTOP and parent in TERMINAL_PARENTS else "desktop"
+            key, g = (kind, str(pid)), {"name": NICE.get(comm, comm), "kind": kind}
+        cur = groups.setdefault(key, dict(g, id=key[1], cpu=0.0))
+        cur["cpu"] += cpu
+    return groups
+
+
+def notify(text):
+    subprocess.run(["notify-send", "-a", "Battery", "-i", "battery-caution", "Using a lot of battery", text],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def describe(cpu):
+    return f"{cpu / 100:.1f} cores" if cpu >= 100 else f"{cpu:.0f}% of a core"
+
+
+def watch():
+    history, prev, prev_t, told = [], None, 0, set()
+    while True:
+        bat = on_battery()
+        if not bat:
+            history, prev, told = [], None, set()
+            print(json.dumps({"onBattery": False, "hogs": []}), flush=True)
+            time.sleep(STEP)
+            continue
+        now = time.time()
+        snap = snapshot()
+        if prev is not None:
+            history = (history + [group(prev, snap, now - prev_t)])[-WINDOW:]
+        prev, prev_t = snap, now
+        hogs = []
+        if history:
+            keys = set().union(*history)
+            for k in keys:
+                cpu = sum(h[k]["cpu"] for h in history if k in h) / len(history)
+                if cpu >= THRESHOLD:
+                    g = next(h[k] for h in reversed(history) if k in h)
+                    hogs.append(dict(g, cpu=round(cpu, 1)))
+            hogs.sort(key=lambda g: -g["cpu"])
+            for g in hogs:
+                if g["cpu"] >= NOTIFY_AT and g["kind"] != "desktop" and (g["kind"], g["id"]) not in told:
+                    told.add((g["kind"], g["id"]))
+                    notify(f"{g['name']} is using {describe(g['cpu'])}. Open the battery menu in the bar to quit it.")
+        print(json.dumps({"onBattery": True, "hogs": hogs}), flush=True)
+        time.sleep(max(0.5, STEP - (time.time() - now)))
+
+
+def once():
+    a, t = snapshot(), time.time()
+    time.sleep(STEP)
+    groups = group(a, snapshot(), time.time() - t)
+    for g in sorted(groups.values(), key=lambda g: -g["cpu"])[:15]:
+        print(f"{g['cpu']:7.1f}%  {g['kind']:8} {g['name']}  ({g['id']})")
+
+
+def qmp_powerdown(pid):
+    """Ask qemu to shut its guest down the way a power button press would."""
+    args = [x.decode(errors="replace") for x in cmdline(pid)]
+    path = None
+    for i, a in enumerate(args):
+        if a == "-qmp" and i + 1 < len(args):
+            m = re.match(r"unix:([^,]+)", args[i + 1])
+            path = m and m.group(1)
+    if not path:
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(3)
+        s.connect(path)
+        s.recv(4096)
+        for cmd in ({"execute": "qmp_capabilities"}, {"execute": "system_powerdown"}):
+            s.sendall(json.dumps(cmd).encode() + b"\n")
+            s.recv(4096)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def quit_(kind, ident):
+    if kind == "app":
+        subprocess.run(["systemctl", "--user", "stop", ident])
+    elif kind == "vm":
+        if not qmp_powerdown(int(ident)):
+            notify("Couldn't ask that VM to shut down; stop it from its window or with `vm stop`.")
+    elif kind == "proc":
+        os.kill(int(ident), 15)
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "once"
+    if cmd == "watch":
+        try:
+            watch()
+        except (BrokenPipeError, KeyboardInterrupt):
+            pass
+    elif cmd == "quit" and len(sys.argv) == 4:
+        quit_(sys.argv[2], sys.argv[3])
+    elif cmd == "once":
+        once()
+    else:
+        print(__doc__)
+        sys.exit(1)

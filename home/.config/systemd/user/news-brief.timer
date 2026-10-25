@@ -1,0 +1,12 @@
+[Unit]
+Description=News brief at 7:30 and 20:30 (or on wake, if asleep then)
+
+[Timer]
+# two minutes early so the summary is written by the time it's delivered, on the half hour
+OnCalendar=*-*-* 07:28:00
+OnCalendar=*-*-* 20:28:00
+# if the laptop was off or asleep, run as soon as it's next on
+Persistent=true
+
+[Install]
+WantedBy=timers.target

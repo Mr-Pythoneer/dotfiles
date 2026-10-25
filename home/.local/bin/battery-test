@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Measure what each part of the desktop costs in battery watts.
+
+  battery-test          run it (about 11 minutes): unplug first, then leave the laptop alone
+  battery-test --dry    a few seconds per step, on the charger too: checks every step undoes itself
+
+Reads the battery's own power meter for a minute per step, with one thing switched off or
+paused at a time, and reports the difference from the normal state:
+  screen at 30%, Chrome paused, rice bar paused, Caelestia paused, Hyprland effects off,
+  efficiency mode
+Paused apps are frozen (SIGSTOP), not closed, and always resumed at the end, even on Ctrl+C.
+The screen stays on and the screensaver/lock stay away while it runs.
+Results: ~/.local/state/battery-test/<date>.txt, and a notification.
+"""
+import datetime
+import json
+import os
+import signal
+import statistics
+import subprocess
+import sys
+import time
+
+BAT = "/sys/class/power_supply/BAT0"
+OUT = os.path.expanduser("~/.local/state/battery-test")
+SETTLE, MEASURE, STEP = 15, 60, 2
+DRY = "--dry" in sys.argv
+if DRY:
+    SETTLE, MEASURE, STEP = 1, 2, 1
+TEST_BRIGHTNESS = 60      # % for the whole run, so every step sees the same screen
+undo_stack = []           # things to put back, newest first
+
+
+def sh(*cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def read(name):
+    with open(f"{BAT}/{name}") as f:
+        return f.read().strip()
+
+
+def watts():
+    return int(read("power_now")) / 1e6
+
+
+def pids(pattern, exact=True):
+    r = sh("pgrep", "-x" if exact else "-f", pattern)
+    return [int(p) for p in r.stdout.split()]
+
+
+def tree(pid):
+    """a process and all its descendants"""
+    out, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        out.append(p)
+        todo += [int(c) for c in sh("pgrep", "-P", str(p)).stdout.split()]
+    return out
+
+
+def freeze(ps):
+    ps = [p for p in ps if p != os.getpid()]
+    for p in ps:
+        try:
+            os.kill(p, signal.SIGSTOP)
+        except ProcessLookupError:
+            pass
+
+    def thaw():
+        for p in ps:
+            try:
+                os.kill(p, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+    return thaw
+
+
+def hypr_opt(name):
+    r = sh("hyprctl", "getoption", name, "-j")
+    try:
+        d = json.loads(r.stdout)
+        return d.get("int", d.get("bool"))
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
+def lua(code):
+    sh("hyprctl", "eval", code)
+
+
+def brightness(pct):
+    sh("brightnessctl", "-q", "set", f"{pct}%")
+
+
+def measure(label):
+    time.sleep(SETTLE)
+    samples, t0 = [], time.time()
+    while time.time() - t0 < MEASURE:
+        samples.append(watts())
+        time.sleep(STEP)
+    w = statistics.mean(samples)
+    print(f"  {label:<22} {w:5.2f} W", flush=True)
+    return w
+
+
+# ---- the steps: each returns a function that undoes it --------------------------------------
+
+def step_screen():
+    brightness(30)
+    return lambda: brightness(TEST_BRIGHTNESS)
+
+
+def step_chrome():
+    return freeze([p for root in pids("chrome") for p in tree(root)])
+
+
+def step_shell(config):
+    ps = pids(f"^qs -c {config}( |$)", exact=False)
+    return freeze([p for root in ps for p in tree(root)])
+
+
+def step_effects():
+    old = {k: hypr_opt(k) for k in ("animations:enabled", "decoration:blur:enabled", "decoration:shadow:enabled")}
+    lua("hl.config({ animations = { enabled = false }, decoration = { blur = { enabled = false }, shadow = { enabled = false } } })")
+    tf = lambda v: "true" if v else "false"
+    return lambda: lua(f"hl.config({{ animations = {{ enabled = {tf(old['animations:enabled'])} }}, decoration = {{ "
+                       f"blur = {{ enabled = {tf(old['decoration:blur:enabled'])} }}, shadow = {{ enabled = {tf(old['decoration:shadow:enabled'])} }} }} }})")
+
+
+def step_eco():
+    before = sh("powerprofilesctl", "get").stdout.strip() or "balanced"
+    sh("powerprofilesctl", "set", "power-saver")
+
+    def back():
+        sh("powerprofilesctl", "set", before)
+        time.sleep(3)                       # eco-mode puts everything back on its own
+        brightness(TEST_BRIGHTNESS)
+    return back
+
+
+STEPS = [
+    ("normal", None),
+    ("screen at 30%", step_screen),
+    ("Chrome paused", step_chrome),
+    ("rice bar paused", lambda: step_shell("rice")),
+    ("Caelestia paused", lambda: step_shell("caelestia")),
+    ("effects off", step_effects),
+    ("efficiency mode", step_eco),
+    ("normal again", None),
+]
+
+
+def put_back():
+    while undo_stack:
+        try:
+            undo_stack.pop()()
+        except Exception as e:      # keep going: every other thing still has to be put back
+            print("  couldn't undo a step:", e, file=sys.stderr)
+
+
+def main():
+    if "--inhibited" not in sys.argv:
+        # keep hypridle (screensaver, lock, screen off, suspend) away for the whole run
+        os.execvp("systemd-inhibit", ["systemd-inhibit", "--what=idle:sleep", "--who=battery-test",
+                                      "--why=measuring battery use", sys.argv[0], "--inhibited"] + sys.argv[1:])
+    if not DRY and read("status") != "Discharging" and open("/sys/class/power_supply/AC/online").read().strip() != "0":
+        sys.exit("Unplug the charger first: the battery meter only reads while it's discharging.")
+    vms = pids("^qemu-system", exact=False)     # -x can't match: process names are cut to 15 characters
+    if vms and not DRY:
+        sys.exit("A virtual machine is running; it would swamp the numbers. Run this again once it's stopped.")
+
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, lambda *_: sys.exit(1))
+    os.makedirs(OUT, exist_ok=True)
+    start_brightness = sh("brightnessctl", "g").stdout.strip()
+    undo_stack.append(lambda: sh("brightnessctl", "-q", "set", start_brightness))
+    anr = hypr_opt("misc:enable_anr_dialog")
+    lua("hl.config({ misc = { enable_anr_dialog = false } })")        # frozen apps would pop "not responding"
+    undo_stack.append(lambda: lua(f"hl.config({{ misc = {{ enable_anr_dialog = {'true' if anr else 'false'} }} }})"))
+    brightness(TEST_BRIGHTNESS)
+
+    total = len(STEPS) * (SETTLE + MEASURE) // 60 + 1
+    print(f"Measuring for about {total} minutes. Leave the laptop alone (no mouse, no typing).", flush=True)
+    if not DRY:
+        sh("notify-send", "-a", "Battery test", "Battery test running",
+           f"About {total} minutes. Please don't touch the laptop until it's done.")
+    results = []
+    try:
+        for label, step in STEPS:
+            undo = step() if step else None
+            if undo:
+                undo_stack.append(undo)
+            results.append((label, measure(label)))
+            if undo:
+                undo_stack.pop()()
+    finally:
+        put_back()
+
+    if DRY:
+        print("dry run finished; everything put back")
+        return
+    base = statistics.mean(w for l, w in results if l.startswith("normal"))
+    drift = abs(results[0][1] - results[-1][1])
+    lines = [f"Battery test {datetime.datetime.now():%Y-%m-%d %H:%M} (screen at {TEST_BRIGHTNESS}% unless noted)",
+             f"normal: {base:.2f} W  ->  {57.3 / base:.1f} h on a full battery (drift between the two normal runs {drift:.2f} W)", ""]
+    for label, w in results:
+        if not label.startswith("normal"):
+            lines.append(f"{label:<22} {w:5.2f} W   saves {base - w:+.2f} W")
+    lines += ["", "Anything within the drift is noise."]
+    report = "\n".join(lines)
+    path = os.path.join(OUT, f"{datetime.datetime.now():%Y-%m-%d-%H%M}.txt")
+    with open(path, "w") as f:
+        f.write(report + "\n")
+    print("\n" + report + f"\n\nSaved to {path}")
+    sh("notify-send", "-a", "Battery test", "Battery test done", f"Normal use: {base:.1f} W. Details in {path}")
+
+
+if __name__ == "__main__":
+    main()

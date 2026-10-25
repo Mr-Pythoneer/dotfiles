@@ -1,0 +1,10 @@
+#!/bin/sh
+# eyecandy — switch the greeting in new terminals (cowtune) on or off (remembered across reboots).
+# Usage: eyecandy on | off     (no argument shows the current setting)
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/eyecandy"
+mode=$(cat "$conf/mode" 2>/dev/null); [ "$mode" = off ] || mode=on
+case "$1" in
+    on|off) mkdir -p "$conf"; echo "$1" > "$conf/mode"; echo "eyecandy: $1 (applies to new terminals)" ;;
+    "") echo "eyecandy: $mode" ;;
+    *) echo "usage: eyecandy [on|off]" >&2; exit 1 ;;
+esac

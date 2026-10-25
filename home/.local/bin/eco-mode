@@ -1,0 +1,150 @@
+#!/bin/bash
+# eco-mode — efficiency mode. When the power profile is "power-saver" (Efficiency in the control centre, or
+# automatically at 20% battery, see power-mode), cut everything that isn't needed; balanced or performance
+# puts it all back the way it was.
+#   eco-mode watch     follow the power profile (autostarted from hyprland.lua)
+#   eco-mode on|off    apply / undo right now
+#   eco-mode status
+#
+# What efficiency mode cuts:
+#   Hyprland      animations, blur, shadows and dimming off (they make the GPU redraw)
+#   screen        brightness capped at 50% (put back afterwards unless you changed it yourself)
+#   keyboard      backlight off (Fn+Space still turns it on)
+#   Bluetooth     off, but only while nothing is connected (your mouse keeps working)
+#   background    the update check and news brief timers wait until you leave efficiency mode
+#   desktop       Caelestia's music visualiser off; the rice bar holds still by itself (services/Power.qml)
+#   idle          no animated screensaver: lock and screen off after 3 minutes (idle-step)
+#   CPU and GPU   turbo off, apps on the 4 low-power cores, GPU allowed to idle down and capped
+#                 (needs the one-time "sudo ~/.local/bin/eco-mode-install")
+state="$HOME/.local/state/eco-mode"
+shelljson="$HOME/.config/caelestia/shell.json"
+timers="update-check.timer news-brief.timer"
+mkdir -p "$state"
+
+kbd() {  # kbd get | kbd set N   (UPower lets your user set the keyboard backlight)
+    if [ "$1" = get ]; then
+        busctl --system call org.freedesktop.UPower /org/freedesktop/UPower/KbdBacklight \
+            org.freedesktop.UPower.KbdBacklight GetBrightness 2>/dev/null | awk '{print $2}'
+    else
+        busctl --system call org.freedesktop.UPower /org/freedesktop/UPower/KbdBacklight \
+            org.freedesktop.UPower.KbdBacklight SetBrightness i "$2" >/dev/null 2>&1
+    fi
+}
+
+visualiser() {  # visualiser get | visualiser set true|false   (Caelestia reloads shell.json by itself)
+    python3 -I - "$shelljson" "$@" <<'EOF'
+import json, os, sys
+path, op = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+v = d.setdefault("background", {}).setdefault("visualiser", {})
+if op == "get":
+    print("true" if v.get("enabled", False) else "false")
+else:
+    v["enabled"] = sys.argv[3] == "true"
+    tmp = path + ".eco-tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=4)
+        f.write("\n")
+    os.replace(tmp, path)
+EOF
+}
+
+eco_on() {
+    [ -e "$state/active" ] && return
+    : > "$state/active"
+
+    hyprctl eval 'hl.config({ animations = { enabled = false }, decoration = { blur = { enabled = false }, shadow = { enabled = false }, dim_inactive = false } })' >/dev/null
+
+    read -r cur max < <(echo "$(brightnessctl g) $(brightnessctl m)")
+    if [ -n "$cur" ] && [ $((cur * 100)) -gt $((max * 50)) ]; then
+        echo "$cur" > "$state/brightness"
+        brightnessctl -q set 50%
+        brightnessctl g > "$state/brightness-set"
+    fi
+
+    k=$(kbd get)
+    if [ -n "$k" ] && [ "$k" != 0 ]; then
+        echo "$k" > "$state/kbd"
+        kbd set 0
+    fi
+
+    if bluetoothctl show 2>/dev/null | grep -q 'Powered: yes' && [ -z "$(bluetoothctl devices Connected 2>/dev/null)" ]; then
+        bluetoothctl power off >/dev/null 2>&1 && : > "$state/bluetooth"
+    fi
+
+    if [ "$(visualiser get 2>/dev/null)" = true ]; then
+        visualiser set false && : > "$state/visualiser"
+    fi
+
+    : > "$state/timers"
+    for t in $timers; do
+        systemctl --user is-active -q "$t" && systemctl --user stop "$t" && echo "$t" >> "$state/timers"
+    done
+
+    if [ -x /usr/local/bin/eco-root ] && sudo -n /usr/local/bin/eco-root on 2>/dev/null; then
+        : > "$state/root"
+        extra="CPU on low-power cores, no turbo, GPU capped."
+    else
+        extra="Run sudo ~/.local/bin/eco-mode-install once to also limit the CPU and GPU."
+    fi
+    notify-send -a "Efficiency mode" -i battery-profile-powersave "Efficiency mode on" \
+        "No animations or blur, screen at most 50%, keyboard light off. $extra"
+}
+
+eco_off() {
+    [ -e "$state/active" ] || return
+
+    [ -e "$state/root" ] && sudo -n /usr/local/bin/eco-root off 2>/dev/null
+    rm -f "$state/root"
+
+    # back to exactly what hyprland.lua says, then the blur strength power-mode picks for charger/battery
+    hyprctl reload >/dev/null
+    if [ "$(cat /sys/class/power_supply/AC/online 2>/dev/null)" = 1 ]; then passes=3; else passes=2; fi
+    hyprctl eval "hl.config({ decoration = { blur = { passes = $passes } } })" >/dev/null
+
+    if [ -e "$state/brightness" ]; then
+        # only if you didn't change it yourself in the meantime
+        [ "$(brightnessctl g)" = "$(cat "$state/brightness-set" 2>/dev/null)" ] && brightnessctl -q set "$(cat "$state/brightness")"
+        rm -f "$state/brightness" "$state/brightness-set"
+    fi
+
+    if [ -e "$state/kbd" ]; then
+        [ "$(kbd get)" = 0 ] && kbd set "$(cat "$state/kbd")"
+        rm -f "$state/kbd"
+    fi
+
+    [ -e "$state/bluetooth" ] && bluetoothctl power on >/dev/null 2>&1
+    rm -f "$state/bluetooth"
+
+    [ -e "$state/visualiser" ] && visualiser set true
+    rm -f "$state/visualiser"
+
+    if [ -e "$state/timers" ]; then
+        while read -r t; do [ -n "$t" ] && systemctl --user start "$t"; done < "$state/timers"
+        rm -f "$state/timers"
+    fi
+
+    rm -f "$state/active"
+}
+
+follow() {
+    if [ "$(powerprofilesctl get 2>/dev/null)" = power-saver ]; then eco_on; else eco_off; fi
+}
+
+case "${1:-}" in
+    on)  eco_on ;;
+    off) eco_off ;;
+    status)
+        if [ -e "$state/active" ]; then
+            echo "efficiency mode: on$([ -e "$state/root" ] && echo " (CPU/GPU limited too)")"
+        else
+            echo "efficiency mode: off"
+        fi ;;
+    watch)
+        exec 9>"$state/watch.lock"
+        flock -n 9 || exit 0          # already watching
+        follow
+        gdbus monitor --system --dest net.hadess.PowerProfiles --object-path /net/hadess/PowerProfiles 2>/dev/null \
+            | grep --line-buffered ActiveProfile | while read -r _; do follow; done ;;
+    *)  sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+esac

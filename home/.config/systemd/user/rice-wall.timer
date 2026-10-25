@@ -1,0 +1,10 @@
+[Unit]
+Description=Rotate the rice wallpaper every 15 minutes
+
+[Timer]
+OnStartupSec=15min
+OnUnitActiveSec=15min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

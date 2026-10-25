@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Your to-do list, shared with the bar's to-do panel (~/.local/share/rice/todo.json).
+    todo                  show the list
+    todo add <thing>      add something
+    todo done <n>         tick item n off (or back on)
+    todo rm <n>           delete item n
+    todo clear            delete everything that's done
+"""
+import json
+import os
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+FILE = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "rice" / "todo.json"
+GREEN, DIM, BOLD, RESET = "\033[32m", "\033[2m", "\033[1m", "\033[0m"
+
+
+def load():
+    try:
+        items = json.loads(FILE.read_text())
+        return items if isinstance(items, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save(items):
+    FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=FILE.parent, prefix=".todo.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(items, f, indent=1)
+    os.replace(tmp, FILE)
+
+
+def ordered(items):
+    # the same order the panel shows: open ones first, then done
+    return sorted(items, key=lambda i: i.get("done", False))
+
+
+def show(items):
+    if not items:
+        print(f"{DIM}Nothing on the list. Add something: todo add <thing>{RESET}")
+        return
+    for n, item in enumerate(ordered(items), 1):
+        if item.get("done"):
+            print(f"{DIM}{n:>3}  ✓ {item['text']}{RESET}")
+        else:
+            print(f"{BOLD}{n:>3}{RESET}  ○ {item['text']}")
+
+
+def pick(items, arg):
+    try:
+        n = int(arg)
+        return ordered(items)[n - 1]
+    except (ValueError, IndexError):
+        sys.exit(f"todo: there's no item {arg} (see `todo`)")
+
+
+def main():
+    args = sys.argv[1:]
+    items = load()
+    if not args or args[0] in ("ls", "list"):
+        show(items)
+    elif args[0] == "add" and len(args) > 1:
+        text = " ".join(args[1:]).strip()
+        items.append({"id": format(int(time.time() * 1000), "x"), "text": text, "done": False,
+                      "created": datetime.now(timezone.utc).isoformat()})
+        save(items)
+        print(f"{GREEN}added{RESET} {text}")
+    elif args[0] == "done" and len(args) == 2:
+        item = pick(items, args[1])
+        item["done"] = not item.get("done")
+        save(items)
+        print(f"{GREEN}{'done' if item['done'] else 'reopened'}{RESET} {item['text']}")
+    elif args[0] == "rm" and len(args) == 2:
+        item = pick(items, args[1])
+        items.remove(item)
+        save(items)
+        print(f"removed {item['text']}")
+    elif args[0] == "clear":
+        left = [i for i in items if not i.get("done")]
+        save(left)
+        print(f"cleared {len(items) - len(left)} done item(s)")
+    else:
+        print(__doc__.strip())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

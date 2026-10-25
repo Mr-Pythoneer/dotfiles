@@ -1,0 +1,179 @@
+{
+    "appearance": {
+        "font": {
+            "body": {
+                "family": "Inter"
+            },
+            "label": {
+                "family": "Inter"
+            },
+            "title": {
+                "family": "Inter"
+            }
+        },
+        "rounding": {
+            "scale": 0.25
+        },
+        "anim": {
+            "durations": {
+                "scale": 1.1
+            }
+        }
+    },
+    "background": {
+        "wallpaperEnabled": true,
+        "desktopClock": {
+            "enabled": true,
+            "position": "top-right",
+            "background": {
+                "enabled": true,
+                "blur": true,
+                "opacity": 0.55
+            },
+            "shadow": {
+                "enabled": true,
+                "opacity": 0.6,
+                "blur": 0.6
+            }
+        },
+        "visualiser": {
+            "enabled": true,
+            "autoHide": true,
+            "blur": true
+        }
+    },
+    "bar": {
+        "activeWindow": {
+            "compact": false,
+            "inverted": false
+        },
+        "clock": {
+            "background": true,
+            "showDate": true,
+            "showIcon": true,
+            "showSeconds": true
+        },
+        "position": "bottom",
+        "statusIcons": [
+            {
+                "enabled": true,
+                "id": "lockStatus"
+            },
+            {
+                "enabled": true,
+                "id": "audio"
+            },
+            {
+                "enabled": false,
+                "id": "microphone"
+            },
+            {
+                "enabled": false,
+                "id": "kbLayout"
+            },
+            {
+                "enabled": true,
+                "id": "network"
+            },
+            {
+                "enabled": true,
+                "id": "bluetooth"
+            },
+            {
+                "enabled": true,
+                "id": "battery"
+            }
+        ],
+        "tray": {
+            "background": true,
+            "compact": true,
+            "recolour": false
+        },
+        "workspaces": {
+            "occupiedBg": true,
+            "perMonitor": true,
+            "shown": 5,
+            "showWindows": true,
+            "activeTrail": true,
+            "activeIndicator": true
+        },
+        "excludedScreens": [
+            "^.*$"
+        ]
+    },
+    "border": {
+        "rounding": 0,
+        "thickness": 4
+    },
+    "dashboard": {
+        "resourceUpdateInterval": 2500
+    },
+    "general": {
+        "apps": {
+            "playback": [
+                "mpv"
+            ],
+            "terminal": [
+                "kitty"
+            ],
+            "explorer": [
+                "kitty",
+                "-e",
+                "spf"
+            ]
+        },
+        "idle": {
+            "timeouts": []
+        }
+    },
+    "launcher": {
+        "showOnHover": false,
+        "useFuzzy": {
+            "actions": true,
+            "apps": true,
+            "schemes": true,
+            "variants": true,
+            "wallpapers": true
+        }
+    },
+    "notifs": {
+        "actionOnClick": true,
+        "defaultExpireTimeout": 3000,
+        "expire": true
+    },
+    "paths": {
+        "sessionGif": "~/.config/caelestia/penguin.webp"
+    },
+    "services": {
+        "audioIncrement": 0.05,
+        "defaultPlayer": "Mozilla zen"
+    },
+    "session": {
+        "commands": {
+            "logout": [
+                "sh",
+                "-c",
+                "~/.local/bin/session save; uwsm stop"
+            ],
+            "reboot": [
+                "sh",
+                "-c",
+                "~/.local/bin/session save; systemctl reboot"
+            ],
+            "shutdown": [
+                "sh",
+                "-c",
+                "~/.local/bin/session save; systemctl poweroff"
+            ]
+        }
+    },
+    "utilities": {
+        "toasts": {
+            "audioOutputChanged": false,
+            "audioInputChanged": false
+        }
+    },
+    "sidebar": {
+        "showOnHover": true
+    }
+}

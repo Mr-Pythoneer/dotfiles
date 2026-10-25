@@ -1,0 +1,11 @@
+Fallback PAM service for the lock screen's private pam.d: without it PAM logs
+"_pam_init_handlers: no default config other" every time the lock screen starts.
+--- /dev/null
++++ b/assets/pam.d/other
+@@ -0,0 +1,6 @@
++#%PAM-1.0
++
++auth      required  pam_deny.so
++account   required  pam_deny.so
++password  required  pam_deny.so
++session   required  pam_deny.so

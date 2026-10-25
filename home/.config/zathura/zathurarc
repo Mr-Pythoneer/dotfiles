@@ -1,0 +1,22 @@
+# Copy selected text to the clipboard (Wayland)
+set selection-clipboard clipboard
+
+# Dark mode by default (toggle with Ctrl+R)
+set recolor true
+set recolor-keephue true
+set recolor-darkcolor "#e6e6e6"
+set recolor-lightcolor "#1e1e2e"
+set default-bg "#1e1e2e"
+
+# Layout & scrolling
+set adjust-open best-fit
+set smooth-scroll true
+set scroll-step 80
+set scroll-page-aware true
+set pages-per-row 1
+set statusbar-h-padding 8
+set window-title-basename true
+set font "Inter 10"
+
+# Remember position per file
+set continuous-hits-search true

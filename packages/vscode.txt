@@ -1,0 +1,6 @@
+andrepimenta.claude-code-chat
+anthropic.claude-code
+ms-python.debugpy
+ms-python.python
+ms-python.vscode-pylance
+ms-python.vscode-python-envs

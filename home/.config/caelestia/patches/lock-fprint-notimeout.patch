@@ -1,0 +1,12 @@
+Lock screen fingerprint: no 30-second scan limit. pam_fprintd's default timeout ended the scan
+every 30s while the lock sat idle, which reset the reader (a touch during the ~1s restart was
+missed) and counted as an error, so after three timeouts (~90s) the lock flashed "Fingerprint
+reader isn't responding" although it was fine. timeout=-1 keeps one scan running until a
+finger, unlocking or sleep ends it.
+--- a/assets/pam.d/fprint
++++ b/assets/pam.d/fprint
+@@ -1,3 +1,3 @@
+ #%PAM-1.0
+ 
+-auth    required    pam_fprintd.so  max-tries=1
++auth    required    pam_fprintd.so  max-tries=1 timeout=-1

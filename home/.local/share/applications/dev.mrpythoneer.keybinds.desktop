@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Keybinds
+GenericName=Keyboard shortcuts
+Comment=Make your own shortcuts: open apps, run commands, type text, run macros
+Exec=/home/mrpythoneer/.local/bin/keybinds
+Icon=preferences-desktop-keyboard-shortcuts
+Terminal=false
+Categories=Settings;Utility;
+Keywords=shortcut;hotkey;keyboard;macro;bind;keybind;hyprland;
+StartupWMClass=dev.mrpythoneer.keybinds

@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""pscircle-wall OUTPUT.png [WIDTH HEIGHT] — draw the live process-tree wallpaper: every running process
+as a radial tree (pscircle, built from source into ~/.local/bin), the classic look: the kernel's threads
+fan out to the right of kthreadd, everything else branches from systemd to the left, and the busiest CPU
+and memory users are listed on the right. Laid out for 1920x1200, scaled to the screen size given.
+
+Caelestia runs this every 30 s on the charger and every 2 minutes on battery (not in efficiency mode)
+while a wallpaper named "*.pscircle.png" is selected: ~/.config/caelestia/patches/wallpaper-pscircle.patch
+
+The process list is built here and handed to pscircle (--stdin), so that:
+  - a chain of the same program (bwrap -> bwrap -> bwrap) is one node, "3 * bwrap";
+  - this drawing itself isn't in the picture;
+  - the rings are sized from how deep the tree really is, so the deepest branch still ends on screen
+    (above the bar); a tree too deep for that has its deepest levels folded into the last ring.
+CPU use is measured over one second, as pscircle does itself; memory and load come from pscircle.
+pscircle gives every process without children an equal slice of the circle, so the kernel fan is capped
+at 30 threads: about a third of the circle instead of half.
+"""
+import os
+import subprocess
+import sys
+import time
+
+import shutil
+# the one built from source on the host; elsewhere (the Fedora VM) the distro's package
+PSCIRCLE = os.path.expanduser("~/.local/bin/pscircle")
+if not os.access(PSCIRCLE, os.X_OK):
+    PSCIRCLE = shutil.which("pscircle") or PSCIRCLE
+HZ = os.sysconf("SC_CLK_TCK")
+PAGE_KB = os.sysconf("SC_PAGESIZE") // 1024
+NBSP = " "   # pscircle cuts a name at its first space; this one draws the same
+
+
+def snapshot():
+    """pid -> (ppid, name, cpu ticks, rss KiB)"""
+    procs = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                st = f.read()
+            name = st[st.index("(") + 1:st.rindex(")")]
+            f_ = st[st.rindex(")") + 2:].split()
+            with open(f"/proc/{d}/statm") as f:
+                rss = int(f.read().split()[1]) * PAGE_KB
+            procs[int(d)] = (int(f_[1]), name, int(f_[11]) + int(f_[12]), rss)
+        except (OSError, ValueError, IndexError):
+            pass
+    return procs
+
+
+def cpu_total():
+    with open("/proc/stat") as f:
+        v = list(map(int, f.readline().split()[1:]))
+    return sum(v), v[3] + v[4]
+
+
+def measure():
+    a, (ta, ia), t0 = snapshot(), cpu_total(), time.monotonic()
+    time.sleep(1)
+    b, (tb, ib), dt = snapshot(), cpu_total(), time.monotonic() - t0
+    busy = 1 - (ib - ia) / max(1, tb - ta)
+    nodes = {}
+    for pid, (ppid, name, ticks, rss) in b.items():
+        cpu = (ticks - a[pid][2]) / HZ / dt * 100 if pid in a else 0.0
+        nodes[pid] = {"ppid": ppid, "name": name, "cpu": max(0.0, cpu), "rss": rss, "n": 1, "kids": []}
+    return nodes, max(0.0, min(1.0, busy))
+
+
+def build(nodes, leave_out):
+    for pid in leave_out:
+        nodes.pop(pid, None)
+    for pid, n in nodes.items():
+        if n["ppid"] in nodes:
+            nodes[n["ppid"]]["kids"].append(pid)
+        else:
+            n["ppid"] = 0      # parent gone or left out (and systemd, kthreadd): hang it on the root
+    roots = [p for p, n in nodes.items() if n["ppid"] == 0]
+
+    def fold(pid):
+        n = nodes[pid]
+        # the same program started by itself, alone (bwrap -> bwrap -> bwrap): one node
+        while len(n["kids"]) == 1 and nodes[n["kids"][0]]["name"] == n["name"]:
+            k = nodes.pop(n["kids"][0])
+            n["n"] += k["n"]
+            n["cpu"] += k["cpu"]
+            n["rss"] += k["rss"]
+            n["kids"] = k["kids"]
+            for c in n["kids"]:
+                nodes[c]["ppid"] = pid
+        # children of the same name without children of their own (tabs, workers): one node, "5 * name".
+        # Done here, not by pscircle's --collapse-threads: that one prefixes the count and then cuts the
+        # name to 19 bytes, which can split a multi-byte character, and Cairo then draws no more labels.
+        same = {}
+        for c in list(n["kids"]):
+            k = nodes[c]
+            if k["kids"]:
+                continue
+            if k["name"] in same:
+                first = nodes[same[k["name"]]]
+                first["n"] += k["n"]
+                first["cpu"] += k["cpu"]
+                first["rss"] += k["rss"]
+                n["kids"].remove(c)
+                del nodes[c]
+            else:
+                same[k["name"]] = c
+        for c in n["kids"]:
+            fold(c)
+
+    for r in roots:
+        fold(r)
+    return roots
+
+
+def depth(nodes, roots):
+    best, todo = 0, [(r, 1) for r in roots]
+    while todo:
+        p, d = todo.pop()
+        best = max(best, d)
+        todo += [(c, d + 1) for c in nodes[p]["kids"]]
+    return best
+
+
+def flatten_below(nodes, roots, limit):
+    """Nothing further out than ring `limit`: everything deeper hangs on its ancestor one ring in,
+    so it's drawn in the last ring, next to the process it would have branched from."""
+    todo = [(r, 1, None) for r in roots]
+    while todo:
+        p, d, anchor = todo.pop()
+        if d > limit:
+            nodes[p]["ppid"] = anchor
+        nxt = p if d == limit - 1 else anchor   # the ancestor everything below the last ring hangs on
+        todo += [(c, d + 1, nxt) for c in nodes[p]["kids"]]
+
+
+def header_labels():
+    """What pscircle shows over its lists when it reads /proc itself (with --stdin it leaves them out)."""
+    with open("/proc/loadavg") as f:
+        load = " ".join(f.read().split()[:4])
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            mem[k] = int(v.split()[0]) * 1024
+    total, used = mem["MemTotal"], mem["MemTotal"] - mem.get("MemAvailable", mem.get("MemFree", 0))
+
+    def human(b):
+        for unit in "BKMGT":
+            if b < 1024 or unit == "T":
+                return f"{b:.1f}{unit}"
+            b /= 1024
+    return load, f"{human(used)} / {human(total)}", used / total
+
+
+def label(n):
+    name = (f"{n['n']} * " if n["n"] > 1 else "") + n["name"]
+    out = ""
+    for ch in name.replace(" ", NBSP):
+        if len((out + ch).encode()) > 19:   # pscircle keeps 19 bytes of a name
+            break
+        out += ch
+    return out
+
+
+def main():
+    out = sys.argv[1]
+    w = int(sys.argv[2]) if len(sys.argv) > 2 else 1920
+    h = int(sys.argv[3]) if len(sys.argv) > 3 else 1200
+    s = min(w / 1920, h / 1200)
+    px = lambda v: f"{v * s:.1f}"
+    at = lambda x, y: f"{x * s:.0f}:{y * s:.0f}"
+
+    nodes, busy = measure()
+    roots = build(nodes, {os.getpid()})
+
+    # Rings: the first one is wider, the rest even. They must reach no further than the screen's
+    # top edge and the bar, leaving room for the outermost labels.
+    bar, label_room = 44 * s, 100 * s
+    reach = (h - bar) / 2 - label_room
+    first = 1.4                       # the first ring, in ring widths
+    widest, narrowest = 100 * s, 78 * s
+    d = depth(nodes, roots)
+    ring = reach / (first + d - 1)
+    if ring < narrowest:              # too deep: fold the deepest levels into the last ring
+        d = max(2, int(reach / narrowest - first + 1))
+        flatten_below(nodes, roots, d)
+        ring = reach / (first + d - 1)
+    ring = min(ring, widest)
+
+    load, mem_text, mem_used = header_labels()
+    lines = [f"{pid} {n['ppid']} {n['cpu']:.1f} {n['rss']} {label(n)}" for pid, n in nodes.items()]
+    tmp = out[:-4] + ".drawing.png" if out.endswith(".png") else out + ".drawing"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    subprocess.run([PSCIRCLE, "--stdin=true", f"--output={tmp}", f"--output-width={w}", f"--output-height={h}",
+                    "--interval=0", "--collapse-threads=false", "--max-children=30",
+                    f"--cpulist-bar-value={busy:.3f}", f"--cpulist-label={load}",
+                    f"--memlist-bar-value={mem_used:.3f}", f"--memlist-label={mem_text}",
+                    f"--tree-center={at(40, -22)}", f"--tree-radius-increment={ring * first:.1f},{ring:.1f}",
+                    f"--dot-radius={px(4)}", f"--dot-border-width={px(1.5)}", f"--link-width={px(1.5)}",
+                    "--tree-font-face=Inter", f"--tree-font-size={px(11.5)}",
+                    "--toplists-font-face=Inter", f"--toplists-font-size={px(13)}", f"--toplists-row-height={px(20)}",
+                    f"--toplists-bar-width={px(44)}", f"--toplists-bar-height={px(5)}", f"--toplists-column-padding={px(10)}",
+                    f"--cpulist-center={at(650, -200)}", f"--memlist-center={at(650, 180)}"],
+                   input="\n".join(lines) + "\n", text=True, check=True,
+                   stdout=subprocess.DEVNULL)
+    os.replace(tmp, out)
+
+
+if __name__ == "__main__":
+    main()

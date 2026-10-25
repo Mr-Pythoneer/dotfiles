@@ -1,0 +1,14 @@
+#!/bin/sh
+# Restart once into another system on this laptop, without the F12 menu. Works from Arch and from Fedora:
+# it sets the firmware's BootNext, so the next start goes there and the one after is back to normal.
+#     reboot-to arch | fedora | windows
+case "$1" in
+    arch) label="Linux Boot Manager" ;;   # Arch's systemd-boot
+    fedora) label="Fedora" ;;
+    windows) label="Windows Boot Manager" ;;
+    *) echo "usage: reboot-to arch|fedora|windows" >&2; exit 1 ;;
+esac
+id=$(efibootmgr | awk -v l="$label" -F'\t' '{ sub(/^Boot/, "", $1); n = substr($1, 1, 4); name = substr($1, 5); sub(/^\*? /, "", name); if (name == l) { print n; exit } }')
+[ -n "$id" ] || { echo "no \"$label\" boot entry on this laptop" >&2; exit 1; }
+echo "Restarting into $1 (boot entry $id) once. Your password is for changing the firmware's next boot."
+sudo efibootmgr -q -n "$id" && systemctl reboot

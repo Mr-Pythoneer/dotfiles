@@ -1,0 +1,65 @@
+diff -ruN a/modules/bar/BarWrapper.qml b/modules/bar/BarWrapper.qml
+--- a/modules/bar/BarWrapper.qml	2026-10-12 20:22:05.759449219 -0400
++++ b/modules/bar/BarWrapper.qml	2026-10-12 20:24:48.399981475 -0400
+@@ -29,7 +29,12 @@
+     readonly property int clampedWidth: isHorizontal ? screen.width : Math.max(Config.border.minThickness, implicitWidth)
+     readonly property int clampedHeight: isHorizontal ? Math.max(Config.border.minThickness, implicitHeight) : screen.height
+ 
+-    readonly property int exclusiveZone: !disabled && (Config.bar.persistent || screenState.bar) ? thickness : Config.border.thickness
++    // local: a disabled bar (the rice bar replaced it) leaves no frame edge on its side, so the rice bar can sit flush
++    // against the screen edge without Caelestia's border drawn over it, see ~/.config/caelestia/patches
++    readonly property int edgeThickness: disabled ? 0 : Config.border.thickness
++    // and the drawers open above the rice bar instead of under it (Theme.barHeight in ~/.config/quickshell/rice)
++    readonly property int replacedBy: disabled && !fullscreen ? 42 : 0
++    readonly property int exclusiveZone: !disabled && (Config.bar.persistent || screenState.bar) ? thickness : edgeThickness
+     readonly property bool shouldBeVisible: !fullscreen && !disabled && (Config.bar.persistent || screenState.bar || isHovered)
+     property bool isHovered
+     readonly property Item contentItem: (isHorizontal ? horizontalContent.item : verticalContent.item) as Item
+@@ -56,8 +61,8 @@
+     width: isHorizontal ? screen.width : implicitWidth
+     height: isHorizontal ? implicitHeight : screen.height
+ 
+-    implicitWidth: fullscreen ? 0 : (isHorizontal ? screen.width : Config.border.thickness)
+-    implicitHeight: fullscreen ? 0 : (isHorizontal ? Config.border.thickness : screen.height)
++    implicitWidth: fullscreen ? 0 : (isHorizontal ? screen.width : edgeThickness)
++    implicitHeight: fullscreen ? 0 : (isHorizontal ? edgeThickness : screen.height)
+ 
+     onIsHorizontalChanged: {
+         if (popouts && !popouts.isDetached)
+diff -ruN a/modules/drawers/Panels.qml b/modules/drawers/Panels.qml
+--- a/modules/drawers/Panels.qml	2026-10-12 20:24:48.388093326 -0400
++++ b/modules/drawers/Panels.qml	2026-10-12 20:24:48.400020174 -0400
+@@ -139,7 +139,7 @@
+     anchors.leftMargin: barOnLeft ? bar.implicitWidth : borderThickness
+     anchors.rightMargin: barOnRight ? bar.implicitWidth : borderThickness
+     anchors.topMargin: barOnTop ? bar.implicitHeight : borderThickness
+-    anchors.bottomMargin: barOnBottom ? bar.implicitHeight : borderThickness
++    anchors.bottomMargin: barOnBottom ? Math.max(bar.implicitHeight, bar.replacedBy) : borderThickness // local: bar-off-flush
+ 
+     Connections {
+         function onHasCurrentChanged(): void {
+diff -ruN a/modules/drawers/Regions.qml b/modules/drawers/Regions.qml
+--- a/modules/drawers/Regions.qml	2026-10-12 20:24:48.391910999 -0400
++++ b/modules/drawers/Regions.qml	2026-10-12 20:24:48.400039790 -0400
+@@ -21,10 +21,17 @@
+ 
+     readonly property real clampedThickness: win.contentItem.Config.border.clampedThickness
+ 
+-    x: (barOnLeft ? bar.clampedWidth : clampedThickness) + win.dragMaskPadding
+-    y: (barOnTop ? bar.clampedHeight : clampedThickness) + win.dragMaskPadding
+-    width: win.width - (barOnLeft || barOnRight ? bar.clampedWidth : clampedThickness) - clampedThickness - win.dragMaskPadding * 2
+-    height: win.height - (barOnTop || barOnBottom ? bar.clampedHeight : clampedThickness) - clampedThickness - win.dragMaskPadding * 2
++    // local: the band along each edge that takes the pointer; none along a disabled bar's edge, so the rice bar
++    // there gets every click, see ~/.config/caelestia/patches/bar-off-flush.patch
++    readonly property real leftBand: barOnLeft ? (bar.disabled ? 0 : bar.clampedWidth + win.dragMaskPadding) : clampedThickness + win.dragMaskPadding
++    readonly property real topBand: barOnTop ? (bar.disabled ? 0 : bar.clampedHeight + win.dragMaskPadding) : clampedThickness + win.dragMaskPadding
++    readonly property real rightBand: barOnRight ? (bar.disabled ? 0 : bar.clampedWidth + win.dragMaskPadding) : clampedThickness + win.dragMaskPadding
++    readonly property real bottomBand: barOnBottom ? (bar.disabled ? 0 : bar.clampedHeight + win.dragMaskPadding) : clampedThickness + win.dragMaskPadding
++
++    x: leftBand
++    y: topBand
++    width: win.width - leftBand - rightBand
++    height: win.height - topBand - bottomBand
+     intersection: Intersection.Xor
+ 
+     R {

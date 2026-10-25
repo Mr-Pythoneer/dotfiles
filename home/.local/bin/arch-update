@@ -1,0 +1,154 @@
+#!/bin/bash
+# arch-update — update Arch without breaking the top-bar Caelestia setup.
+#
+#   arch-update                     update everything (official repos + AUR), then repair what needs it
+#   arch-update --check             only check that everything still works, change nothing
+#   arch-update --official-caelestia  switch to the normal Caelestia once it has the bar-position setting
+#
+# Why it exists: three parts of this desktop are built against exact versions of other packages.
+#   quickshell-pinned       Caelestia runs on it; it uses Qt internals, so it's rebuilt after every Qt update
+#   caelestia-shell-topbar  Caelestia with the bar on top (pull request #2076); rebuilt with Quickshell
+#   hymission               the window overview plugin; rebuilt after every Hyprland update
+# Quickshell and caelestia-cli stay frozen at the versions the top bar was tested with,
+# so an update can't pull them out of step with it.
+set -uo pipefail
+
+PKGS=~/.local/share/arch-kit/pkg
+STATE=~/.local/state/arch-update
+LOGS=~/.cache/arch-update; mkdir -p "$LOGS"
+HYMISSION=~/.local/src/hymission
+HYMISSION_COMMIT=f89245e
+mkdir -p "$STATE"
+
+step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()   { printf '    \033[32mok\033[0m      %s\n' "$*"; }
+bad()  { printf '    \033[31mPROBLEM\033[0m %s\n' "$*"; problems+=("$*"); }
+note() { printf '    %s\n' "$*"; }
+problems=()
+ver() { pacman -Q "$1" 2>/dev/null | awk '{print $2}'; }
+
+# Build and install one of the local recipes in ~/.local/share/arch-kit/pkg.
+# Dependencies that aren't in Arch's repos come from the AUR first.
+build_local() {
+    local name=$1 dir=/tmp/arch-update-build/$1 log=$LOGS/$1.log
+    rm -rf "$dir" && mkdir -p /tmp/arch-update-build && cp -r "$PKGS/$name" "$dir" || return 1
+    (
+        cd "$dir" || exit 1
+        deps=$(bash -c 'source ./PKGBUILD; printf "%s\n" "${depends[@]}" "${makedepends[@]}"' | sed 's/[<>=].*//')
+        missing=$(pacman -T $deps)          # what isn't installed (provides count)
+        aur=$(for d in $missing; do pacman -Si "$d" >/dev/null 2>&1 || echo "$d"; done)
+        [ -z "$aur" ] || yay -S --noconfirm --needed --asdeps --answerdiff None --answerclean None --removemake $aur || exit 1
+        makepkg -sif --noconfirm
+    ) >"$log" 2>&1 || return 1
+    # /tmp is in RAM: a finished build left ~2.5 GB behind each time (kept on failure, to look at)
+    rm -rf "$dir"
+}
+
+build_hymission() {
+    local log=$LOGS/hymission.log
+    [ -d "$HYMISSION" ] || git clone -q https://github.com/gfhdhytghd/hymission.git "$HYMISSION"
+    try() {
+        (cd "$HYMISSION" && git fetch -q origin && git checkout -q "$1" \
+            && rm -rf build-cmake && cmake -DCMAKE_BUILD_TYPE=Release -B build-cmake \
+            && cmake --build build-cmake -j"$(nproc)" \
+            && install -Dm755 build-cmake/libhymission.so ~/.local/lib/hyprland/libhymission.so \
+            && install -Dm755 build-cmake/hymission-search-input ~/.local/bin/hymission-search-input) >"$log" 2>&1
+    }
+    # the tested version first; if it no longer compiles against the new Hyprland, the newest one
+    if try "$HYMISSION_COMMIT"; then return 0; fi
+    try origin/HEAD && note "(the tested version didn't build with this Hyprland, so the newest hymission was used)"
+}
+
+check_all() {
+    step "Checking"
+    if quickshell --private-check-compat >/dev/null 2>&1; then ok "Quickshell matches Qt $(ver qt6-base)"
+    else bad "Quickshell needs rebuilding for this Qt version (run: arch-update)"; fi
+    if pacman -Q caelestia-shell-topbar >/dev/null 2>&1 && [ -s /etc/xdg/quickshell/caelestia/shell.qml ]; then ok "Caelestia (top bar) installed"
+    elif pacman -Q caelestia-shell >/dev/null 2>&1; then ok "Caelestia (official) installed"
+    else bad "Caelestia isn't installed properly"; fi
+    if [ -f ~/.local/lib/hyprland/libhymission.so ] && [ "$(cat "$STATE/hymission-built-for" 2>/dev/null)" = "$(ver hyprland)" ]; then
+        ok "Overview plugin built for Hyprland $(ver hyprland)"
+    else bad "Overview plugin isn't built for Hyprland $(ver hyprland) (run: arch-update)"; fi
+    local bars hv; bars=$(ver hyprland-plugin-hyprbars); hv=$(ver hyprland)
+    if [ -n "$bars" ]; then
+        if [ "${bars%%-*}" = "${hv%%-*}" ]; then ok "Title bars match Hyprland ${hv%%-*}"
+        else note "Title bars (hyprbars ${bars%%-*}) were built for another Hyprland; they stay off until the AUR package catches up"; fi
+    fi
+    # judge by exit code: with the Lua config it prints no "config ok", and some builds crash after checking
+    local v rc; v=$(ulimit -c 0; Hyprland --verify-config 2>&1); rc=$?   # no core dump for its known crash
+    v=$(printf '%s\n' "$v" | sed 's/\x1b\[[0-9;]*m//g' | grep -iE 'error|fail' | tail -1)
+    if [ $rc -eq 0 ]; then ok "Hyprland config"
+    elif [ $rc -ge 128 ]; then note "Hyprland config: the checker itself crashed (Hyprland bug), so it couldn't be verified"
+    else bad "Hyprland config: ${v:-invalid (exit $rc)}"; fi
+}
+
+check_upstream() {
+    # Has the bar-position setting reached a normal Caelestia release?
+    local aurver; aurver=$(curl -fsS "https://aur.archlinux.org/rpc/v5/info?arg[]=caelestia-shell" 2>/dev/null | grep -o '"Version":"[^"]*"' | cut -d'"' -f4)
+    [ -z "$aurver" ] && return
+    local tag="v${aurver%-*}"
+    if curl -fsS "https://raw.githubusercontent.com/caelestia-dots/shell/$tag/plugin/src/Caelestia/Config/barconfig.hpp" 2>/dev/null | grep -q 'position'; then
+        step "Good news"
+        note "Caelestia $aurver has the bar-position setting built in."
+        note "Switch to it (and get normal updates again) with:  arch-update --official-caelestia"
+    fi
+}
+
+official_caelestia() {
+    step "Switching to the official Caelestia"
+    sudo sed -i 's/^\(IgnorePkg *=.*\) caelestia-cli/\1/; s/^IgnorePkg *= *$/#IgnorePkg =/' /etc/pacman.conf
+    # build the official ones first, so nothing is removed unless they built fine
+    yay -Sw --noconfirm --answerdiff None --answerclean None quickshell-git caelestia-shell >$LOGS/official.log 2>&1 \
+        || { bad "couldn't build the official packages; nothing was changed (log: $LOGS/official.log)"; return 1; }
+    sudo pacman -Rdd --noconfirm caelestia-shell-topbar quickshell-pinned >/dev/null
+    yay -S --noconfirm --answerdiff None --answerclean None quickshell-git caelestia-cli caelestia-shell >>$LOGS/official.log 2>&1 \
+        || { bad "switch failed (log: $LOGS/official.log); put the top-bar version back with: arch-update --build-local quickshell-pinned && arch-update --build-local caelestia-shell-topbar"; return 1; }
+    note "Your bar setting (\"position\": \"top\" in ~/.config/caelestia/shell.json) carries over."
+    note "Log out and back in to load it."
+}
+
+case "${1:-}" in
+    --check) check_all; check_upstream ;;
+    --build-local)
+        # one automatic retry: a dropped download shouldn't fail the whole setup
+        if build_local "$2"; then ok "$2"
+        else cp "$LOGS/$2.log" "$LOGS/$2.first-try.log"; note "$2: first try failed, retrying once"; sleep 10
+             if build_local "$2"; then ok "$2"; else bad "$2 build failed twice (logs: $LOGS/$2.first-try.log and $LOGS/$2.log)"; fi
+        fi ;;
+    --build-hymission) if build_hymission; then ver hyprland > "$STATE/hymission-built-for"; ok hymission; else bad "hymission build failed (log: $LOGS/hymission.log)"; fi ;;
+    --official-caelestia) official_caelestia; check_all ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    "")
+        qt_before=$(ver qt6-base); hypr_before=$(ver hyprland)
+        # save your configs and scripts first: the post-update check tells your edits from what the update did,
+        # and any file can be put back (update-check --history / --restore)
+        [ -x ~/.local/bin/update-check ] && ~/.local/bin/update-check --snapshot "before update" >/dev/null 2>&1
+        step "Updating (official repos + AUR)"
+        yay -Syu || { echo "The update itself failed; nothing was rebuilt."; exit 1; }
+
+        if pacman -Q quickshell-pinned >/dev/null 2>&1 && { [ "$(ver qt6-base)" != "$qt_before" ] || ! quickshell --private-check-compat >/dev/null 2>&1; }; then
+            step "Qt changed ($qt_before -> $(ver qt6-base)): rebuilding Quickshell and Caelestia (about 10 minutes)"
+            if build_local quickshell-pinned; then ok "Quickshell"; else bad "Quickshell rebuild failed (log: $LOGS/quickshell-pinned.log)"; fi
+            if build_local caelestia-shell-topbar; then ok "Caelestia"; else bad "Caelestia rebuild failed (log: $LOGS/caelestia-shell-topbar.log)"; fi
+        fi
+        if [ "$(ver hyprland)" != "$(cat "$STATE/hymission-built-for" 2>/dev/null)" ]; then
+            step "Hyprland is $(ver hyprland): rebuilding the overview plugin"
+            if build_hymission; then ver hyprland > "$STATE/hymission-built-for"; ok "hymission"
+            else bad "hymission didn't build for this Hyprland; the overview is off until it does (log: $LOGS/hymission.log)"; fi
+        fi
+        check_all
+        check_upstream
+        # what the update may have broken (reboot, failed services, .pacnew, rebuilds, missing files),
+        # fixed straight away: each fix, its follow-ups, then a re-check. Asks before rebooting.
+        if [ -x ~/.local/bin/update-check ]; then
+            step "Post-update check"
+            ~/.local/bin/update-check --after --fix
+        fi
+        if [ "$(ver qt6-base)" != "$qt_before" ] || [ "$(ver hyprland)" != "$hypr_before" ]; then
+            step "Log out and back in (or reboot) to use the updated pieces"
+        fi
+        ;;
+    *) echo "Unknown option $1 (try: arch-update --help)"; exit 1 ;;
+esac
+
+[ ${#problems[@]} -eq 0 ] || { printf '\n%s\n' "Problems found: ${#problems[@]}. Details above."; exit 1; }

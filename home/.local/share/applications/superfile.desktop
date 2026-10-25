@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=superfile
+Comment=Terminal file manager
+Exec=kitty -e spf %f
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileManager;
+MimeType=inode/directory;

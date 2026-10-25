@@ -1,0 +1,72 @@
+Floating bar (rice, 2026-10-11): a horizontal bar is drawn as its own rounded pill, 12px in from the screen
+edges (BarWrapper.floatGap), as a BlobRect in the drawers' blob group so popouts still melt out of it.
+The gap lives inside the bar's own area, so panels/popouts/reserved space keep their geometry.
+Pairs with shell.json border.thickness 0 and border.smoothing 6 (bigger smoothing bridges the gap).
+diff -ruN a/modules/bar/Bar.qml b/modules/bar/Bar.qml
+--- a/modules/bar/Bar.qml	2026-10-11 08:55:58.511797624 -0400
++++ b/modules/bar/Bar.qml	2026-10-11 08:55:58.512614097 -0400
+@@ -19,7 +19,8 @@
+     required property bool fullscreen
+     required property bool isHorizontal
+     required property rect dashboardHitRect
+-    readonly property int axisPadding: Tokens.padding.large
++    property int floatGap // floating bar (local patch): keeps the end entries inside the pill
++    readonly property int axisPadding: Tokens.padding.large + floatGap
+     readonly property int entryCount: repeater.count
+     readonly property var enabledEntries: Config.bar.entries.values.filter(e => e.enabled)
+     readonly property int firstSpacerIndex: enabledEntries.findIndex(e => e.id === "spacer")
+diff -ruN a/modules/bar/BarWrapper.qml b/modules/bar/BarWrapper.qml
+--- a/modules/bar/BarWrapper.qml	2026-10-11 08:55:58.508702427 -0400
++++ b/modules/bar/BarWrapper.qml	2026-10-11 08:55:58.509184990 -0400
+@@ -20,7 +20,11 @@
+     readonly property string position: BarPosition.resolvedPosition(Config.bar.position)
+     readonly property bool isHorizontal: BarPosition.isHorizontal(position)
+ 
+-    readonly property int padding: Math.max(Tokens.padding.small, Config.border.thickness)
++    // Floating bar (local patch): a horizontal bar is drawn as a rounded pill this far in from the
++    // screen edges (see barBg in ContentWindow.qml). The gap is part of the bar's own area, so
++    // panels, popouts and the reserved space keep their usual geometry.
++    readonly property int floatGap: isHorizontal ? 12 : 0
++    readonly property int padding: Math.max(Tokens.padding.small, Config.border.thickness) + floatGap
+     readonly property int thickness: Tokens.sizes.bar.innerWidth + padding * 2
+ 
+     readonly property int contentWidth: isHorizontal ? screen.width : thickness
+@@ -118,6 +122,7 @@
+ 
+         Bar {
+             isHorizontal: root.isHorizontal
++            floatGap: root.floatGap
+             width: root.width
+             height: root.height
+             screen: root.screen
+diff -ruN a/modules/drawers/ContentWindow.qml b/modules/drawers/ContentWindow.qml
+--- a/modules/drawers/ContentWindow.qml	2026-10-11 08:55:58.515048727 -0400
++++ b/modules/drawers/ContentWindow.qml	2026-10-11 08:55:58.515645469 -0400
+@@ -175,8 +175,25 @@
+             radius: root.borderRounding
+             borderLeft: (BarPosition.isLeft(bar.position) ? bar.implicitWidth : root.borderThickness) - anchors.margins - root.sdfBorderOffset
+             borderRight: (BarPosition.isRight(bar.position) ? bar.implicitWidth : root.borderThickness) - anchors.margins - root.sdfBorderOffset
+-            borderTop: (BarPosition.isTop(bar.position) ? bar.implicitHeight : root.borderThickness) - anchors.margins - root.sdfBorderOffset
+-            borderBottom: (BarPosition.isBottom(bar.position) ? bar.implicitHeight : root.borderThickness) - anchors.margins - root.sdfBorderOffset
++            borderTop: (BarPosition.isTop(bar.position) && !bar.floatGap ? bar.implicitHeight : root.borderThickness) - anchors.margins - root.sdfBorderOffset
++            borderBottom: (BarPosition.isBottom(bar.position) && !bar.floatGap ? bar.implicitHeight : root.borderThickness) - anchors.margins - root.sdfBorderOffset
++        }
++
++        // Floating bar (local patch): the horizontal bar is its own pill, inset from the screen edges
++        // by bar.floatGap. It's part of the blob group, so popouts still melt out of it.
++        BlobRect {
++            id: barBg
++
++            readonly property real gap: bar.floatGap
++
++            group: blobGroup
++            visible: gap > 0 && bar.visible && bar.height > gap * 2
++            x: gap
++            y: bar.y + gap
++            implicitWidth: root.width - gap * 2
++            implicitHeight: Math.max(0, bar.height - gap * 2)
++            radius: height / 2
++            deformScale: (0.05 * Config.appearance.deformScale) / 10000
+         }
+ 
+         PanelBg {

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily update check (repos, AUR, Arch news, system health)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/update-check --daily
+# the notification-click waiter is forked off and must outlive the service
+KillMode=process
+TimeoutStartSec=infinity

@@ -1,0 +1,62 @@
+Media widget shows a random meme GIF from ~/.config/caelestia/media-gifs (falls back to bongo cat).
+Re-picks on every track change.
+--- a/modules/dashboard/dash/Media.qml
++++ b/modules/dashboard/dash/Media.qml
+@@ -1,6 +1,7 @@
+ pragma ComponentBehavior: Bound
+ 
+ import QtQuick
++import Qt.labs.folderlistmodel
+ import Caelestia.Components
+ import Caelestia.Config
+ import Caelestia.I18n
+@@ -172,10 +173,48 @@
+         anchors.bottomMargin: Tokens.padding.large
+         anchors.margins: Tokens.padding.extraLargeIncreased
+ 
++        property string randomGif: ""
++
++        // Random meme from ~/.config/caelestia/media-gifs: pick a meme (files grouped by the name
++        // before the first "-" or "."), then one of its files, so a meme with many GIFs isn't favoured.
++        function pickRandom(): void {
++            const groups = {};
++            for (let i = 0; i < memeGifs.count; i++) {
++                const name = memeGifs.get(i, "fileName");
++                const key = name.split(/[-.]/)[0];
++                (groups[key] = groups[key] ?? []).push(memeGifs.get(i, "filePath"));
++            }
++            const keys = Object.keys(groups);
++            if (!keys.length) {
++                randomGif = "";
++                return;
++            }
++            const files = groups[keys[Math.floor(Math.random() * keys.length)]];
++            randomGif = files[Math.floor(Math.random() * files.length)];
++        }
++
+         playing: Players.active?.isPlaying ?? false
+         speed: Audio.beatTracker.bpm / Config.general.mediaGifSpeedAdjustment // qmllint disable unresolved-type
+-        source: Paths.absolutePath(Config.paths.mediaGif)
++        source: randomGif || Paths.absolutePath(Config.paths.mediaGif)
+         asynchronous: true
+         fillMode: AnimatedImage.PreserveAspectFit
++
++        FolderListModel {
++            id: memeGifs
++
++            folder: `file://${Paths.config}/media-gifs`
++            nameFilters: ["*.gif", "*.webp"]
++            showDirs: false
++            onStatusChanged: if (status === FolderListModel.Ready) bongocat.pickRandom()
++        }
++
++        Connections {
++            target: Players.active
++            ignoreUnknownSignals: true
++
++            function onTrackTitleChanged(): void {
++                bongocat.pickRandom();
++            }
++        }
+     }
+ }

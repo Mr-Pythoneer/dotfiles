@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""larp - fake terminal "hacker" session that looks like the real thing.
+
+Usage: larp            run until ESC is pressed
+       larp <seconds>  run for that many seconds (ESC still exits early)
+
+Nothing here touches the network or your system. It only prints text.
+"""
+import os
+import random
+import select
+import shutil
+import string
+import sys
+import termios
+import time
+import tty
+
+# ----- palette (kept subtle: real terminals aren't a rainbow) -----------
+RST = "\033[0m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+GRN = "\033[32m"
+RED = "\033[31m"
+YEL = "\033[33m"
+BLU = "\033[34m"
+CYN = "\033[36m"
+MAG = "\033[35m"
+WHT = "\033[37m"
+
+deadline = None
+fd = sys.stdin.fileno()
+interactive = sys.stdin.isatty()
+
+USER = os.environ.get("USER", "root")
+HOST = "kali"
+CWD = "~"
+
+
+class Stop(Exception):
+    pass
+
+
+def size():
+    s = shutil.get_terminal_size((100, 30))
+    return s.columns, s.lines
+
+
+def out(s):
+    sys.stdout.write(s)
+    sys.stdout.flush()
+
+
+def wait(t):
+    """Sleep t seconds, bailing on lone ESC or when the timer expires."""
+    end = time.time() + t
+    while True:
+        now = time.time()
+        if deadline is not None and now >= deadline:
+            raise Stop
+        remaining = end - now
+        if deadline is not None:
+            remaining = min(remaining, deadline - now)
+        if remaining <= 0:
+            return
+        if not interactive:
+            time.sleep(remaining)
+            continue
+        r, _, _ = select.select([fd], [], [], remaining)
+        if r:
+            data = os.read(fd, 64)
+            if data == b"\x1b":  # lone ESC; arrow keys send ESC + more bytes
+                raise Stop
+
+
+# ----- random data helpers ----------------------------------------------
+def rip(local=False):
+    if local:
+        return f"192.168.{random.randint(0,4)}.{random.randint(2,254)}"
+    return ".".join(str(random.randint(1, 254)) for _ in range(4))
+
+
+def rhex(n):
+    return "".join(random.choice("0123456789abcdef") for _ in range(n))
+
+
+def rmac():
+    return ":".join(rhex(2) for _ in range(6))
+
+
+def now_ts():
+    return time.strftime("%b %d %H:%M:%S")
+
+
+# ----- shell look --------------------------------------------------------
+def prompt():
+    return (f"{BOLD}{GRN}{USER}@{HOST}{RST}:{BOLD}{BLU}{CWD}{RST}$ ")
+
+
+def type_cmd(cmd):
+    """Draw the prompt and 'type' the command with human-ish jitter."""
+    out(prompt())
+    for ch in cmd:
+        out(ch)
+        wait(random.uniform(0.02, 0.075) if ch != " " else random.uniform(0.05, 0.12))
+    wait(random.uniform(0.15, 0.5))  # pause before hitting enter
+    out("\n")
+
+
+def line(s="", delay=(0.0, 0.02)):
+    out(s + "\n")
+    wait(random.uniform(*delay))
+
+
+def clip(s):
+    return s[: size()[0] - 1]
+
+
+# ----- progress bars / spinners -----------------------------------------
+SPIN = "|/-\\"
+
+
+def download(name, total_kb):
+    """wget/curl-style download bar."""
+    w = min(38, max(12, size()[0] - 48))
+    got = 0
+    start = time.time()
+    while got < total_kb:
+        got = min(total_kb, got + random.randint(total_kb // 40 + 1, total_kb // 8 + 1))
+        pct = got * 100 // total_kb
+        filled = w * pct // 100
+        speed = random.uniform(1.2, 11.5)
+        eta = int((total_kb - got) / (speed * 1024) + 0.5)
+        bar = "=" * max(0, filled - 1) + (">" if filled else "") + " " * (w - filled)
+        out(f"\r{name:<20.20} {pct:3d}%[{GRN}{bar}{RST}] "
+            f"{got/1024:6.1f}K  {speed:4.1f}MB/s  eta {eta:2d}s")
+        wait(random.uniform(0.03, 0.11))
+    dur = time.time() - start
+    out(f"\r{name:<20.20} 100%[{GRN}{'='*w}{RST}] "
+        f"{total_kb/1024:6.1f}K  --.-MB/s  in {dur:3.1f}s\n")
+
+
+def spinner(label, secs):
+    end = time.time() + secs
+    i = 0
+    while time.time() < end:
+        out(f"\r {CYN}{SPIN[i % 4]}{RST} {label}")
+        i += 1
+        wait(0.08)
+    out(f"\r {GRN}✓{RST} {label}\n")
+
+
+# ========================================================================
+#  fake commands — each returns realistic-looking output
+# ========================================================================
+SERVICES = [
+    (22, "ssh", "OpenSSH 8.9p1 Ubuntu-3ubuntu0.4"),
+    (80, "http", "Apache httpd 2.4.52 ((Ubuntu))"),
+    (443, "https", "nginx 1.18.0"),
+    (3306, "mysql", "MySQL 8.0.34-0ubuntu0.22.04.1"),
+    (5432, "postgresql", "PostgreSQL DB 14.9 - 16.0"),
+    (6379, "redis", "Redis key-value store 7.0.11"),
+    (8080, "http-proxy", "Jetty 9.4.43.v20210629"),
+    (21, "ftp", "vsftpd 3.0.5"),
+    (25, "smtp", "Postfix smtpd"),
+    (139, "netbios-ssn", "Samba smbd 4.6.2"),
+    (445, "microsoft-ds", "Samba smbd 4.6.2"),
+    (3389, "ms-wbt-server", "xrdp"),
+]
+
+
+def cmd_nmap():
+    tgt = rip(local=True)
+    type_cmd(f"nmap -sV -sC -T4 {tgt}")
+    line(f"Starting Nmap 7.94 ( https://nmap.org ) at {time.strftime('%Y-%m-%d %H:%M')} UTC")
+    spinner(f"Scanning {tgt} [1000 ports]", random.uniform(1.5, 3))
+    line(f"Nmap scan report for {tgt}")
+    line(f"Host is up ({random.uniform(0.00012, 0.004):.5f}s latency).")
+    chosen = sorted(random.sample(SERVICES, random.randint(4, 7)))
+    line("PORT     STATE SERVICE       VERSION")
+    for port, svc, ver in chosen:
+        line(f"{str(port)+'/tcp':<8} {GRN}open{RST}  {svc:<13} {ver}", (0.03, 0.12))
+    line(f"MAC Address: {rmac().upper()} (Unknown)")
+    line("Service detection performed. Please report any incorrect results.")
+    line(f"Nmap done: 1 IP address (1 host up) scanned in {random.uniform(6,40):.2f} seconds")
+
+
+def cmd_git():
+    repo = random.choice(["exploit-db/searchsploit", "SecureAuth/impacket",
+                          "danielmiessler/SecLists", "swisskyrepo/PayloadsAllTheThings"])
+    type_cmd(f"git clone https://github.com/{repo}.git")
+    name = repo.split("/")[-1]
+    line(f"Cloning into '{name}'...")
+    line(f"remote: Enumerating objects: {random.randint(5000,90000)}, done.")
+    n = random.randint(4000, 80000)
+    for pct in (7, 23, 46, 68, 84, 97, 100):
+        out(f"\rremote: Counting objects: {pct}% ({n*pct//100}/{n})")
+        wait(random.uniform(0.05, 0.2))
+    out(f"\rremote: Counting objects: 100% ({n}/{n}), done.\n")
+    download("Receiving objects", random.randint(40000, 400000))
+    line(f"Resolving deltas: 100% ({random.randint(2000,40000)}/{random.randint(2000,40000)}), done.")
+
+
+def cmd_make():
+    type_cmd(random.choice(["make -j$(nproc)", "gcc -O2 -o exploit exploit.c",
+                            "cc -Wall -o rootkit rootkit.c"]))
+    files = ["main.c", "net.c", "crypto.c", "payload.c", "shell.c", "util.c",
+             "elf.c", "inject.c", "hook.c", "ptrace.c"]
+    for f in random.sample(files, random.randint(4, 8)):
+        o = f[:-2] + ".o"
+        line(f"{DIM}gcc -c -O2 -Wall -fPIC {f} -o {o}{RST}", (0.05, 0.18))
+        if random.random() < 0.35:
+            ln = random.randint(20, 400)
+            line(f"{f}:{ln}:{random.randint(2,40)}: {MAG}warning:{RST} "
+                 f"unused variable '{random.choice(['tmp','ctx','ret','buf','len'])}' "
+                 f"[{YEL}-Wunused-variable{RST}]")
+    line(f"{DIM}gcc -O2 -o {random.choice(['exploit','rootkit','payload'])} *.o -lssl -lcrypto -lpthread{RST}")
+    line(f"{GRN}Build finished successfully.{RST}")
+
+
+def cmd_ssh():
+    tgt = rip(local=True)
+    user = random.choice(["admin", "root", "svc_backup", "deploy"])
+    type_cmd(f"ssh {user}@{tgt}")
+    line(f"The authenticity of host '{tgt} ({tgt})' can't be established.")
+    line(f"ED25519 key fingerprint is SHA256:{''.join(random.choice(string.ascii_letters+string.digits+'+/') for _ in range(43))}.")
+    type_cmd("yes")
+    line(f"Warning: Permanently added '{tgt}' (ED25519) to the list of known hosts.")
+    wait(random.uniform(0.3, 0.8))
+    line(f"{user}@{tgt}'s password: ")
+    wait(random.uniform(0.4, 1.0))
+    line("Linux target-web-01 5.15.0-89-generic #99-Ubuntu SMP x86_64 GNU/Linux")
+    line(f"Last login: {now_ts()} from {rip()}")
+    line(f"{BOLD}{RED}{user}@target-web-01{RST}:~# {DIM}id{RST}")
+    line(f"uid=0({user}) gid=0(root) groups=0(root)")
+
+
+def cmd_hydra():
+    tgt = rip(local=True)
+    svc = random.choice(["ssh", "ftp", "http-post-form"])
+    type_cmd(f"hydra -l admin -P rockyou.txt {tgt} {svc}")
+    line("Hydra v9.5 (c) 2023 by van Hauser/THC & David Maciejak")
+    line(f"[DATA] max 16 tasks per 1 server, overall 16 tasks, {random.randint(100000,14000000)} login tries")
+    line(f"[DATA] attacking {svc}://{tgt}:{22 if svc=='ssh' else 21}/")
+    tries = 0
+    for _ in range(random.randint(6, 12)):
+        tries += random.randint(2000, 90000)
+        rate = random.randint(400, 2200)
+        out(f"\r[STATUS] {tries} tries/min, {tries} done, remaining, {rate} c/s")
+        wait(random.uniform(0.15, 0.45))
+    out("\n")
+    pw = random.choice(["Summer2023!", "P@ssw0rd", "letmein123", "admin@123", "qwerty!@#"])
+    line(f"[{22 if svc=='ssh' else 21}][{svc}] host: {tgt}   {GRN}login: admin   password: {pw}{RST}")
+    line("1 of 1 target successfully completed, 1 valid password found")
+
+
+def cmd_tcpdump():
+    iface = random.choice(["eth0", "wlan0", "tun0"])
+    type_cmd(f"tcpdump -i {iface} -nn -c 40")
+    line(f"tcpdump: verbose output suppressed, use -v[v]... for full protocol decode")
+    line(f"listening on {iface}, link-type EN10MB (Ethernet), snapshot length 262144 bytes")
+    for _ in range(random.randint(18, 34)):
+        ts = time.strftime("%H:%M:%S") + f".{random.randint(0,999999):06d}"
+        a, b = rip(local=True), rip()
+        pa, pb = random.randint(1024, 65535), random.choice([443, 80, 53, 22, 8080, 3306])
+        flags = random.choice(["[S]", "[S.]", "[.]", "[P.]", "[F.]", "[R.]"])
+        ln = random.randint(0, 1460)
+        proto = random.choice(["Flags", "Flags", "Flags", "UDP,"])
+        if proto == "UDP,":
+            line(f"{ts} IP {a}.{pa} > {b}.53: UDP, length {random.randint(30,90)}", (0.02, 0.09))
+        else:
+            line(f"{ts} IP {a}.{pa} > {b}.{pb}: Flags {flags}, "
+                 f"seq {random.randint(0,4_000_000_000)}, win {random.randint(64,65535)}, length {ln}", (0.02, 0.09))
+    line("40 packets captured")
+    line(f"{random.randint(40,120)} packets received by filter")
+
+
+def cmd_sqlmap():
+    tgt = f"http://{rip(local=True)}/product.php?id=1"
+    type_cmd(f"sqlmap -u \"{tgt}\" --batch --dbs")
+    line(f"        {RED}___{RST}")
+    line(f" {RED}__H__{RST}")
+    line(f" ___ ___[.]_____ ___ ___  {{1.7.11#stable}}")
+    line(f"|_ -| . [']     | .'| . |")
+    line(f"|___|_  [\"]_|_|_|__,|  _|")
+    line(f"      |_|V...       |_|   https://sqlmap.org")
+    line("")
+    spinner("testing connection to the target URL", 1.2)
+    line(f"[{now_ts()}] [INFO] testing if the target URL content is stable")
+    line(f"[{now_ts()}] [INFO] GET parameter 'id' appears to be injectable")
+    line(f"[{now_ts()}] [INFO] testing for SQL injection on GET parameter 'id'")
+    line(f"[{now_ts()}] [{GRN}INFO{RST}] GET parameter 'id' is '{BOLD}MySQL >= 5.6 boolean-based blind{RST}' injectable")
+    line(f"[{now_ts()}] [INFO] the back-end DBMS is MySQL")
+    spinner("fetching database names", 1.4)
+    line("available databases [4]:")
+    for db in ["information_schema", "mysql", "webapp", "customers"]:
+        line(f"[*] {db}", (0.05, 0.15))
+
+
+def cmd_msf():
+    type_cmd("msfconsole -q")
+    line(f"       =[ metasploit v6.3.42-dev                          ]")
+    line(f"+ -- --=[ 2372 exploits - 1233 auxiliary - 413 post       ]")
+    line(f"+ -- --=[ 1391 payloads - 46 encoders - 11 nops           ]")
+    line("")
+    exp = "exploit/multi/http/apache_normalize_path_rce"
+    type_cmd(f"use {exp}")
+    tgt = rip(local=True)
+    type_cmd(f"set RHOSTS {tgt}")
+    line(f"RHOSTS => {tgt}")
+    type_cmd(f"set LHOST {rip(local=True)}")
+    type_cmd("run")
+    line(f"[*] Started reverse TCP handler on {rip(local=True)}:4444")
+    spinner(f"Executing automatic check against {tgt}", 1.3)
+    line(f"[{GRN}+{RST}] {tgt}:80 - The target is vulnerable.")
+    line(f"[*] Sending stage ({random.randint(180000,220000)} bytes) to {tgt}")
+    wait(random.uniform(0.4, 1.0))
+    line(f"[{GRN}*{RST}] Meterpreter session 1 opened ({rip(local=True)}:4444 -> {tgt}:{random.randint(40000,60000)})")
+    line("")
+    type_cmd("getuid")
+    line("Server username: www-data")
+    type_cmd("sysinfo")
+    line("Computer     : target-web-01")
+    line("OS           : Ubuntu 22.04 (Linux 5.15.0-89-generic)")
+    line("Meterpreter  : x64/linux")
+
+
+def cmd_dmesg():
+    type_cmd("dmesg -T | tail -20")
+    boot = time.time()
+    msgs = [
+        "audit: type=1400 apparmor=\"STATUS\" operation=\"profile_load\"",
+        "TCP: request_sock_TCP: Possible SYN flooding on port 443. Sending cookies.",
+        f"eth0: renamed from veth{rhex(4)}",
+        "IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready",
+        f"Out of memory: Killed process {random.randint(1000,9999)} (chrome)",
+        "usb 1-1: new high-speed USB device number 4 using xhci_hcd",
+        f"docker0: port 1(veth{rhex(4)}) entered forwarding state",
+        "nf_conntrack: nf_conntrack: table full, dropping packet",
+        "EXT4-fs (sda1): mounted filesystem with ordered data mode",
+        f"[UFW BLOCK] IN=eth0 SRC={rip()} DST={rip(local=True)} PROTO=TCP SPT={random.randint(1024,65535)} DPT=22",
+    ]
+    for m in random.sample(msgs, len(msgs)):
+        ts = time.strftime("%a %b %d %H:%M:%S %Y", time.localtime(boot - random.randint(1, 9000)))
+        line(f"[{ts}] {m}", (0.03, 0.14))
+
+
+def cmd_docker():
+    img = random.choice(["kalilinux/kali-rolling", "vulnerables/web-dvwa", "alpine:latest"])
+    type_cmd(f"docker pull {img}")
+    line("Using default tag: latest")
+    line(f"latest: Pulling from {img}")
+    layers = [rhex(12) for _ in range(random.randint(4, 7))]
+    for lyr in layers:
+        for st in ["Pulling fs layer", "Downloading", "Extracting", "Pull complete"]:
+            out(f"\r{lyr}: {st}" + " " * 20)
+            wait(random.uniform(0.1, 0.35))
+        out("\n")
+    line(f"Digest: sha256:{rhex(64)}")
+    line(f"Status: Downloaded newer image for {img}")
+
+
+def cmd_crack():
+    type_cmd("hashcat -m 1800 -a 0 hashes.txt rockyou.txt --status")
+    line("hashcat (v6.2.6) starting")
+    line("OpenCL API (OpenCL 3.0) - Platform #1 [NVIDIA]")
+    line("* Device #1: NVIDIA GeForce RTX 4090, 24564/24564 MB")
+    line("")
+    line("Dictionary cache built. 14,344,385 words.")
+    target = random.choice(["Password1!", "monkey123", "iloveyou2", "Dragon#99"])
+    for _ in range(random.randint(4, 7)):
+        speed = random.uniform(4.5, 42.0)
+        rec = random.uniform(1, 96)
+        line(f"Speed.#1.........: {speed:6.1f} MH/s   "
+             f"Recovered........: {random.randint(0,4)}/5   "
+             f"Progress.........: {rec:4.1f}%", (0.2, 0.6))
+    line(f"$6${rhex(16)}...:{GRN}{target}{RST}")
+    line("Session..........: hashcat   Status...........: Cracked")
+
+
+COMMANDS = [
+    cmd_nmap, cmd_git, cmd_make, cmd_ssh, cmd_hydra, cmd_tcpdump,
+    cmd_sqlmap, cmd_msf, cmd_dmesg, cmd_docker, cmd_crack,
+]
+
+
+def run():
+    # a plausible opening
+    line(f"Last login: {now_ts()} on pts/0")
+    wait(0.4)
+    last = None
+    while True:
+        c = random.choice([x for x in COMMANDS if x is not last])
+        last = c
+        c()
+        # settle, then a blank line before the next prompt, like a real session
+        wait(random.uniform(0.6, 1.6))
+        out("\n")
+
+
+def main():
+    global deadline
+    args = sys.argv[1:]
+    if len(args) > 1 or (args and args[0] in ("-h", "--help")):
+        print(__doc__.strip())
+        return 0
+    if args:
+        try:
+            secs = float(args[0])
+            if secs <= 0:
+                raise ValueError
+        except ValueError:
+            print(f"larp: '{args[0]}' is not a positive number of seconds", file=sys.stderr)
+            return 1
+        deadline = time.time() + secs
+
+    old = termios.tcgetattr(fd) if interactive else None
+    try:
+        if interactive:
+            tty.setcbreak(fd)
+        out("\033[?1049h\033[?25l\033[2J\033[H")  # alt screen, hide cursor, clear
+        out("\033[?25h")  # keep a visible cursor — real terminals have one
+        run()
+    except (Stop, KeyboardInterrupt):
+        pass
+    finally:
+        out(RST + "\033[?25h\033[?1049l")  # restore cursor + main screen
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

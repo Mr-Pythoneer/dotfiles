@@ -1,0 +1,59 @@
+Fix the crash when a monitor is unplugged (or drops out on suspend/wake).
+
+Upstream issue: https://github.com/quickshell-mirror/quickshell/issues/910 (open as of 2026-10-18).
+
+When a screen goes away the compositor closes its layer surfaces, Quickshell detaches each
+window's content item and deletes the window. An item that is the source of a
+ShaderEffectSource (Caelestia's desktop clock blurs `behindClock`, the wallpaper) keeps one
+extra reference to that window, so it keeps a dangling window pointer; when the per-screen
+delegate is destroyed a moment later, Qt derefs the freed window and segfaults in
+QQuickWindowPrivate::cleanup(). The fix drops any references to the old window still left in
+the content tree right after detaching it.
+
+Reproduced and verified in a nested Hyprland with `hyprctl output create/remove headless`:
+stock build crashes on the first unplug, patched build survived 60+ unplugs incl. rapid flaps.
+
+diff --git a/src/window/proxywindow.cpp b/src/window/proxywindow.cpp
+index bc0181c..c99ec0c 100644
+--- a/src/window/proxywindow.cpp
++++ b/src/window/proxywindow.cpp
+@@ -1,6 +1,7 @@
+ #include "proxywindow.hpp"
+ #include <functional>
+ 
++#include <private/qquickitem_p.h>
+ #include <private/qquickwindow_p.h>
+ #include <qcontainerfwd.h>
+ #include <qcoreevent.h>
+@@ -33,6 +34,23 @@
+ #include "../debug/lint.hpp"
+ #include "windowinterface.hpp"
+ 
++namespace {
++
++// Detaching the content item from a window derefs every item under it, but an item can hold more
++// than one reference to its window (shader effect sources and layers take extra ones on their
++// source item). If those aren't all given back before the window is deleted, the item keeps a
++// dangling window pointer and crashes Qt when it is later reparented or destroyed, which is what
++// happens when a screen is removed (layer surface closed, then its windows destroyed).
++// Drop whatever references to the old window are still left in the tree.
++void releaseStaleWindowRefs(QQuickItem* item, QQuickWindow* window) {
++	auto* d = QQuickItemPrivate::get(item);
++	while (d->window == window) d->derefWindow();
++
++	for (auto* child: d->childItems) releaseStaleWindowRefs(child, window);
++}
++
++} // namespace
++
+ ProxyWindowBase::ProxyWindowBase(QObject* parent)
+     : Reloadable(parent)
+     , mContentItem(new ProxyWindowContentItem()) {
+@@ -185,6 +203,7 @@ ProxiedWindow* ProxyWindowBase::disownWindow(bool keepItemOwnership) {
+ 
+ 	if (!keepItemOwnership) {
+ 		this->mContentItem->setParentItem(nullptr);
++		releaseStaleWindowRefs(this->mContentItem, this->window);
+ 	}
+ 
+ 	auto* window = this->window;

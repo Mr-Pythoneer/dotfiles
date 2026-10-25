@@ -1,0 +1,53 @@
+--- a/services/Brightness.qml	2026-10-12 06:48:32.200634624 -0400
++++ b/services/Brightness.qml	2026-10-12 06:48:54.177943877 -0400
+@@ -19,6 +19,10 @@
+     }
+     readonly property list<Monitor> monitors: variants.instances // qmllint disable incompatible-type
+     property bool appleDisplayPresent: false
++    // local: the backlight brightnessctl drives, watched so changes made outside the shell
++    // (the F5/F6 keys run brightnessctl) move the OSD too, see ~/.config/caelestia/patches
++    property string backlight: ""
++    property int backlightMax: 0
+ 
+     function getMonitorForScreen(screen: ShellScreen): var {
+         return monitors.find(m => m.modelData === screen); // qmllint disable missing-property
+@@ -74,6 +78,20 @@
+ 
+     Process {
+         running: true
++        command: ["sh", "-c", "d=$(ls /sys/class/backlight | head -n1); [ -n \"$d\" ] && echo \"$d $(cat /sys/class/backlight/$d/max_brightness)\""]
++        stdout: StdioCollector {
++            onStreamFinished: {
++                const [name, max] = text.trim().split(" ");
++                if (name && parseInt(max) > 0) {
++                    root.backlightMax = parseInt(max);
++                    root.backlight = name;
++                }
++            }
++        }
++    }
++
++    Process {
++        running: true
+         command: ["sh", "-c", "asdbctl get"] // To avoid warnings if asdbctl is not installed
+         stdout: StdioCollector {
+             onStreamFinished: root.appleDisplayPresent = text.trim().length > 0
+@@ -186,6 +204,18 @@
+             }
+         }
+ 
++        // local: follow the backlight file, whoever changes it
++        readonly property FileView backlightFile: FileView {
++            path: !monitor.isDdc && !monitor.isAppleDisplay && root.backlight ? `/sys/class/backlight/${root.backlight}/brightness` : ""
++            watchChanges: true
++            onFileChanged: reload()
++            onLoaded: {
++                const cur = parseInt(text());
++                if (!isNaN(cur) && root.backlightMax > 0 && Math.abs(cur / root.backlightMax - monitor.brightness) > 0.0002)
++                    monitor.brightness = cur / root.backlightMax;
++            }
++        }
++
+         readonly property Timer timer: Timer {
+             interval: 500
+             onTriggered: {

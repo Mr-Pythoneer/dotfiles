@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boardroom-ai"
+version = "0.1.0"
+description = "Run a company of AI agents: connect your AI accounts and get a CEO, a debugger and workers that delegate work and spawn subagents."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["ai", "agents", "multi-agent", "llm", "claude", "openai", "deepseek", "orchestration"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mr-Pythoneer/boardroom"
+Issues = "https://github.com/Mr-Pythoneer/boardroom/issues"
+Changelog = "https://github.com/Mr-Pythoneer/boardroom/blob/main/CHANGELOG.md"
+
+[project.scripts]
+boardroom = "boardroom.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["boardroom*"]
+
+[tool.setuptools.package-data]
+boardroom = ["web/*"]

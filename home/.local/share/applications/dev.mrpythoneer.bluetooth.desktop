@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Bluetooth
+GenericName=Bluetooth Manager
+Comment=Connect, pair and fix Bluetooth devices
+Exec=/home/mrpythoneer/.local/bin/bluetooth-manager
+Icon=bluetooth
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=bluetooth;headphones;mouse;pair;
+StartupWMClass=dev.mrpythoneer.bluetooth

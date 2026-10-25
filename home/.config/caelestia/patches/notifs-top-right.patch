@@ -1,0 +1,152 @@
+diff -ru etc/xdg/quickshell/caelestia/modules/drawers/Panels.qml home/mrpythoneer/.config/quickshell/caelestia/modules/drawers/Panels.qml
+--- a/modules/drawers/Panels.qml	2026-10-04 18:35:04.000000000 -0400
++++ b/modules/drawers/Panels.qml	2026-10-05 21:42:49.030058476 -0400
+@@ -297,7 +297,7 @@
+     Toasts.Toasts {
+         id: toasts
+ 
+-        anchors.bottom: root.barOnBottom || sidebar.visible ? parent.bottom : utilities.top
++        anchors.top: notifications.bottom
+         x: root.barOnRight ? sidebar.x + sidebar.width + anchors.margins : sidebar.x - width - anchors.margins
+         anchors.margins: Tokens.padding.medium
+     }
+diff -ru etc/xdg/quickshell/caelestia/modules/notifications/Notification.qml home/mrpythoneer/.config/quickshell/caelestia/modules/notifications/Notification.qml
+--- a/modules/notifications/Notification.qml	2026-10-04 18:35:04.000000000 -0400
++++ b/modules/notifications/Notification.qml	2026-10-05 21:42:49.029914427 -0400
+@@ -250,7 +250,7 @@
+                 text: root.modelData.appName
+                 font: appName.font
+                 elide: Text.ElideRight
+-                elideWidth: expandBtn.x - time.width - timeSep.width - summary.x - root.Tokens.spacing.small * 3
++                elideWidth: closeBtn.x - time.width - timeSep.width - summary.x - root.Tokens.spacing.small * 3
+             }
+ 
+             StyledText {
+@@ -304,7 +304,7 @@
+                 text: root.modelData.summary
+                 font: summary.font
+                 elide: Text.ElideRight
+-                elideWidth: expandBtn.x - time.width - timeSep.width - summary.x - root.Tokens.spacing.small * 3
++                elideWidth: closeBtn.x - time.width - timeSep.width - summary.x - root.Tokens.spacing.small * 3
+             }
+ 
+             StyledText {
+@@ -348,6 +348,31 @@
+             }
+ 
+             Item {
++                id: closeBtn
++
++                anchors.right: expandBtn.left
++                anchors.top: parent.top
++                anchors.topMargin: -Tokens.padding.extraSmall
++
++                implicitWidth: closeIcon.implicitHeight
++                implicitHeight: closeIcon.implicitHeight
++
++                StateLayer {
++                    radius: Tokens.rounding.full
++                    color: root.modelData.urgency === NotificationUrgency.Critical ? Colours.palette.m3onSecondaryContainer : Colours.palette.m3onSurface
++                    onClicked: root.modelData.close()
++                }
++
++                MaterialIcon {
++                    id: closeIcon
++
++                    anchors.centerIn: parent
++                    text: "close"
++                    fontStyle: Tokens.font.icon.medium
++                }
++            }
++
++            Item {
+                 id: expandBtn
+ 
+                 anchors.right: parent.right
+@@ -386,7 +411,7 @@
+                 id: bodyPreview
+ 
+                 anchors.left: summary.left
+-                anchors.right: expandBtn.left
++                anchors.right: closeBtn.left
+                 anchors.top: summary.bottom
+                 anchors.rightMargin: Tokens.spacing.small
+ 
+@@ -418,7 +443,7 @@
+                 id: body
+ 
+                 anchors.left: summary.left
+-                anchors.right: expandBtn.left
++                anchors.right: closeBtn.left
+                 anchors.top: summary.bottom
+                 anchors.rightMargin: Tokens.spacing.small
+ 
+diff -ru etc/xdg/quickshell/caelestia/modules/utilities/toasts/ToastItem.qml home/mrpythoneer/.config/quickshell/caelestia/modules/utilities/toasts/ToastItem.qml
+--- a/modules/utilities/toasts/ToastItem.qml	2026-10-04 18:35:04.000000000 -0400
++++ b/modules/utilities/toasts/ToastItem.qml	2026-10-05 21:42:49.030085031 -0400
+@@ -128,6 +128,26 @@
+                 elide: Text.ElideRight
+             }
+         }
++
++        Item {
++            implicitWidth: closeIcon.implicitHeight
++            implicitHeight: closeIcon.implicitHeight
++
++            StateLayer {
++                radius: Tokens.rounding.full
++                color: title.color
++                onClicked: root.modelData.close()
++            }
++
++            MaterialIcon {
++                id: closeIcon
++
++                anchors.centerIn: parent
++                text: "close"
++                color: title.color
++                fontStyle: Tokens.font.icon.medium
++            }
++        }
+     }
+ 
+     Behavior on border.color {
+diff -ru etc/xdg/quickshell/caelestia/modules/utilities/toasts/Toasts.qml home/mrpythoneer/.config/quickshell/caelestia/modules/utilities/toasts/Toasts.qml
+--- a/modules/utilities/toasts/Toasts.qml	2026-10-04 18:35:04.000000000 -0400
++++ b/modules/utilities/toasts/Toasts.qml	2026-10-05 21:42:49.030014626 -0400
+@@ -81,7 +81,7 @@
+         opacity: modelData.closed || previewHidden ? 0 : 1
+         scale: modelData.closed || previewHidden ? 0.7 : 1
+ 
+-        anchors.bottomMargin: {
++        anchors.topMargin: {
+             root.flag; // Force update
+             let y = 0;
+             for (let i = 0; i < index; i++) {
+@@ -94,7 +94,7 @@
+ 
+         anchors.left: parent.left
+         anchors.right: parent.right
+-        anchors.bottom: parent.bottom
++        anchors.top: parent.top
+         implicitHeight: toastInner.implicitHeight
+ 
+         acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
+@@ -115,7 +115,7 @@
+ 
+         ParallelAnimation {
+             running: toast.modelData.closed
+-            onStarted: toast.anchors.bottomMargin = toast.anchors.bottomMargin
++            onStarted: toast.anchors.topMargin = toast.anchors.topMargin
+             onFinished: toast.modelData.unlock(toast)
+ 
+             Anim {
+@@ -147,7 +147,7 @@
+             Anim {}
+         }
+ 
+-        Behavior on anchors.bottomMargin {
++        Behavior on anchors.topMargin {
+             Anim {}
+         }
+     }

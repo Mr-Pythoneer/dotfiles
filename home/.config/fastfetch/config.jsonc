@@ -1,0 +1,36 @@
+// fastfetch (run it by hand; new terminals show a cowsay fortune instead, see ~/.bashrc).
+// Logo: the official Tux (Larry Ewing) as half-block pixel art in the graphite palette, a bit wider than the
+// artwork (kitty cells are narrow), 18 lines tall, real black pupils (marked in the SVG before rendering): tux.ansi.
+// For the small line-art penguin instead: fastfetch --logo linux_small
+{
+    "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+    "logo": {
+        "type": "file-raw",
+        "source": "~/.config/fastfetch/tux.ansi",
+        "width": 39,
+        "height": 18,
+        "padding": { "top": 1, "left": 2, "right": 4 }
+    },
+    "display": {
+        "separator": "  ",
+        "color": { "keys": "38;2;138;141;147", "title": "1;38;2;228;228;224", "separator": "38;2;85;88;95" },
+        "key": { "width": 10 }
+    },
+    "modules": [
+        "break",
+        "title",
+        { "type": "separator", "string": "─" },
+        { "type": "os", "key": "OS" },
+        { "type": "kernel", "key": "Kernel" },
+        { "type": "wm", "key": "WM" },
+        { "type": "shell", "key": "Shell" },
+        { "type": "terminal", "key": "Terminal" },
+        { "type": "cpu", "key": "CPU", "showPeCoreCount": false },
+        { "type": "command", "key": "GPU", "text": "lspci | sed -n 's/.*VGA compatible controller: Intel Corporation .*\\(Arc Graphics [^ ]*\\).*/Intel \\1/p'" },
+        { "type": "memory", "key": "Memory" },
+        { "type": "uptime", "key": "Uptime" },
+        { "type": "command", "key": "Theme", "text": "printf 'Caelestia %s\\n' \"$(grep -o '\"variant\": *\"[a-z]*\"' ~/.local/state/caelestia/scheme.json | cut -d'\"' -f4)\"" },
+        "break",
+        { "type": "colors", "symbol": "circle" }
+    ]
+}

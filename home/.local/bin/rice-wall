@@ -1,0 +1,29 @@
+#!/bin/bash
+# Rotates the rice wallpapers through Caelestia, so the lock screen and the wallpaper picker know
+# which one is showing. Super+W / Super+Shift+W. (rice-wall.timer ran "next" every 15 minutes; it's off
+# since 2026-10-12, when only the Arch logo and the circuit board were kept: Arch stays put.)
+#   rice-wall next | prev | restore | current | list
+# "N-name.live.png" has a "N-name.mp4" next to it, which Caelestia plays over the still while on
+# the charger (patch: ~/.config/caelestia/patches/wallpaper-live.patch).
+set -euo pipefail
+dir="$HOME/Pictures/Wallpapers/rice"
+state="$HOME/.local/state/rice-wall"
+mkdir -p "$state"
+mapfile -t walls < <(find "$dir" -maxdepth 1 -type f \( -name '*.png' -o -name '*.jpg' \) | sort -V)
+n=${#walls[@]}
+[ "$n" -gt 0 ] || { echo "rice-wall: no wallpapers in $dir" >&2; exit 1; }
+i=$(cat "$state/index" 2>/dev/null || echo -1)
+case "${1:-next}" in
+    next)    i=$(( (i + 1) % n )) ;;
+    prev)    i=$(( (i - 1 + n) % n )) ;;
+    restore) [ "$i" -ge 0 ] && [ "$i" -lt "$n" ] || i=0 ;;
+    current) [ "$i" -ge 0 ] && echo "${walls[$i]}"; exit 0 ;;
+    list)    printf '%s\n' "${walls[@]}"; exit 0 ;;
+    *)       sed -n '2,6s/^# \{0,1\}//p' "$0" >&2; exit 1 ;;
+esac
+echo "$i" > "$state/index"
+# -N: keep dark mode, never switch it from the wallpaper's brightness
+if ! caelestia wallpaper -N -f "${walls[$i]}" 2>"$state/last-error"; then
+    notify-send -a "Rice" "Wallpaper didn't change" "caelestia wallpaper failed, see ~/.local/state/rice-wall/last-error"
+    exit 1
+fi

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Keeps the speaker-mute light on F1 in step with whether sound is muted.
+# This ThinkPad's sound chip doesn't drive that light by itself on Linux.
+update() {
+    wpctl get-volume @DEFAULT_AUDIO_SINK@ | grep -q MUTED && on=1 || on=0
+    [ "$on" = "$last" ] || { brightnessctl -q -d platform::mute set "$on"; last=$on; }
+}
+update
+pactl subscribe | grep --line-buffered -E "'change' on (sink|server)" | while read -r _; do update; done

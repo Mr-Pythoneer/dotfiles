@@ -1,0 +1,34 @@
+#!/bin/sh
+# One-time system power tweaks (run with sudo). Undo: sudo power-tweaks-install --undo
+set -e
+[ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+
+if [ "$1" = --undo ]; then
+    rm -f /etc/udev/rules.d/50-runtime-pm.rules /etc/sysctl.d/90-power.conf /etc/NetworkManager/conf.d/wifi-powersave.conf
+    systemctl enable NetworkManager-wait-online.service
+    echo "removed; reboot to fully restore defaults"
+    exit
+fi
+
+# Let idle PCI devices (Wi-Fi, Bluetooth, SSD, sensors...) power down when unused
+echo 'ACTION=="add", SUBSYSTEM=="pci", ATTR{power/control}="auto"' > /etc/udev/rules.d/50-runtime-pm.rules
+for f in /sys/bus/pci/devices/*/power/control; do echo auto > "$f"; done
+
+# Fewer CPU wakeups: no NMI watchdog (only useful for kernel debugging),
+# and flush disk writes every 15s instead of 5s
+cat > /etc/sysctl.d/90-power.conf <<'EOF'
+kernel.nmi_watchdog = 0
+vm.dirty_writeback_centisecs = 1500
+EOF
+# (a key the kernel doesn't have, like the NMI watchdog in a VM, mustn't stop the rest)
+sysctl -q --system || true
+
+# Wi-Fi power saving (radio naps between packets)
+mkdir -p /etc/NetworkManager/conf.d
+printf '[connection]\nwifi.powersave = 3\n' > /etc/NetworkManager/conf.d/wifi-powersave.conf
+nmcli general reload conf || true
+
+# Don't hold up boot waiting for the network (nothing here needs it)
+systemctl disable NetworkManager-wait-online.service
+
+echo "done"

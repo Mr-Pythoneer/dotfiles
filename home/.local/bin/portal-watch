@@ -1,0 +1,7 @@
+#!/bin/bash
+nmcli monitor | while read -r line; do
+  if [[ "$line" == *"Connectivity is now 'portal'"* ]]; then
+    notify-send "Wi-Fi login required" "Opening captive portal…"
+    xdg-open "http://neverssl.com"
+  fi
+done

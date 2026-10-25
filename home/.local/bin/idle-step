@@ -1,0 +1,51 @@
+#!/bin/sh
+# idle-step — what happens when you walk away, timed by the power profile:
+#                  screensaver   lock + screen off
+#   power-saver         -             3 min    (efficiency mode: no animated screensaver, it burns battery)
+#   balanced          5 min          10 min
+#   performance       7 min          15 min
+# If sound, media, the mic or a fullscreen app is in use, neither step happens.
+# hypridle has a listener at each of those times calling "idle-step <seconds>"; only the ones
+# matching the current profile do anything. Coming back from the screensaver lands on the lock
+# screen. The screensaver runs its own countdown to the screen-off step, because Hyprland counts
+# the screensaver window opening as activity, which restarts hypridle's timers.
+profile_times() {
+    case "$(powerprofilesctl get 2>/dev/null)" in
+        power-saver) echo "0 180" ;;     # 0 = never: hypridle never calls with 0
+        performance) echo "420 900" ;;
+        *)           echo "300 600" ;;
+    esac
+}
+locked() { [ "$(caelestia shell lock isLocked 2>/dev/null)" = true ]; }
+
+# Lock, and return once the lock screen is up and has finished animating in, so whatever is
+# behind it (the screensaver) can close unseen.
+lock_and_wait() {
+    locked && return
+    loginctl lock-session
+    i=0; until locked || [ $i -ge 30 ]; do sleep 0.1; i=$((i + 1)); done
+    sleep 0.8
+}
+
+blackout() {
+    lock_and_wait                                    # lock first, so the desktop never shows
+    pkill -f '^kitty --class eyecandy-screensaver'
+    sleep 2                                          # let the activity from that settle, then fade
+    hyprctl dispatch 'hl.dsp.dpms({ action = "off" })'  # out; any key or mouse move fades back in
+}
+
+case "$1" in
+    resume)   exec ~/.local/bin/screensaver stop ;;
+    blackout) locked || blackout ;;
+    lock)     lock_and_wait ;;
+    [0-9]*)
+        locked && exit 0
+        set -- "$1" $(profile_times)
+        if [ "$1" = "$2" ]; then
+            exec ~/.local/bin/screensaver "$(( $3 - $2 ))"
+        elif [ "$1" = "$3" ] && ! pgrep -f '^kitty --class eyecandy-screensaver' >/dev/null; then
+            # the screensaver was skipped: only lock if whatever stopped it (sound, media,
+            # mic, a fullscreen game) has finished — otherwise you're probably still using it
+            ~/.local/bin/screensaver check | grep -q '^idle' && blackout
+        fi ;;
+esac

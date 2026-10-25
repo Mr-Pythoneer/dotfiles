@@ -1,0 +1,84 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}canvas{display:block}</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+</head><body>
+<script type="module">
+import * as THREE from "three";
+import { STLLoader } from "three/addons/loaders/STLLoader.js";
+
+// colours come in the query string: bg, base, low, high, top, key light
+const q = new URLSearchParams(location.search);
+const col = (k, d) => new THREE.Color("#" + (q.get(k) || d));
+const W = Number(q.get("w") || innerWidth), H = Number(q.get("h") || innerHeight);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setSize(W, H);
+renderer.setPixelRatio(1);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = col("bg", "1d2021");
+scene.fog = new THREE.Fog(scene.background, 260, 520);
+
+const camera = new THREE.PerspectiveCamera(28, W / H, 1, 2000);
+camera.up.set(0, 0, 1);
+
+scene.add(new THREE.HemisphereLight(0xffffff, col("base", "32302f"), 1.15));
+const fill = new THREE.DirectionalLight(0xffffff, 0.7);
+fill.position.set(-160, -40, 50);
+scene.add(fill);
+const key = new THREE.DirectionalLight(0xffffff, 1.7);
+key.position.set(-60, -120, 160);
+key.castShadow = true;
+key.shadow.mapSize.set(4096, 4096);
+Object.assign(key.shadow.camera, { left: -110, right: 110, top: 80, bottom: -80, near: 10, far: 500 });
+key.shadow.radius = 4;
+scene.add(key);
+const rim = new THREE.DirectionalLight(col("rim", "fe8019"), 1.4);
+rim.position.set(120, 140, 60);
+scene.add(rim);
+
+// floor that catches the shadow
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000), new THREE.ShadowMaterial({ opacity: 0.45 }));
+floor.position.z = -10.01;
+floor.receiveShadow = true;
+scene.add(floor);
+
+new STLLoader().load(q.get("stl") || "skyline-2026.stl", geo => {
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox, cx = (bb.min.x + bb.max.x) / 2, cy = (bb.min.y + bb.max.y) / 2;
+  geo.translate(-cx, -cy, 0);
+  // colour by height: the plinth stays dark, buildings run low -> high -> top
+  const pos = geo.attributes.position, n = pos.count, colors = new Float32Array(n * 3);
+  const base = col("base", "32302f"), low = col("low", "b8bb26"), high = col("high", "fabd2f"), top = col("top", "fe8019");
+  const zmax = bb.max.z, c = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    const z = pos.getZ(i);
+    if (z <= 0.05) c.copy(base);
+    else {
+      const t = Math.min(1, z / zmax);
+      if (t < 0.55) c.copy(low).lerp(high, t / 0.55); else c.copy(high).lerp(top, (t - 0.55) / 0.45);
+    }
+    colors.set([c.r, c.g, c.b], i * 3);
+  }
+  geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, metalness: 0.08 }));
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+
+  const dist = Number(q.get("dist") || 162);
+  camera.position.set(Number(q.get("cx") || 74), -dist, Number(q.get("cz") || 88));
+  camera.lookAt(Number(q.get("lx") || 9), 0, Number(q.get("lz") || 4));
+  renderer.render(scene, camera);
+  renderer.render(scene, camera);
+  renderer.domElement.toBlob(b => fetch("/save?name=" + (q.get("name") || "sky.png"), { method: "POST", body: b }).then(() => { document.title = "done"; }), "image/png");
+});
+</script>
+</body></html>

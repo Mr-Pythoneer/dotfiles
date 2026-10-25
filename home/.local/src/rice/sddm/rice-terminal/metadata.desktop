@@ -1,0 +1,8 @@
+[SddmGreeterTheme]
+Name=Rice Terminal
+Description=GitHub Dark terminal-style login over the code rain (rice, 2026-10-10)
+Type=sddm-theme
+Version=1.0
+MainScript=Main.qml
+ConfigFile=theme.conf
+QtVersion=6

@@ -1,0 +1,65 @@
+#!/bin/sh
+# screensaver — every animated terminal scene in turn, full-screen in a big-font kitty, with a clock.
+# Started by hypridle after 3 idle minutes; any key or mouse move closes it.
+# It only starts when you're really away: hypridle already waits out apps that inhibit idle
+# (video players, browsers playing video), and this also stays out of the way when:
+#   - anything is playing sound (music, video, a call)
+#   - something is using the microphone (calls, recording)
+#   - a media player reports Playing
+#   - the focused window is fullscreen (games, presentations)
+case "$1" in
+    stop)
+        # Hyprland counts any window opening as activity, so hypridle "resumes" the instant the
+        # screensaver appears; ignore stops in its first seconds (mouse/keys close it after that)
+        pid=$(pgrep -of '^kitty --class eyecandy-screensaver') || exit 0
+        [ "$(ps -o etimes= -p "$pid" | tr -d ' ')" -ge 3 ] || exit 0
+        ~/.local/bin/idle-step lock   # the lock screen animates in over the screensavers,
+        pkill -f '^kitty --class eyecandy-screensaver'   # which then close unseen behind it
+        exit 0 ;;
+    check) check_only=1 ;;
+    [0-9]*) blackout_in=$1 ;;   # seconds until idle-step locks and turns the screen off
+esac
+
+busy() { [ -n "$check_only" ] && echo "busy: $1"; exit 0; }
+
+pgrep -f '^kitty --class eyecandy-screensaver' >/dev/null && busy "already running"
+pactl list sink-inputs 2>/dev/null | grep -q 'Corked: no' && busy "sound is playing"
+pactl list source-outputs 2>/dev/null | awk '/^Source Output/{c=0} /Corked: no/{c=1} /application.name = /{if (c && $0 !~ /cava/) f=1} END{exit !f}' \
+    && busy "microphone in use"
+playerctl -a status 2>/dev/null | grep -qx Playing && busy "media is playing"
+hyprctl activewindow -j 2>/dev/null | grep -q '"fullscreen": [12]' && busy "fullscreen window"
+
+[ -n "$check_only" ] && { echo "idle: screensaver would start"; exit 0; }
+# One screensaver per monitor, each with a big font so the scenes fill it (roughly an 82x24 grid).
+# Lines of "name font_size", the focused monitor last so focus ends up back where you left it.
+monitors=$(hyprctl monitors -j 2>/dev/null | python3 -c '
+import json, sys
+ms = sorted(json.load(sys.stdin), key=lambda m: m["focused"])
+for m in ms:
+    w, h = m["width"] / m["scale"], m["height"] / m["scale"]
+    print(m["name"], round(min(w / (82 * 0.83), h / (24 * 1.86)), 1))' 2>/dev/null)
+[ -n "$monitors" ] || monitors="current 22"
+count() { hyprctl clients -j | grep -c '"class": "eyecandy-screensaver"'; }
+pids=
+while read -r mon fs; do
+    [ "$mon" = current ] || hyprctl dispatch "hl.dsp.focus({ monitor = \"$mon\" })" >/dev/null
+    n=$(count)
+    kitty --class eyecandy-screensaver --start-as fullscreen \
+        -o font_size="$fs" -o background=#060709 -o background_opacity=1 -o cursor_trail=0 -o window_padding_width=0 -o mouse_hide_wait=0.1 \
+        -o confirm_os_window_close=0 sh -c '~/.local/bin/archboot --screensaver; printf "\033[?25l"; ~/.local/bin/idle-step lock' &
+    pids="$pids $!"
+    # wait for it to appear before focusing the next monitor, or it may open on the wrong one
+    i=0; until [ "$(count)" -gt "$n" ] || [ $i -ge 30 ]; do sleep 0.1; i=$((i + 1)); done
+done <<MONITORS
+$monitors
+MONITORS
+
+all_running() { for p in $pids; do kill -0 "$p" 2>/dev/null || return 1; done; }
+end=$(( $(date +%s) + ${blackout_in:-0} ))
+while all_running; do
+    [ -n "$blackout_in" ] && [ "$(date +%s)" -ge "$end" ] && exec ~/.local/bin/idle-step blackout
+    sleep 1
+done
+# you came back on one screen: lock (it animates in over everything), then close the rest unseen
+~/.local/bin/idle-step lock
+pkill -f '^kitty --class eyecandy-screensaver'

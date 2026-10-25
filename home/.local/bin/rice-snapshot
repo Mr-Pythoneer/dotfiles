@@ -1,0 +1,162 @@
+#!/bin/bash
+# Save and roll back everything that decides how the desktop looks: Hyprland,
+# the Caelestia shell (config, patches, colour scheme), terminal, GTK/Qt themes,
+# wallpapers, prompt, app themes, look-related dconf keys.
+#
+#   rice-snapshot save [name]     snapshot the current look
+#   rice-snapshot list            list snapshots
+#   rice-snapshot diff <name>     show what changed since a snapshot
+#   rice-snapshot restore <name>  roll back to a snapshot (snapshots the current look first,
+#                                 so a restore can itself be undone)
+set -euo pipefail
+# packages you installed yourself: pacman on Arch, dnf on Fedora (the snapshot compares these lists)
+if command -v pacman >/dev/null; then
+    pkgs() { pacman -Qqe; }
+    remove="pacman -Rns"
+elif command -v dnf >/dev/null; then
+    pkgs() { dnf repoquery -q --userinstalled --qf '%{name}\n' 2>/dev/null | sort -u; }
+    remove="dnf remove"
+fi
+store="$HOME/.local/share/rice-snapshots"
+
+# Relative to $HOME. Paths missing at save time are recorded as absent, so a restore
+# removes them again (e.g. a fastfetch config that was added while ricing).
+paths=(
+    .config/hypr .config/caelestia .config/quickshell .config/kitty .config/waypaper
+    .config/gtk-3.0 .config/gtk-4.0 .config/qt5ct .config/qt6ct .config/qtengine .config/Kvantum
+    .config/fontconfig .config/btop .config/cava .config/fuzzel .config/wlogout .config/swaylock
+    .config/hyprlock .config/eyecandy .config/spicetify .config/superfile .config/zathura
+    .config/spun .config/fcitx5 .config/mpv .config/kew .config/nvtop .config/htop
+    .config/Vencord .config/vesktop .config/Equicord .config/BetterDiscord .config/legcord
+    .config/systemd/user .config/environment.d .config/uwsm .config/xsettingsd .config/mimeapps.list
+    .config/fastfetch .config/starship.toml .config/matugen .config/wal .config/cbonsai
+    .config/sddm-theme .config/plymouth
+    .local/bin .local/state/caelestia .local/share/caelestia .local/share/spun
+    .local/share/applications .local/share/PandoraLauncher/themes
+    .local/share/icons .local/share/themes .local/share/fonts .icons .themes .gtkrc-2.0
+    .bashrc .bash_profile .face Pictures/Wallpapers
+)
+# Zen browser theming (userChrome, user.js, Zen mods) for every profile
+for prof in "$HOME"/.config/zen/*/; do
+    [ -f "$prof/prefs.js" ] || continue
+    rel="${prof#"$HOME"/}"
+    paths+=("${rel}user.js" "${rel}chrome" "${rel}zen-themes.json")
+done
+dconf_dirs=(/org/gnome/desktop/interface/ /org/gnome/desktop/wm/preferences/ /org/gtk/settings/)
+system_paths=(/etc/sddm.conf.d /usr/share/sddm/themes/caelestia)
+
+die() { echo "rice-snapshot: $*" >&2; exit 1; }
+
+save() {
+    local name="${1:-$(date +%F-%H%M%S)}" dest p
+    dest="$store/$name"
+    [ -e "$dest" ] && die "snapshot '$name' already exists"
+    mkdir -p "$dest/home" "$dest/dconf" "$dest/system"
+    printf '%s\n' "${paths[@]}" > "$dest/paths"
+    : > "$dest/absent"
+    for p in "${paths[@]}"; do
+        if [ -e "$HOME/$p" ] || [ -L "$HOME/$p" ]; then
+            mkdir -p "$dest/home/$(dirname "$p")"
+            cp -a "$HOME/$p" "$dest/home/$p"
+        else
+            printf '%s\n' "$p" >> "$dest/absent"
+        fi
+    done
+    for p in "${dconf_dirs[@]}"; do
+        dconf dump "$p" > "$dest/dconf/$(echo "$p" | tr / _).ini"
+    done
+    # Read-only copies: putting these back needs sudo, so restore only prints the command
+    for p in "${system_paths[@]}"; do
+        [ -e "$p" ] && cp -a "$p" "$dest/system/"
+    done
+    pkgs > "$dest/packages.txt"
+    date '+%F %T' > "$dest/created"
+    echo "Saved snapshot '$name' ($(du -sh "$dest" | cut -f1)) in $dest"
+}
+
+list() {
+    [ -d "$store" ] || { echo "No snapshots yet."; return; }
+    local d
+    for d in "$store"/*/; do
+        [ -f "$d/created" ] && printf '%-36s %s\n' "$(basename "$d")" "$(cat "$d/created")"
+    done
+}
+
+snap_dir() {
+    [ -n "${1:-}" ] || die "which snapshot? (see: rice-snapshot list)"
+    [ -d "$store/$1/home" ] || die "no snapshot named '$1' (see: rice-snapshot list)"
+    echo "$store/$1"
+}
+
+diff_snap() {
+    local src p
+    src="$(snap_dir "${1:-}")"
+    while IFS= read -r p; do
+        if [ -e "$src/home/$p" ] || [ -L "$src/home/$p" ]; then
+            diff -rq "$src/home/$p" "$HOME/$p" 2>&1 | sed "s|$src/home/|snapshot:|; s|$HOME/|now:|g" || true
+        fi
+    done < "$src/paths"
+    while IFS= read -r p; do
+        [ -e "$HOME/$p" ] && echo "Added since snapshot: ~/$p"
+    done < "$src/absent"
+    comm -13 "$src/packages.txt" <(pkgs) | sed 's/^/Package installed since snapshot: /'
+}
+
+restore() {
+    local src p f
+    src="$(snap_dir "${1:-}")"
+    save "before-restore-$(date +%F-%H%M%S)"
+
+    while IFS= read -r p; do
+        if [ -d "$src/home/$p" ] && [ ! -L "$src/home/$p" ]; then
+            [ -d "$HOME/$p" ] && [ ! -L "$HOME/$p" ] || rm -rf "$HOME/$p"
+            mkdir -p "$HOME/$p"
+            rsync -a --delete "$src/home/$p/" "$HOME/$p/"
+        elif [ -e "$src/home/$p" ] || [ -L "$src/home/$p" ]; then
+            rm -rf "$HOME/$p"
+            mkdir -p "$(dirname "$HOME/$p")"
+            cp -a "$src/home/$p" "$HOME/$p"
+        fi
+    done < "$src/paths"
+    while IFS= read -r p; do
+        [ -n "$p" ] && rm -rf "${HOME:?}/$p"
+    done < "$src/absent"
+
+    for f in "$src"/dconf/*.ini; do
+        p="$(basename "$f" .ini | tr _ /)"
+        dconf reset -f "$p"
+        dconf load "$p" < "$f"
+    done
+
+    # Bring the running session in line with the restored files
+    systemctl --user stop rice-wall.timer 2>/dev/null || true
+    systemctl --user daemon-reload || true
+    hyprctl reload >/dev/null 2>&1 || true
+    pkill -USR1 -x kitty || true
+    pkill -x qs || true
+    sleep 1
+    setsid -f caelestia shell -d >/dev/null 2>&1 || true
+    # the custom bar (if this snapshot has it) runs as its own shell next to Caelestia
+    [ -f "$HOME/.config/quickshell/rice/shell.qml" ] && grep -q 'qs -c rice' "$HOME/.config/hypr/hyprland.lua" && { setsid -f qs -c rice -d >/dev/null 2>&1 || true; }
+    (sleep 2; pgrep -x awww-daemon >/dev/null || setsid -f awww-daemon >/dev/null 2>&1; sleep 1; waypaper --restore >/dev/null 2>&1) &
+
+    echo "Restored '$1'. Undo with: rice-snapshot restore $(ls -t "$store" | grep '^before-restore-' | head -1)"
+    echo "Log out and back in once to restart the background helpers (power-mode etc.) on their old versions."
+    for p in "${system_paths[@]}"; do
+        f="$src/system/$(basename "$p")"
+        if [ -e "$f" ] && ! diff -rq "$f" "$p" >/dev/null 2>&1; then
+            echo "System file differs, to put it back run: sudo rm -rf $p && sudo cp -a '$f' $p"
+        fi
+    done
+    p="$(comm -13 "$src/packages.txt" <(pkgs) | tr '\n' ' ')"
+    [ -n "$p" ] && echo "Packages installed since the snapshot (harmless to keep; to remove: sudo $remove $p)"
+    return 0
+}
+
+case "${1:-}" in
+    save) save "${2:-}" ;;
+    list) list ;;
+    diff) diff_snap "${2:-}" ;;
+    restore) restore "${2:-}" ;;
+    *) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 1 ;;
+esac

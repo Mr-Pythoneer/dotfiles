@@ -1,0 +1,9 @@
+#!/bin/sh
+# One-time theme setup at the first Hyprland login (needs the Caelestia shell running)
+[ -f ~/.local/state/first-login-done ] && exit 0
+for i in $(seq 30); do caelestia shell drawers list >/dev/null 2>&1 && break; sleep 1; done
+caelestia wallpaper -f ~/Pictures/Wallpapers/mountain-night.png   # colours come from this
+caelestia scheme set -n dynamic -m dark
+caelestia scheme set -v monochrome
+grep -q '"variant": *"monochrome"' ~/.local/state/caelestia/scheme.json || exit 1
+mkdir -p ~/.local/state && touch ~/.local/state/first-login-done

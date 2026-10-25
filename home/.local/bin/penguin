@@ -1,0 +1,1749 @@
+#!/usr/bin/env python3
+"""penguin - a little pixel-art Tux pops onto the screen, does something random, leaves.
+
+Bound to the Copilot key. Draws on a click-through overlay, so it never gets
+in the way. Pressing the key again while one is out replaces it. Same Tux as
+the terminal splash (~/.local/bin/archboot), just bigger.
+
+Usage: penguin            random act (the fun-CLI ones, cowsay/fortune/pipes/cmatrix, come up more often)
+       penguin <act>      a specific act (see ACTS at the bottom)
+"""
+import math, os, random, signal, sys, time
+
+# gtk4-layer-shell has to load before libwayland-client, so re-exec with it preloaded
+# (Arch keeps it in /usr/lib, Fedora in /usr/lib64)
+LIB = next((p for p in ("/usr/lib/libgtk4-layer-shell.so", "/usr/lib64/libgtk4-layer-shell.so.0",
+                        "/usr/lib64/libgtk4-layer-shell.so") if os.path.exists(p)), "/usr/lib/libgtk4-layer-shell.so")
+if LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = (LIB + " " + os.environ.get("LD_PRELOAD", "")).strip()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import cairo
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("GLibUnix", "2.0")
+gi.require_foreign("cairo")
+from gi.repository import Gtk, Gdk, GLib, GLibUnix, Gtk4LayerShell as Layer
+
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "penguin.pid")
+
+
+def distro_id():
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("ID="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "arch"
+
+
+FEDORA = distro_id() == "fedora"
+DISTRO = "Fedora" if FEDORA else "Arch"
+UPGRADE = "sudo dnf upgrade" if FEDORA else "sudo pacman -Syu"
+
+SAYINGS = [
+    f"I use {DISTRO} btw", "hi :)", "you were expecting Copilot?", "sudo make me a sandwich",
+    "have you tried turning it off and on again?", "don't forget to commit!",
+    "git push --force? bold.", "remember to drink water", "nice wallpaper",
+    "rm -rf / ...just kidding", "*waddles*", "it works on my machine",
+    "have you read the wiki?", "Tux says hello", "segfault? not my problem",
+    "touch grass. or snow.", "vim or emacs? ...nano.", "brb, fishing",
+    f"{UPGRADE}, daily", "0 bugs found (didn't look)", "it's not a bug, it's a feature",
+]
+
+PX = 6           # screen pixels per sprite pixel
+FONT = "JetBrainsMono Nerd Font"
+INK = (0.09, 0.09, 0.11)
+PAPER = (0.09, 0.094, 0.106)
+LIGHT = (0.83, 0.83, 0.82)
+ARCH_BLUE = (81 / 255, 162 / 255, 218 / 255) if FEDORA else (23 / 255, 147 / 255, 209 / 255)  # the distro's blue
+
+# ── the pixel Tux (same sprite as the terminal splash) ──
+BODY = [
+    ".......KKKKKK.......",
+    "......KKGGGGKK......",
+    ".....KKGGKKKKKK.....",
+    ".....KWWKKKKWWK.....",
+    ".....KWEKKKKWEK.....",
+    ".....KKYYYYYYKK.....",
+    ".....KYYYYYYYYK.....",
+    "....KKKYYYYYYKKK....",
+    "....KKWWWYYWWWKK....",
+    "...KKWWWWWWWWWWKK...",
+    "...KWWWWWWWWWWWWK...",
+    "..KKWWWWWWWWWWWWKK..",
+    "..KWWWWWWWWWWWWWWK..",
+    "..KWWWWWWWWWWWWWWK..",
+    "..KWWWWWWWWWWWWWWK..",
+    "..KWWWWWWWWWWWWWWK..",
+    "..KKWWWWWWWWWWWWKK..",
+    "...KWWWWWWWWWWWWK...",
+    "...KKWWWWWWWWWWKK...",
+    "....KKKKKKKKKKKK....",
+]
+FOOT_L = ["..YYYYY...", ".DYYYYY..."]
+FOOT_R = ["...YYYYY..", "...YYYYYD."]
+PAL = {
+    "K": (62, 65, 77), "G": (105, 110, 126), "W": (236, 236, 228), "E": (16, 16, 20),
+    "Y": (255, 178, 36), "D": (214, 122, 22), "P": (255, 140, 165), "M": (120, 30, 40),
+    "S": (12, 12, 14), "H": (200, 220, 255), "B": (23, 147, 209),
+}
+SPRITE_W, SPRITE_H, BX, BY = 40, 34, 10, 10   # canvas, and where the body sits in it
+EYES = {  # (x, y): colour key, for the four eye pixels on each side; pupils look to the right
+    "open":   {3: "WW", 4: "WE"},
+    "wide":   {2: "WW", 3: "WE", 4: "WE"},
+    "closed": {3: "KK", 4: "GG"},
+}
+SHADES = [(x, 3) for x in range(5, 15)] + [(x, 4) for x in (5, 6, 7, 8, 11, 12, 13, 14)]
+
+
+def rgb(c):
+    return tuple(v / 255 for v in c)
+
+
+def blit(cr, rows, colors, x, y, px, alpha=1.0):
+    """Draw a little bitmap: rows of characters, '.' is transparent."""
+    for j, line in enumerate(rows):
+        for i, ch in enumerate(line):
+            if ch != ".":
+                cr.set_source_rgba(*colors[ch], alpha)
+                cr.rectangle(round(x + i * px), round(y + j * px), px, px)
+                cr.fill()
+
+
+def pixel_text(cr, text, x, y, color, size=10, scale=2, outline=None, measure=False):
+    """Text rendered without anti-aliasing and scaled up, so it's chunky like the sprite."""
+    tmp = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+    c = cairo.Context(tmp)
+    c.select_font_face(FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    c.set_font_size(size)
+    ext = c.text_extents(text)
+    w, h = int(ext.x_advance) + 4, int(size * 1.4) + 4
+    if measure:
+        return w * scale, h * scale
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    c = cairo.Context(surf)
+    opts = cairo.FontOptions()
+    opts.set_antialias(cairo.ANTIALIAS_NONE)
+    opts.set_hint_style(cairo.HINT_STYLE_FULL)
+    c.set_font_options(opts)
+    c.select_font_face(FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    c.set_font_size(size)
+    base = 2 + size
+    if outline:
+        c.set_source_rgba(*outline)
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            c.move_to(2 + dx, base + dy)
+            c.show_text(text)
+    c.set_source_rgba(*color)
+    c.move_to(2, base)
+    c.show_text(text)
+    cr.save()
+    cr.translate(round(x), round(y))
+    cr.scale(scale, scale)
+    cr.set_source_surface(surf, 0, 0)
+    cr.get_source().set_filter(cairo.FILTER_NEAREST)
+    cr.paint()
+    cr.restore()
+    return w * scale, h * scale
+
+
+class Penguin:
+    def __init__(self):
+        self.x = -150.0       # feet, screen coords
+        self.y = 0.0          # extra height above the ground
+        self.s = 1.0          # size
+        self.face = 1         # 1 looks right, -1 left
+        self.phase = 0.0      # walk cycle
+        self.tilt = 0.0       # side-to-side waddle
+        self.rot = 0.0        # whole-body rotation (flips, sliding)
+        self.squash = 1.0     # <1 squats down
+        self.flap = 0.0       # flipper angle
+        self.eyes = "open"    # open / closed / wide
+        self.beak_open = False
+        self.shades = False
+        self.hidden = False
+        self.wings = None     # (left, right) flipper angles, overriding flap (dab, floss...)
+        self.mug = False
+        self.bubble = None
+        self.blink_at = time.monotonic() + random.uniform(1, 3)
+
+    def sprite(self, blinking):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, SPRITE_W, SPRITE_H)
+        cr = cairo.Context(surf)
+        cr.set_antialias(cairo.ANTIALIAS_NONE)
+
+        def put(x, y, key):
+            cr.set_source_rgb(*rgb(PAL[key]))
+            cr.rectangle(BX + x, BY + y, 1, 1)
+            cr.fill()
+
+        # flippers behind the body, angle 0 = hanging down, ~2.8 = straight up
+        ang = min(2.9, 0.45 + self.flap * 1.4)
+        for (side, sx), ang in zip(((-1, 3.5), (1, 16.5)), self.wings or (ang, ang)):
+            dx, dy = side * math.sin(ang), math.cos(ang)
+            for i in range(15):
+                s = i * 0.5
+                for k in range(3 if s < 3 else 2 if s < 6 else 1):
+                    put(round(sx + dx * s - side * dy * k), round(10 + dy * s + side * dx * k), "K")
+        for y, line in enumerate(BODY):
+            for x, ch in enumerate(line):
+                if ch != ".":
+                    put(x, y, ch)
+        eyes = EYES["closed" if blinking else self.eyes]
+        for y, pair in eyes.items():
+            for x, key in zip((6, 7), pair):
+                put(x, y, key)
+            for x, key in zip((12, 13), pair):
+                put(x, y, key)
+        put(6, 5, "P"); put(13, 5, "P")  # rosy cheeks
+        if self.beak_open:
+            for x in range(7, 13):
+                put(x, 6, "M")
+        if self.shades:
+            for x, y in SHADES:
+                put(x, y, "S")
+            put(6, 3, "H"); put(12, 3, "H")
+        if self.mug:  # an Arch-blue mug at the tip of the right flipper
+            ar = (self.wings or (0, min(2.9, 0.45 + self.flap * 1.4)))[1]
+            mx, my = round(16.5 + math.sin(ar) * 6), round(10 + math.cos(ar) * 6) - 2
+            for dx in range(3):
+                for dy in range(3):
+                    put(mx + dx, my + dy, "W" if dy == 0 else "B")
+            put(mx + 3, my + 1, "B")
+        step = math.sin(self.phase)
+        for foot, x0, up in ((FOOT_L, 0, step > 0.3), (FOOT_R, 10, step < -0.3)):
+            for y, line in enumerate(foot):
+                for x, ch in enumerate(line):
+                    if ch != ".":
+                        put(x0 + x, 20 + y - up, ch)
+        return surf
+
+    def draw(self, cr, ground):
+        if self.hidden:
+            return
+        now = time.monotonic()
+        blinking = self.eyes == "open" and self.blink_at < now < self.blink_at + 0.12
+        if now > self.blink_at + 0.12:
+            self.blink_at = now + random.uniform(1.5, 4)
+
+        surf = self.sprite(blinking)
+        mid = (BY + 22 - SPRITE_H / 2) * PX  # rotate around the middle of the body
+        cr.save()
+        cr.translate(round(self.x), round(ground - self.y))
+        cr.scale(self.s * self.face, self.s * self.squash)
+        cr.translate(0, -(BY + 22) * PX + mid)
+        cr.rotate(self.rot + self.tilt)
+        cr.translate(0, -mid)
+        cr.scale(PX, PX)
+        cr.set_source_surface(surf, -SPRITE_W / 2, 0)
+        cr.get_source().set_filter(cairo.FILTER_NEAREST)
+        cr.paint()
+        cr.restore()
+
+        if self.bubble:
+            self.draw_bubble(cr, ground)
+
+    def draw_bubble(self, cr, ground):
+        """A tiny terminal: dark box, pixel border, text after a green prompt."""
+        b = 3  # border thickness = one "pixel"
+        tw, th = pixel_text(cr, "$ " + self.bubble, 0, 0, LIGHT, measure=True)
+        w, h = tw + 16, th + 8
+        bx = self.x - w / 2 + 30 * self.face
+        by = ground - self.y - 140 * self.s * self.squash - h - 18
+        bx = round(max(10, min(bx, self.screen_w - w - 10)))
+        by = round(by)
+        cr.set_source_rgb(*LIGHT)
+        cr.rectangle(bx + b, by, w - 2 * b, h)        # border, with notched pixel corners
+        cr.rectangle(bx, by + b, w, h - 2 * b)
+        cr.fill()
+        cr.set_source_rgb(*PAPER)
+        cr.rectangle(bx + b, by + b, w - 2 * b, h - 2 * b)
+        cr.fill()
+        tail = round(min(max(self.x, bx + 24), bx + w - 24))
+        for i in range(4):  # stair-stepped tail
+            cr.set_source_rgb(*LIGHT)
+            cr.rectangle(tail - 12 + i * 3, by + h - b + i * 4, 24 - i * 6, 4)
+            cr.fill()
+            if i < 3:
+                cr.set_source_rgb(*PAPER)
+                cr.rectangle(tail - 9 + i * 3, by + h - b + i * 4, 18 - i * 6, 4)
+                cr.fill()
+        x = bx + 8
+        x += pixel_text(cr, "$ ", x, by + 4, (0.31, 0.98, 0.48))[0] - 4
+        pixel_text(cr, self.bubble, x, by + 4, LIGHT)
+
+
+NOTES = {  # music notes as pixel bitmaps (the pixel font has no ♪ glyphs)
+    "♪": ["..WW.", "..W.W", "..W..", "..W..", "WWW..", "WWW.."],
+    "♫": ["..WWWWW", "..W...W", "..W...W", "..W...W", "WWW.WWW", "WWW.WWW"],
+}
+NOTES["♬"] = NOTES["♫"]
+HEART = [".HH.HH.", "HHHHHHH", "HHHHHHH", ".HHHHH.", "..HHH..", "...H..."]
+SPARK = [[".Y.", "YWY", ".Y."], ["Y.Y", ".W.", "Y.Y"]]
+FISH = ["...BBBB....", ".BBBBBBB..B", "BEBBBBBBBBB", "BLLLLLLLBBB", ".BLLLLLB..B", "...BBBB...."]
+UFO = [".....CCCC.....", "....CCCCCC....", "..GGGGGGGGGG..", ".GGLGGLGGLGGG.", "GGGGGGGGGGGGGG", "..DDDDDDDDDD.."]
+GLASSES = ["SSSSSSSSSS", "SSHS..SHSS", "SSSS..SSSS"]
+COLORS = {
+    "H": (1.0, 0.35, 0.5), "Y": (1.0, 0.85, 0.3), "W": (1, 1, 1), "B": (0.35, 0.65, 0.95),
+    "E": INK, "L": (0.75, 0.88, 1.0), "C": (0.6, 0.86, 1.0), "G": (0.6, 0.62, 0.68),
+    "D": (0.32, 0.33, 0.38), "S": (0.05, 0.05, 0.06),
+}
+
+
+class Particle:
+    """A floating bit of decoration: music notes, Zzz, hearts, snow, sparkles."""
+
+    def __init__(self, kind, x, y, vx=0.0, vy=-60.0, life=1.6, text=None, color=None, size=11,
+                 scale=3, delay=0.0):
+        self.kind, self.x, self.y, self.vx, self.vy = kind, x, y, vx, vy
+        self.life = self.max_life = life
+        self.text, self.color, self.size, self.scale, self.delay = text, color, size, scale, delay
+
+    def update(self, dt):
+        if self.delay > 0:  # sits still until its moment comes
+            self.delay -= dt
+            return True
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        if self.kind == "snow":
+            self.vy += 400 * dt
+        self.life -= dt
+        return self.life > 0
+
+    def draw(self, cr):
+        a = min(1.0, self.life / (self.max_life * 0.4))
+        if self.kind == "snow":
+            cr.set_source_rgba(0.9, 0.95, 1, a)
+            cr.rectangle(round(self.x), round(self.y), PX, PX)
+            cr.fill()
+        elif self.kind == "dust":
+            cr.set_source_rgba(*self.color[:3], a if self.delay <= 0 else 1.0)
+            cr.rectangle(round(self.x), round(self.y), self.size, self.size)
+            cr.fill()
+        elif self.kind == "heart":
+            blit(cr, HEART, COLORS, self.x - 3 * 4, self.y, 4, a)
+        elif self.kind == "spark":
+            blit(cr, SPARK[int(self.life * 8) % 2], COLORS, self.x - 6, self.y - 6, 4, a)
+        elif self.text in NOTES:
+            blit(cr, NOTES[self.text], {"W": (*(self.color or (1, 1, 1))[:3],)}, self.x, self.y - 30, 5, a)
+        else:  # text: Zzz, !, words
+            color = (*self.color[:3], a) if self.color else (1, 1, 1, a)
+            pixel_text(cr, self.text, self.x, self.y - 30, color, size=self.size, scale=self.scale,
+                       outline=(*INK, a))
+
+
+class Fish:
+    def __init__(self, x, y):
+        self.x, self.y, self.vy, self.alive = x, y, 0.0, True
+
+    def update(self, dt):
+        self.vy += 900 * dt
+        self.y += self.vy * dt
+        return self.alive
+
+    def draw(self, cr):
+        blit(cr, FISH, COLORS, self.x - 33, self.y - 18, PX)
+
+
+class Sprite:
+    """Something the act moves around by hand (UFO, Pac-Man, glasses, snowball)."""
+
+    def __init__(self, draw_fn, x, y):
+        self.draw_fn, self.x, self.y, self.alive, self.t = draw_fn, x, y, True, 0.0
+        self.extra = {}
+
+    def update(self, dt):
+        self.t += dt
+        return self.alive
+
+    def draw(self, cr):
+        self.draw_fn(cr, self)
+
+
+def draw_ufo(cr, u):
+    if u.extra.get("beam"):
+        top, bottom = u.y + 6 * PX, u.extra["ground"]
+        rows = int((bottom - top) / PX)
+        for r in range(rows):
+            half = 4 + r * 0.25
+            flick = 0.18 + 0.06 * math.sin(u.t * 20 + r * 0.6)
+            cr.set_source_rgba(0.5, 1.0, 0.75, flick)
+            cr.rectangle(round(u.x - half * PX), round(top + r * PX), round(half * 2) * PX, PX)
+            cr.fill()
+    lights = dict(COLORS, L=(1.0, 0.85, 0.3) if int(u.t * 6) % 2 else (1.0, 0.35, 0.35))
+    blit(cr, UFO, lights, u.x - 7 * PX, u.y, PX)
+
+
+def draw_pac(cr, p):
+    r = 8
+    mouth = 0.8 * abs(math.sin(p.t * 14))
+    cr.set_source_rgb(1.0, 0.84, 0.0)
+    for y in range(-r, r + 1):
+        for x in range(-r, r + 1):
+            if math.hypot(x, y) <= r + 0.3 and abs(math.atan2(y, x * p.extra["dir"])) >= mouth:
+                cr.rectangle(round(p.x + x * PX), round(p.y + y * PX), PX, PX)
+    cr.fill()
+
+
+def draw_glasses(cr, g):
+    blit(cr, GLASSES, COLORS, g.x - 5 * PX, g.y, PX)
+
+
+def draw_snowball(cr, s):
+    r = s.extra["r"]
+    for y in range(-r, r + 1):
+        for x in range(-r, r + 1):
+            d = math.hypot(x, y)
+            if d <= r + 0.3:
+                shade = 1.0 if x + y < 0 else 0.85
+                cr.set_source_rgba(0.9 * shade, 0.95 * shade, 1.0 * shade, s.extra.get("a", 1.0))
+                cr.rectangle(round(s.x + x * 10), round(s.y + y * 10), 10, 10)
+                cr.fill()
+
+
+def draw_splat(cr, s):
+    a = max(0.0, min(1.0, s.extra["life"] / 1.5))
+    for (x, y, size) in s.extra["blobs"]:
+        cr.set_source_rgba(0.92, 0.96, 1.0, a * 0.95)
+        cr.rectangle(round(s.x + x), round(s.y + y + s.t * 25), size, size)
+        cr.fill()
+
+
+# ---------- the show ----------
+# Each act is a generator: it yields once per frame and gets the frame time back.
+
+def wait(sec):
+    t = 0.0
+    while t < sec:
+        t += yield
+
+
+def walk_to(p, tx, speed=280):
+    p.face = 1 if tx > p.x else -1
+    while abs(p.x - tx) > 3:
+        dt = yield
+        p.x += p.face * min(speed * dt, abs(p.x - tx))
+        p.phase += dt * min(speed, 200) / 13
+        p.y = abs(math.sin(p.phase)) * 6
+        p.tilt = math.sin(p.phase) * 0.08
+    p.y = p.tilt = p.phase = 0.0
+
+
+def say(p, text, sec=2.2):
+    p.bubble = text
+    t = 0.0
+    while t < sec:
+        t += yield
+        p.beak_open = t < sec * 0.6 and int(t * 8) % 2 == 0
+    p.beak_open = False
+    p.bubble = None
+
+
+def hop(p, height, dur, spin=0.0):
+    t = 0.0
+    while t < dur:
+        t += yield
+        k = min(t / dur, 1)
+        p.y = 4 * height * k * (1 - k)
+        p.rot = spin * k
+        p.flap = 0.9 * math.sin(k * math.pi)
+    p.y = p.rot = p.flap = 0.0
+
+
+def squat(p, amount, dur):
+    start = p.squash
+    t = 0.0
+    while t < dur:
+        t += yield
+        p.squash = start + (amount - start) * min(t / dur, 1)
+
+
+def move(sprite, tx, ty, dur):
+    sx, sy, t = sprite.x, sprite.y, 0.0
+    while t < dur:
+        t += yield
+        k = min(t / dur, 1)
+        k = 1 - (1 - k) ** 3
+        sprite.x, sprite.y = sx + (tx - sx) * k, sy + (ty - sy) * k
+
+
+def entry(show):
+    """Walk in from a random side; returns which side, and a spot to stop at."""
+    side = random.choice((-1, 1))
+    show.p.x = -150 if side == -1 else show.w + 150
+    spot = random.uniform(show.w * 0.25, show.w * 0.75)
+    return side, spot
+
+
+def leave(show, side, speed=320):
+    yield from walk_to(show.p, show.w + 160 if side == -1 else -160, speed)
+
+
+def act_stroll(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    yield from wait(0.3)
+    p.face = random.choice((-1, 1))
+    yield from say(p, random.choice(SAYINGS), 2.6)
+    yield from leave(show, side)
+
+
+def act_dance(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    yield from say(p, random.choice(["drop the beat", "dance break!", "♪ la la la ♪"]), 1.4)
+    t, beat = 0.0, 0
+    while t < 4.5:
+        dt = yield
+        t += dt
+        p.y = abs(math.sin(t * 7)) * 18
+        p.flap = 0.6 + 0.8 * math.sin(t * 14)
+        p.tilt = math.sin(t * 7) * 0.2
+        p.phase = t * 7
+        if int(t * 3.5) != beat:
+            beat = int(t * 3.5)
+            p.face = -p.face
+            show.add(Particle("text", p.x + random.uniform(-70, 70), show.ground - 170,
+                              random.uniform(-30, 30), -80, 1.8, random.choice("♪♫♬")))
+    p.y = p.flap = p.tilt = p.phase = 0.0
+    yield from hop(p, 90, 0.7, spin=2 * math.pi)
+    yield from leave(show, side)
+
+
+def act_slide(show):
+    p = show.p
+    side = random.choice((-1, 1))
+    p.face = -side
+    p.x = -160 if side == -1 else show.w + 160
+    p.rot = math.pi / 2 * 0.95
+    p.y = -30
+    p.flap = 1.0
+    target = show.w + 180 if side == -1 else -180
+    yelled = False
+    while (target - p.x) * p.face > 0:
+        dt = yield
+        p.x += p.face * 650 * dt
+        if random.random() < 0.6:
+            show.add(Particle("snow", p.x - p.face * 70, show.ground - 5,
+                              -p.face * random.uniform(40, 160), -random.uniform(80, 220), 0.9))
+        if not yelled and abs(p.x - show.w / 2) < 200:
+            yelled = True
+            p.bubble = random.choice(["wheeee!", "zoom zoom", "weeeeeee"])
+    p.bubble = None
+
+
+def act_backflip(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    yield from say(p, "watch this", 1.3)
+    yield from squat(p, 0.75, 0.25)
+    p.squash = 1.0
+    yield from hop(p, 220, 1.0, spin=-2 * math.pi)
+    yield from squat(p, 0.8, 0.08)
+    yield from squat(p, 1.0, 0.12)
+    for _ in range(14):
+        show.add(Particle("spark", p.x + random.uniform(-70, 70), show.ground - random.uniform(40, 170),
+                          random.uniform(-60, 60), random.uniform(-90, -20), 1.2))
+    p.flap = 1.4
+    yield from say(p, "ta-da!", 1.5)
+    p.flap = 0
+    yield from leave(show, side)
+
+
+def act_fish(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    p.eyes = "wide"
+    p.flap = 0.8
+    fish = Fish(p.x, -60)
+    show.add(fish)
+    mouth = show.ground - 100 * p.s
+    while fish.y < mouth:
+        yield
+    fish.alive = False
+    p.eyes = "open"
+    p.flap = 0
+    for _ in range(3):
+        p.beak_open = True
+        yield from wait(0.15)
+        p.beak_open = False
+        yield from wait(0.15)
+    for _ in range(5):
+        show.add(Particle("heart", p.x + random.uniform(-50, 50), show.ground - 160,
+                          random.uniform(-25, 25), -70, 1.6))
+    yield from say(p, random.choice(["yum", "thanks!", "fresh!"]), 1.6)
+    yield from leave(show, side)
+
+
+def act_nap(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot, speed=180)
+    yield from say(p, "*yawn*", 1.2)
+    yield from squat(p, 0.82, 0.4)
+    p.eyes = "closed"
+    t, n = 0.0, 0
+    while t < 4.0:
+        dt = yield
+        t += dt
+        p.squash = 0.82 + math.sin(t * 2.5) * 0.02
+        if int(t / 0.8) != n:
+            n = int(t / 0.8)
+            show.add(Particle("text", p.x + 40 * p.face, show.ground - 150, 25, -45, 2.0, "Z" if n % 2 else "z"))
+    p.eyes = "wide"
+    p.squash = 1.0
+    show.add(Particle("text", p.x - 6, show.ground - 180, 0, -40, 1.0, "!"))
+    yield from hop(p, 40, 0.3)
+    p.eyes = "open"
+    yield from leave(show, side, speed=600)
+
+
+def act_peek(show):
+    p = show.p
+    p.x = random.uniform(show.w * 0.15, show.w * 0.85)
+    p.face = random.choice((-1, 1))
+    p.y = -170
+    while p.y < -60:
+        p.y += 260 * (yield)
+    for _ in range(2):
+        yield from wait(0.5)
+        p.face = -p.face
+    yield from say(p, random.choice(["psst", "hey you", "is it safe?", "boo!"]), 1.6)
+    while p.y > -180:
+        p.y -= 320 * (yield)
+
+
+def act_fly(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    yield from say(p, "I believe I can fly", 1.6)
+    t = 0.0
+    while t < 1.6:
+        dt = yield
+        t += dt
+        p.flap = 0.2 + abs(math.sin(t * 25)) * 1.5
+        p.y = min(t, 1.2) * 70
+    p.flap = 0.0
+    p.eyes = "wide"
+    vy = 0.0
+    while p.y > 0:
+        dt = yield
+        vy += 1200 * dt
+        p.y -= vy * dt
+    p.y = 0
+    yield from squat(p, 0.55, 0.06)
+    for _ in range(8):
+        show.add(Particle("snow", p.x + random.uniform(-50, 50), show.ground - 5,
+                          random.uniform(-150, 150), -random.uniform(100, 250), 0.8))
+    yield from squat(p, 1.0, 0.25)
+    p.eyes = "open"
+    yield from say(p, random.choice(["ow", "nope", "maybe next update"]), 1.5)
+    yield from leave(show, side)
+
+
+def act_ufo(show):
+    """A UFO beams Tux up and flies off with him."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    yield from say(p, random.choice(["nice night", "so quiet out here", "hm?"]), 1.3)
+    ufo = Sprite(draw_ufo, p.x, -80)
+    ufo.extra["ground"] = show.ground
+    show.add(ufo)
+    yield from move(ufo, p.x, show.ground - 460, 1.2)
+    p.eyes = "wide"
+    show.add(Particle("text", p.x - 6, show.ground - 180, 0, -40, 1.0, "!"))
+    yield from wait(0.4)
+    ufo.extra["beam"] = True
+    p.bubble = random.choice(["uh oh", "take me to your kernel", "not again"])
+    t, start = 0.0, p.y
+    while t < 1.8:
+        dt = yield
+        t += dt
+        k = t / 1.8
+        p.y = start + (460 - 120) * k * k
+        p.flap = 0.5 + 0.5 * math.sin(t * 18)
+        p.rot = math.sin(t * 4) * 0.25
+        p.s = 1.0 - 0.6 * k
+        if t > 0.9:
+            p.bubble = None
+    p.hidden = True
+    ufo.extra["beam"] = False
+    yield from wait(0.3)
+    dx = random.choice((-1, 1))
+    vx = 0.0
+    while -200 < ufo.x < show.w + 200 and ufo.y > -200:
+        dt = yield
+        vx += 2500 * dt
+        ufo.x += dx * vx * dt
+        ufo.y -= vx * 0.35 * dt
+    ufo.alive = False
+
+
+def act_chase(show):
+    """Pac-Man shows up hungry. Tux runs."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot, speed=200)
+    yield from say(p, random.choice(["la la la", "what a nice day", "*whistles*"]), 1.4)
+    pac = Sprite(draw_pac, -120 if side == -1 else show.w + 120, show.ground - 9 * PX)
+    pac.extra["dir"] = 1 if side == -1 else -1
+    show.add(pac)
+    while abs(pac.x - p.x) > 360:
+        dt = yield
+        pac.x += pac.extra["dir"] * 260 * dt
+    p.face = -pac.extra["dir"]
+    p.eyes = "wide"
+    show.add(Particle("text", p.x - 6, show.ground - 180, 0, -40, 1.0, "!"))
+    yield from wait(0.5)
+    p.bubble = random.choice(["NOPE", "not food!", "aaaaa"])
+    p.face = pac.extra["dir"]
+    end = show.w + 200 if pac.extra["dir"] == 1 else -200
+    while (end - p.x) * pac.extra["dir"] > 0:
+        dt = yield
+        p.x += pac.extra["dir"] * 620 * dt
+        p.phase += dt * 30
+        p.flap = 0.4 + abs(math.sin(p.phase)) * 1.2
+        p.y = abs(math.sin(p.phase)) * 10
+        pac.x += pac.extra["dir"] * 600 * dt
+        if abs(p.x - show.w / 2) > show.w / 2 + 100:
+            p.bubble = None
+    while -200 < pac.x < show.w + 200:
+        pac.x += pac.extra["dir"] * 600 * (yield)
+    pac.alive = False
+    p.hidden = True
+
+
+def act_snowball(show):
+    """Tux throws a snowball at you. It sticks to the screen for a moment."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    p.face = 1 if spot < show.w / 2 else -1
+    yield from say(p, random.choice(["heads up!", "catch!", "think fast"]), 1.2)
+    yield from squat(p, 0.85, 0.2)
+    p.flap = 2.0
+    yield from wait(0.15)
+    p.squash, p.flap = 1.0, 0.2
+    ball = Sprite(draw_snowball, p.x, show.ground - 150)
+    ball.extra["r"] = 1
+    show.add(ball)
+    tx, ty = show.w / 2 + random.uniform(-200, 200), show.h * 0.4
+    sx, sy, t = ball.x, ball.y, 0.0
+    while t < 0.6:
+        t += yield
+        k = min(t / 0.6, 1)
+        ball.x = sx + (tx - sx) * k
+        ball.y = sy + (ty - sy) * k - math.sin(k * math.pi) * 120
+        ball.extra["r"] = 1 + int(k * k * 7)
+    ball.alive = False
+    blobs = []
+    for _ in range(150):  # the splat, built from chunky squares
+        a, d = random.uniform(0, 2 * math.pi), abs(random.gauss(0, 65))
+        size = random.choice((10, 20, 20, 30))
+        blobs.append((math.cos(a) * d * 1.3 // 10 * 10, math.sin(a) * d // 10 * 10, size))
+    for i in range(6):  # drips
+        x = random.uniform(-60, 60) // 10 * 10
+        for j in range(random.randint(3, 8)):
+            blobs.append((x, 40 + j * 10, 10))
+    splat = Sprite(draw_splat, tx, ty)
+    splat.extra.update(blobs=blobs, life=4.0)
+    show.add(splat)
+    p.beak_open = True
+    yield from say(p, random.choice(["hehe", "got you", "bullseye"]), 1.5)
+    t = 0.0
+    while splat.extra["life"] > 0:
+        dt = yield
+        splat.extra["life"] -= dt
+    splat.alive = False
+    yield from leave(show, side)
+
+
+def act_cool(show):
+    """Sunglasses drop out of the sky onto Tux. Deal with it."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    p.face = 1
+    glasses = Sprite(draw_glasses, p.x, -40)
+    show.add(glasses)
+    face_y = show.ground - (BY + 22 - 3) * PX - 3 * PX + 6
+    yield from move(glasses, p.x, face_y, 1.6)
+    glasses.alive = False
+    p.shades = True
+    for _ in range(10):
+        show.add(Particle("spark", p.x + random.uniform(-80, 80), show.ground - random.uniform(80, 200),
+                          random.uniform(-40, 40), random.uniform(-60, -10), 1.0))
+    yield from say(p, random.choice(["deal with it", "8-)", "too cool for Windows"]), 2.0)
+    yield from leave(show, side, speed=220)
+
+
+# ── meme acts ──
+
+def draw_lava(cr, l):
+    level = l.extra["level"]
+    if level <= 0:
+        return
+    w, ground = l.extra["w"], l.extra["ground"]
+    for x in range(0, int(w) + PX, PX):
+        top = ground + 14 - level - math.sin(x * 0.02 + l.t * 3) * 6 - math.sin(x * 0.05 - l.t * 5) * 3
+        top = round(top / PX) * PX
+        cr.set_source_rgb(1.0, 0.85, 0.25)
+        cr.rectangle(x, top, PX, PX)
+        cr.fill()
+        cr.set_source_rgb(0.95, 0.35, 0.08)
+        cr.rectangle(x, top + PX, PX, ground + 14 - top)
+        cr.fill()
+    for i in range(6):  # bubbles popping on the surface
+        bx = (i * 337 + l.t * 40 * (1 + i % 3)) % w
+        cr.set_source_rgb(1.0, 0.6, 0.15)
+        cr.rectangle(round(bx / PX) * PX, ground + 14 - level + PX * (2 + i % 3), PX * 2, PX * 2)
+        cr.fill()
+
+
+def draw_loading(cr, b):
+    w, x0, y0 = 460, round(b.x - 230 + b.extra.get("shake", 0)), round(b.y)
+    h = 120
+    cr.set_source_rgb(*LIGHT)
+    cr.rectangle(x0 + 3, y0, w - 6, h)
+    cr.rectangle(x0, y0 + 3, w, h - 6)
+    cr.fill()
+    cr.set_source_rgb(*PAPER)
+    cr.rectangle(x0 + 3, y0 + 3, w - 6, h - 6)
+    cr.fill()
+    cr.set_source_rgb(0.25, 0.27, 0.32)
+    cr.rectangle(x0 + 3, y0 + 3, w - 6, 26)
+    cr.fill()
+    pixel_text(cr, b.extra["title"], x0 + 10, y0 + 4, LIGHT)
+    bar_x, bar_y, bar_w = x0 + 20, y0 + 56, w - 120
+    cr.set_source_rgb(0.3, 0.32, 0.36)
+    cr.rectangle(bar_x, bar_y, bar_w, 24)
+    cr.fill()
+    p = b.extra["p"]
+    blocks = int(bar_w * p / 12)
+    for i in range(blocks):  # chunky progress blocks
+        cr.set_source_rgb(*ARCH_BLUE)
+        cr.rectangle(bar_x + 2 + i * 12, bar_y + 3, 9, 18)
+        cr.fill()
+    pixel_text(cr, f"{int(p * 100)}%", bar_x + bar_w + 14, bar_y - 2, LIGHT)
+    if b.extra.get("note"):
+        pixel_text(cr, b.extra["note"], x0 + 20, y0 + 86, (0.31, 0.98, 0.48))
+
+
+def draw_flames(cr, f):
+    t, cx, ground, height = f.t, f.extra["x"], f.extra["ground"], f.extra["height"]
+    for i, x in enumerate(range(round(cx - 420), round(cx + 420), PX * 2)):
+        if abs(x - cx) < 90:  # leave room for Tux's table
+            continue
+        h = height * (0.5 + 0.5 * abs(math.sin(i * 1.7 + t * 6) * math.sin(i * 0.6 - t * 3.3)))
+        for k in range(int(h / PX / 2)):
+            frac = k / max(1, h / PX / 2)
+            color = (1.0, 0.95, 0.6) if frac < 0.15 else (1.0, 0.7, 0.15) if frac < 0.5 else (0.9, 0.3, 0.08)
+            if random.random() < 0.9:
+                cr.set_source_rgba(*color, 1 - frac * 0.5)
+                cr.rectangle(x, ground + 4 - (k + 1) * PX * 2, PX * 2, PX * 2)
+                cr.fill()
+
+
+def draw_keycap(cr, k):
+    s = 10
+    down = k.extra.get("down", 0)
+    x0, y0 = round(k.x - 7 * s), round(k.y + down * s)
+    cr.set_source_rgb(0.18, 0.19, 0.22)  # base
+    cr.rectangle(x0 - s, y0 + 2 * s - down * s, 16 * s, 14 * s)
+    cr.fill()
+    face = 0.7 if down else 0.86
+    cr.set_source_rgb(face, face, face * 1.02)
+    cr.rectangle(x0, y0, 14 * s, 12 * s)
+    cr.fill()
+    cr.set_source_rgb(face * 0.8, face * 0.8, face * 0.82)
+    cr.rectangle(x0, y0 + 10 * s, 14 * s, 2 * s)
+    cr.fill()
+    pixel_text(cr, "F", x0 + 4 * s, y0 + s, INK, size=12, scale=6)
+
+
+def draw_aura(cr, a):
+    p, ground = a.extra["p"], a.extra["ground"]
+    cx, cy = p.x, ground - p.y - 70
+    pulse = 0.6 + 0.4 * math.sin(a.t * 18)
+    for _ in range(90):
+        ang = random.uniform(0, 2 * math.pi)
+        r = random.uniform(70, 110) * (0.9 + 0.2 * pulse)
+        x, y = cx + math.cos(ang) * r * 0.8, cy + math.sin(ang) * r * 1.1 - abs(math.cos(ang)) * 20
+        cr.set_source_rgba(1.0, 0.9, 0.3, 0.25 + 0.3 * pulse)
+        cr.rectangle(round(x / PX) * PX, round(y / PX) * PX, PX, PX * random.choice((1, 2, 3)))
+        cr.fill()
+
+
+def draw_rainbow(cr, r):
+    bands = [(0.93, 0.2, 0.2), (1.0, 0.6, 0.1), (1.0, 0.9, 0.2), (0.3, 0.85, 0.3), (0.2, 0.6, 1.0), (0.5, 0.35, 0.9)]
+    for i, (x, y) in enumerate(r.extra["trail"]):
+        wave = PX if (i // 6) % 2 else 0
+        for b, c in enumerate(bands):
+            cr.set_source_rgb(*c)
+            cr.rectangle(round(x), round(y + wave + b * PX * 2), PX * 2 + 1, PX * 2)
+            cr.fill()
+
+
+def draw_coffin(cr, c):
+    x0, y0 = round(c.x - 150), round(c.y)
+    cr.set_source_rgb(0.24, 0.16, 0.12)
+    for dx, dy, w, h in ((0, 6, 300, 36), (12, 0, 276, 48)):
+        cr.rectangle(x0 + dx, y0 + dy, w, h)
+    cr.fill()
+    cr.set_source_rgb(0.75, 0.6, 0.3)
+    cr.rectangle(x0 + 12, y0 + 20, 276, 4)
+    cr.fill()
+    pixel_text(cr, "RIP bugs", x0 + 90, y0 + 8, (0.95, 0.9, 0.8))
+
+
+class Buddy:
+    """An extra (smaller) penguin, for acts with more than one Tux."""
+
+    def __init__(self, p, show):
+        self.p, self.show, self.alive = p, show, True
+
+    def update(self, dt):
+        return self.alive
+
+    def draw(self, cr):
+        self.p.screen_w = self.show.w
+        self.p.draw(cr, self.show.ground)
+
+
+def say_colour(show, text, x, y, color, life=2.4, size=11, scale=3):
+    show.add(Particle("text", x, y, random.uniform(-10, 10), -12, life, text, color=color, size=size, scale=scale))
+
+
+def act_doge(show):
+    """such penguin. very linux. wow."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    p.face = random.choice((-1, 1))
+    words = random.sample(["such penguin", "much waddle", "very linux", f"so {DISTRO.lower()}", "wow", "amaze",
+                           "many flippers", "such kernel", "very open source", "so compile", "much fish"], 7)
+    for i, w in enumerate(words):
+        x = random.uniform(show.w * 0.1, show.w * 0.8)  # doge words go everywhere
+        y = show.ground - random.uniform(160, show.h * 0.6)
+        say_colour(show, w, x, y, (*[c / 255 for c in hsv_rgb(random.random())], 1.0), 3.2 - i * 0.25)
+        yield from wait(0.38)
+    p.eyes = "wide"
+    yield from say(p, "wow", 1.6)
+    p.eyes = "open"
+    yield from leave(show, side)
+
+
+def hsv_rgb(h):
+    import colorsys
+    return [int(c * 255) for c in colorsys.hsv_to_rgb(h, 0.65, 1.0)]
+
+
+def act_nyan(show):
+    """Tux flies across the screen on a rainbow."""
+    p = show.p
+    going = random.choice((-1, 1))
+    p.face = going
+    p.x = -160 if going == 1 else show.w + 160
+    base = show.ground - show.h * random.uniform(0.35, 0.55)
+    rainbow = Sprite(draw_rainbow, 0, 0)
+    rainbow.extra["trail"] = []
+    show.add(rainbow)
+    t = 0.0
+    while -200 <= p.x <= show.w + 200:
+        dt = yield
+        t += dt
+        p.x += going * 420 * dt
+        p.y = show.ground - base + math.sin(t * 6) * 14
+        p.flap = 0.8 + 0.7 * abs(math.sin(t * 20))
+        p.rot = 0.12 * going
+        tail_x = p.x - going * 70
+        rainbow.extra["trail"].append((tail_x - (PX if going == 1 else 0), show.ground - p.y - 90))
+        rainbow.extra["trail"] = rainbow.extra["trail"][-int(show.w / 6):]
+        if random.random() < 0.25:
+            show.add(Particle("spark", p.x + random.uniform(-500, 500), show.ground - p.y - random.uniform(-150, 250),
+                              -going * 120, 0, 1.0))
+        if t > 0.8 and not p.bubble:
+            p.bubble = "nyan nyan nyan"
+    p.bubble = None
+    p.hidden = True
+    rainbow.alive = False
+
+
+def act_dab(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    yield from say(p, random.choice(["hold my fish", "watch this", "one sec"]), 1.2)
+    yield from hop(p, 30, 0.25)
+    p.wings, p.rot, p.eyes = (2.7, 1.9), -0.35, "closed"
+    for _ in range(10):
+        show.add(Particle("spark", p.x + random.uniform(-90, 90), show.ground - random.uniform(60, 220),
+                          random.uniform(-40, 40), random.uniform(-60, -10), 1.0))
+    yield from say(p, "*dab*", 1.6)
+    p.wings, p.rot, p.eyes = None, 0.0, "open"
+    yield from leave(show, side)
+
+
+def act_floss(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    p.bubble = "*flossing*"
+    t, beat = 0.0, 0
+    while t < 4.0:
+        dt = yield
+        t += dt
+        s = math.sin(t * 9)
+        p.wings = (0.4 + 1.0 * max(0.0, s), 0.4 + 1.0 * max(0.0, -s))
+        p.tilt = -0.12 * s
+        p.phase = t * 9
+        if t > 1.5:
+            p.bubble = None
+        if int(t * 3) != beat:
+            beat = int(t * 3)
+            show.add(Particle("text", p.x + random.uniform(-80, 80), show.ground - 180,
+                              random.uniform(-30, 30), -80, 1.6, random.choice("♪♫")))
+    p.wings, p.tilt, p.phase = None, 0.0, 0.0
+    yield from leave(show, side)
+
+
+def act_loading(show):
+    """A file copy stuck at 99%. Tux kicks it."""
+    p = show.p
+    side, spot = entry(show)
+    box = Sprite(draw_loading, show.w / 2, show.h * 0.32)
+    box.extra.update(p=0.0, title=random.choice(["copying fish.tar.gz", "installing updates (1 of 1)",
+                                                "compiling kernel...", "downloading more RAM"]))
+    show.add(box)
+    walk = walk_to(p, show.w / 2 + 160)
+    next(walk)
+    t = 0.0
+    while box.extra["p"] < 0.99:
+        dt = yield
+        t += dt
+        box.extra["p"] = min(0.99, box.extra["p"] + dt * (0.6 if box.extra["p"] < 0.7 else 0.25))
+        try:
+            walk.send(dt)
+        except StopIteration:
+            pass
+    p.x = show.w / 2 + 160 if abs(p.x - (show.w / 2 + 160)) < 20 else p.x
+    yield from walk_to(p, show.w / 2 + 160)
+    p.face = -1
+    t = 0.0
+    while t < 2.2:  # foot tapping
+        dt = yield
+        t += dt
+        p.phase = t * 14 if int(t * 2) % 2 else 0
+        if t > 1.0:
+            p.bubble = "come on..."
+    p.bubble, p.phase = None, 0.0
+    yield from squat(p, 0.8, 0.15)
+    p.squash = 1.0
+    p.wings = (0.4, 2.0)
+    t = 0.0
+    while t < 0.4:  # kick
+        dt = yield
+        t += dt
+        box.extra["shake"] = random.choice((-10, -6, 6, 10)) if t < 0.3 else 0
+    p.wings = None
+    box.extra["p"] = 1.0
+    box.extra["note"] = "done!"
+    for _ in range(12):
+        show.add(Particle("spark", box.x + random.uniform(-220, 220), box.y + random.uniform(0, 110),
+                          random.uniform(-40, 40), random.uniform(-80, -20), 1.0))
+    yield from say(p, random.choice(["fixed it", "percussive maintenance", "works now"]), 1.6)
+    box.alive = False
+    yield from leave(show, side)
+
+
+def act_thisisfine(show):
+    """Coffee, a little table, and a room on fire. This is fine."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    p.face = 1
+    yield from squat(p, 0.86, 0.3)
+    p.mug = True
+    fire = Sprite(draw_flames, 0, 0)
+    fire.extra.update(x=p.x, ground=show.ground, height=0.0)
+    show.add(fire)
+    t = 0.0
+    while t < 5.2:
+        dt = yield
+        t += dt
+        fire.extra["height"] = min(180.0, t * 70)
+        if random.random() < 0.3:
+            show.add(Particle("dust", p.x + random.uniform(-420, 420), show.ground - fire.extra["height"],
+                              random.uniform(-15, 15), -60, 2.0, color=(0.35, 0.35, 0.38), size=PX * 3))
+        if 1.2 < t < 3.6:
+            p.bubble = "this is fine."
+        else:
+            p.bubble = None
+        p.wings = (0.45, 2.3) if 4.0 < t < 4.8 else (0.45, 1.1)  # a sip
+    p.wings, p.mug, p.squash = None, False, 1.0
+    fire.alive = False
+    p.eyes = "wide"
+    yield from leave(show, side, speed=700)
+
+
+def act_over9000(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    yield from say(p, "hnnnngh...", 1.0)
+    aura = Sprite(draw_aura, 0, 0)
+    aura.extra.update(p=p, ground=show.ground)
+    show.add(aura)
+    p.eyes = "wide"
+    t, level = 0.0, 0
+    while level < 9001:
+        dt = yield
+        t += dt
+        level = min(9001, int((t / 2.6) ** 2 * 9001))
+        p.bubble = f"power level: {level}"
+        p.squash = 0.88
+        p.tilt = random.uniform(-0.05, 0.05)
+        p.flap = 0.6 + 0.3 * random.random()
+        if random.random() < 0.5:
+            show.add(Particle("dust", p.x + random.uniform(-90, 90), show.ground - random.uniform(0, 40),
+                              0, -random.uniform(150, 300), 0.8, color=(1.0, 0.9, 0.3), size=PX))
+    p.squash, p.tilt = 1.0, 0.0
+    yield from say(p, "IT'S OVER 9000!!!", 1.8)
+    aura.alive = False
+    p.eyes, p.flap = "open", 0.0
+    yield from hop(p, 260, 0.9)
+    yield from leave(show, side, speed=600)
+
+
+def act_pressf(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    key = Sprite(draw_keycap, show.w / 2, show.h * 0.22)
+    show.add(key)
+    yield from say(p, "press F to pay respects", 1.8)
+    key.extra["down"] = 1
+    p.eyes, p.squash = "closed", 0.82
+    yield from wait(0.25)
+    key.extra["down"] = 0
+    t = 0.0
+    while t < 2.6:
+        dt = yield
+        t += dt
+        for _ in range(2):
+            say_colour(show, "F", random.uniform(20, show.w - 40), random.uniform(-40, 40),
+                       (*[c / 255 for c in hsv_rgb(random.uniform(0.5, 0.7))], 1.0), 2.4)
+            show.things[-1].vy = random.uniform(200, 380)
+    key.alive = False
+    p.eyes, p.squash = "open", 1.0
+    yield from leave(show, side, speed=200)
+
+
+def act_snap(show):
+    """I don't feel so good... (then Tux turns to dust)."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    p.face = 1
+    p.eyes = "wide"
+    yield from say(p, "I don't feel so good...", 1.8)
+    surf = p.sprite(False)
+    surf.flush()
+    data, stride = surf.get_data(), surf.get_stride()
+    for sy in range(SPRITE_H):
+        for sx in range(SPRITE_W):
+            i = sy * stride + sx * 4
+            b, g, r, a = data[i], data[i + 1], data[i + 2], data[i + 3]
+            if a < 128:
+                continue
+            x = p.x + p.face * p.s * PX * (sx - SPRITE_W / 2)
+            y = show.ground - p.y + p.s * p.squash * (sy - (BY + 22)) * PX
+            show.add(Particle("dust", x, y, random.uniform(60, 160), random.uniform(-90, -10),
+                              random.uniform(1.0, 1.8), color=(r / 255, g / 255, b / 255), size=PX,
+                              delay=(sx / SPRITE_W) * 1.4 + random.uniform(0, 0.25)))
+    p.hidden = True
+    yield from wait(3.2)
+    p.hidden, p.eyes = False, "open"  # ...jk
+    p.x = random.uniform(show.w * 0.2, show.w * 0.8)
+    p.y = -170
+    while p.y < -60:
+        p.y += 260 * (yield)
+    yield from say(p, "jk", 1.2)
+    while p.y > -180:
+        p.y -= 320 * (yield)
+
+
+def act_coffin(show):
+    """Four little Tuxes carry a coffin across the screen, in step with the beat."""
+    show.p.hidden = True
+    going = random.choice((-1, 1))
+    x = show.w + 260 if going == -1 else -260
+    crew = []
+    for i in range(4):
+        q = Penguin()
+        q.s, q.face, q.wings = 0.55, going, (2.4, 2.4)
+        crew.append(q)
+        show.add(Buddy(q, show))
+    coffin = Sprite(draw_coffin, x, 0)
+    show.add(coffin)
+    t, beat = 0.0, 0
+    while -320 < x < show.w + 320:
+        dt = yield
+        t += dt
+        x += going * 170 * dt
+        bob = abs(math.sin(t * 6)) * 10
+        for i, q in enumerate(crew):
+            q.x = x + (-110 + i * 73)
+            q.y = bob
+            q.phase = t * 6 + (i % 2) * math.pi
+        coffin.x, coffin.y = x, show.ground - bob - 136  # resting on raised flippers
+        if int(t * 3) != beat:
+            beat = int(t * 3)
+            show.add(Particle("text", x + random.uniform(-160, 160), show.ground - 230,
+                              random.uniform(-20, 20), -70, 1.6, random.choice("♪♫")))
+    for q in show.things:
+        if isinstance(q, Buddy):
+            q.alive = False
+    coffin.alive = False
+
+
+def act_lava(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    lava = Sprite(draw_lava, 0, 0)
+    lava.extra.update(level=0.0, w=show.w, ground=show.ground)
+    show.add(lava)
+    p.eyes = "wide"
+    p.bubble = "THE FLOOR IS LAVA!"
+    t = 0.0
+    while t < 1.0:
+        dt = yield
+        t += dt
+        lava.extra["level"] = min(70.0, t * 140)
+        p.y = min(180.0, t * 400 - 400 * t * t + t * 180)
+        p.flap = 0.5 + abs(math.sin(t * 25)) * 1.3
+    t = 0.0
+    while t < 2.4:  # hover, frantically
+        dt = yield
+        t += dt
+        p.y = 140 + math.sin(t * 5) * 12
+        p.flap = 0.5 + abs(math.sin(t * 28)) * 1.4
+        if t > 1.2:
+            p.bubble = "...how long do I have to do this"
+    p.bubble = None
+    t = 0.0
+    while lava.extra["level"] > 0:
+        dt = yield
+        t += dt
+        lava.extra["level"] = max(0.0, 70 - t * 90)
+        p.y = max(0.0, 140 - t * 160)
+        p.flap = 0.5
+    lava.alive = False
+    p.y, p.flap, p.eyes = 0.0, 0.0, "open"
+    yield from say(p, "phew", 1.0)
+    yield from leave(show, side)
+
+
+def act_headout(show):
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot, speed=180)
+    yield from squat(p, 0.82, 0.3)
+    yield from say(p, "...", 1.6)
+    p.eyes = "closed"
+    yield from wait(0.8)
+    p.eyes = "open"
+    yield from say(p, "ight, imma head out", 1.8)
+    p.squash = 1.0
+    yield from leave(show, side, speed=520)
+
+
+def act_leeroy(show):
+    p = show.p
+    side = random.choice((-1, 1))
+    p.x = 120 if side == -1 else show.w - 120
+    p.y = -170
+    while p.y < 0:
+        p.y = min(0.0, p.y + 400 * (yield))
+    p.face = -side
+    yield from say(p, "alright chums, let's do this", 2.0)
+    p.eyes = "wide"
+    t = 0.0
+    end = show.w + 200 if side == -1 else -200
+    while (end - p.x) * -side > 0:
+        dt = yield
+        t += dt
+        p.x += -side * 700 * dt
+        p.phase += dt * 30
+        p.y = abs(math.sin(p.phase)) * 10
+        p.flap = 1.2 + 0.6 * abs(math.sin(p.phase))
+        e = min(10, int(t * 8))
+        p.bubble = "LEE" + "E" * e + "ROY" + (" JENKINS!" if t > 1.2 else "")
+    p.bubble = None
+    p.hidden = True
+    yield from wait(1.0)
+    show.add(Particle("text", show.w / 2 - 260, show.h * 0.4, 0, -10, 2.2, "at least I have chicken",
+                      color=(0.8, 0.8, 0.85, 1.0), size=10, scale=3))
+    yield from wait(2.2)
+
+
+# ---------- the fun CLI tools, in person: fortune, cowsay, pipes.sh, cmatrix ----------
+
+def get_fortune(limit=110):
+    """A short real fortune when fortune(6) is installed, else one of Tux's own sayings."""
+    import shutil, subprocess
+    if shutil.which("fortune"):
+        try:
+            out = subprocess.run(["fortune", "-s", "-n", str(limit)], capture_output=True, text=True,
+                                 timeout=2).stdout
+            if out.strip():
+                return " ".join(out.split())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return random.choice(SAYINGS)
+
+
+def wrap_lines(text, width=34):
+    import textwrap
+    return textwrap.wrap(text, width) or [text]
+
+
+def terminal_box(cr, lines, cx, bottom, screen_w, prompt=None, tail=True):
+    """Tux's little terminal bubble, for several lines: an optional green prompt line, then the text.
+    Centred over cx with its bottom (and stair-stepped tail) at `bottom`."""
+    b = 3
+    rows = ([("$ " + prompt, True)] if prompt else []) + [(l, False) for l in lines]
+    sizes = [pixel_text(cr, t, 0, 0, LIGHT, measure=True) for t, _ in rows]
+    w = max(tw for tw, _ in sizes) + 16
+    lh = sizes[0][1] - 6
+    h = lh * len(rows) + 10
+    bx = round(max(10, min(cx - w / 2, screen_w - w - 10)))
+    by = round(bottom - h - (18 if tail else 0))
+    cr.set_source_rgb(*LIGHT)
+    cr.rectangle(bx + b, by, w - 2 * b, h)
+    cr.rectangle(bx, by + b, w, h - 2 * b)
+    cr.fill()
+    cr.set_source_rgb(*PAPER)
+    cr.rectangle(bx + b, by + b, w - 2 * b, h - 2 * b)
+    cr.fill()
+    if tail:
+        t = round(min(max(cx, bx + 24), bx + w - 24))
+        for i in range(4):
+            cr.set_source_rgb(*LIGHT)
+            cr.rectangle(t - 12 + i * 3, by + h - b + i * 4, 24 - i * 6, 4)
+            cr.fill()
+            if i < 3:
+                cr.set_source_rgb(*PAPER)
+                cr.rectangle(t - 9 + i * 3, by + h - b + i * 4, 18 - i * 6, 4)
+                cr.fill()
+    for i, (text, is_prompt) in enumerate(rows):
+        pixel_text(cr, text, bx + 8, by + 4 + i * lh, (0.31, 0.98, 0.48) if is_prompt else LIGHT)
+
+
+COW_COL = {"W": (0.95, 0.95, 0.92), "K": (0.13, 0.13, 0.15), "P": (1.0, 0.68, 0.74), "E": INK,
+           "H": (0.95, 0.9, 0.75)}
+# the cow, as rectangles in sprite pixels: (x, y, w, h, colour), x towards its head, y up from the hooves
+COW_BODY = [(-11, -13, 19, 8, "W"), (8, -16, 7, 7, "W")]
+COW_SPOTS = [(-9, -12, 4, 3, "K"), (-3, -9, 5, 3, "K"), (4, -13, 3, 2, "K"), (-11, -8, 2, 2, "K"),
+             (10, -16, 3, 2, "K"), (6, -15, 2, 1, "K"), (15, -15, 2, 1, "K"), (9, -18, 1, 2, "H"),
+             (13, -18, 1, 2, "H"), (8, -11, 7, 2, "P"), (10, -10, 1, 1, "E"), (12, -10, 1, 1, "E"),
+             (-1, -5, 3, 1, "P"), (-12, -13, 1, 5, "K"), (-13, -8, 2, 2, "K")]
+
+
+def draw_cow(cr, c):
+    face, step = c.extra["face"], c.extra.get("step", 0.0)
+    legs = []
+    for i, lx in enumerate((-9, -6, 3, 6)):  # diagonal pairs lift together while walking
+        lift = max(0.0, math.sin(step + (0 if i in (0, 3) else math.pi))) * 1.2
+        legs.append((lx, -5 - lift, 2, 5, "W"))
+        legs.append((lx, -1 - lift, 2, 1, "K"))
+    bob = abs(math.sin(step)) * 0.6
+
+    def rect(x, y, w, h, col, grow=0):
+        sx = c.x + (x if face > 0 else -(x + w)) * PX
+        cr.set_source_rgb(*(INK if grow else COW_COL[col]))
+        cr.rectangle(round(sx - grow), round(c.y + (y - bob) * PX - grow), w * PX + 2 * grow, h * PX + 2 * grow)
+        cr.fill()
+
+    for shape in COW_BODY + legs:  # a dark outline first, so the cow shows on light wallpapers too
+        rect(*shape, grow=3)
+    for shape in COW_BODY + legs + COW_SPOTS:
+        rect(*shape)
+    blink = (c.t % 3.1) < 0.12
+    for ex in (9, 12):
+        rect(ex, -13, 1, 1 if not blink else 0.4, "E")
+    if c.extra.get("lines"):
+        terminal_box(cr, c.extra["lines"], c.x + face * 6 * PX, c.y - 19 * PX, c.extra["screen_w"],
+                     prompt="fortune | cowsay")
+
+
+def walk_sprite(sp, tx, speed=240):
+    sp.extra["face"] = 1 if tx > sp.x else -1
+    while abs(sp.x - tx) > 3:
+        dt = yield
+        sp.x += sp.extra["face"] * min(speed * dt, abs(sp.x - tx))
+        sp.extra["step"] = sp.extra.get("step", 0.0) + dt * 9
+
+
+def together(*gens):
+    """Run several act steps at once (a cow and a penguin walking off together)."""
+    gens = list(gens)
+    for g in gens:
+        next(g)
+    while gens:
+        dt = yield
+        alive = []
+        for g in gens:
+            try:
+                g.send(dt)
+                alive.append(g)
+            except StopIteration:
+                pass
+        gens = alive
+
+
+def act_cowsay(show):
+    """fortune | cowsay, in person: a cow walks up to Tux and reads him his fortune."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    cow_side = 1 if p.x < show.w / 2 else -1  # the cow comes from the roomier side
+    cow = Sprite(draw_cow, show.w + 260 if cow_side == 1 else -260, show.ground)
+    cow.extra.update(face=-cow_side, screen_w=show.w)
+    show.add(cow)
+    p.face = cow_side
+    p.eyes = "wide"
+    yield from walk_sprite(cow, p.x + cow_side * 260)
+    cow.extra["face"] = -cow_side
+    p.eyes = "open"
+    yield from say(p, random.choice(["moo?", "a cow??", "hi cow", "...cowsay?"]), 1.4)
+    text = get_fortune()
+    cow.extra["lines"] = wrap_lines(text)
+    yield from wait(min(7.0, 2.2 + len(text) / 18))
+    cow.extra["lines"] = None
+    yield from say(p, random.choice(["wise cow.", "deep.", "moo indeed", "noted", "the cow knows"]), 1.6)
+    # the cow heads back where it came from, Tux off the other way
+    yield from together(walk_sprite(cow, show.w + 300 if cow_side == 1 else -300),
+                        walk_to(p, -160 if cow_side == 1 else show.w + 160, 320))
+    cow.alive = False
+
+
+COOKIE = ["....DDDD....", "..DDYYYYDD..", ".DYYYYYYYYD.", "DYYYYDDYYYYD", "DYYYD..DYYYD", ".DDD....DDD."]
+COOKIE_COL = {"Y": (0.93, 0.72, 0.35), "D": (0.66, 0.44, 0.18)}
+
+
+def draw_cookie_half(cr, c):
+    rows = [r[:6] for r in COOKIE] if c.extra["half"] < 0 else [r[6:] for r in COOKIE]
+    cr.save()
+    cr.translate(c.x, c.y)
+    cr.rotate(c.extra.get("spin", 0.0) * c.t)
+    blit(cr, rows, COOKIE_COL, -3 * PX if c.extra["half"] < 0 else 0, -3 * PX, PX, c.extra.get("a", 1.0))
+    cr.restore()
+
+
+def draw_cookie(cr, c):
+    blit(cr, COOKIE, COOKIE_COL, c.x - 6 * PX, c.y - 3 * PX, PX)
+
+
+def draw_slip(cr, c):
+    """The paper slip, unrolling upwards out of the cookie."""
+    k = min(1.0, c.t / 0.6)
+    lines = c.extra["lines"]
+    sizes = [pixel_text(cr, l, 0, 0, INK, measure=True) for l in lines]
+    w = max(tw for tw, _ in sizes) + 20
+    lh = sizes[0][1] - 6
+    full = lh * len(lines) + 14
+    h = max(PX, round(full * k))
+    x = round(max(10, min(c.x - w / 2, c.extra["screen_w"] - w - 10)))
+    y = round(c.y - h)
+    cr.set_source_rgb(0.97, 0.95, 0.88)
+    cr.rectangle(x, y, w, h)
+    cr.fill()
+    cr.set_source_rgb(0.85, 0.82, 0.74)
+    cr.rectangle(x, y, w, 3)
+    cr.fill()
+    if k >= 1:
+        for i, l in enumerate(lines):
+            pixel_text(cr, l, x + 10, y + 7 + i * lh, (0.75, 0.2, 0.2) if l.startswith("lucky") else INK)
+
+
+def act_fortune(show):
+    """Tux cracks open a fortune cookie and reads the slip."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    p.face = 1
+    hand = show.ground - 70
+    cookie = Sprite(draw_cookie, p.x, -40)
+    show.add(cookie)
+    p.eyes = "wide"
+    yield from move(cookie, p.x, hand, 1.2)
+    p.eyes = "open"
+    yield from wait(0.4)
+    p.flap = 0.8
+    cookie.alive = False
+    for half in (-1, 1):
+        h = Sprite(draw_cookie_half, p.x + half * 10, hand)
+        h.extra.update(half=half, spin=half * 3)
+        show.add(h)
+        show.add(Particle("dust", p.x, hand, half * 120, -60, 0.6, color=COOKIE_COL["Y"], size=PX))
+    for _ in range(6):
+        show.add(Particle("dust", p.x + random.uniform(-20, 20), hand, random.uniform(-80, 80),
+                          random.uniform(-160, -60), 0.7, color=COOKIE_COL["D"], size=PX))
+    halves = [t for t in show.things if isinstance(t, Sprite) and t.draw_fn is draw_cookie_half]
+    t = 0.0
+    while t < 0.5:  # the halves drop away
+        dt = yield
+        t += dt
+        for hs in halves:
+            hs.x += (-1 if hs.extra["half"] < 0 else 1) * 160 * dt
+            hs.y += 260 * dt * t * 4
+            hs.extra["a"] = max(0.0, 1 - t * 2)
+    for hs in halves:
+        hs.alive = False
+    p.flap = 0
+    slip = Sprite(draw_slip, p.x, show.ground - 150)
+    lucky = " ".join(str(n) for n in sorted(random.sample(range(1, 50), 6)))
+    slip.extra.update(lines=wrap_lines(get_fortune(90), 30) + ["", f"lucky numbers: {lucky}"], screen_w=show.w)
+    show.add(slip)
+    yield from wait(min(7.0, 3.0 + len(" ".join(slip.extra["lines"])) / 20))
+    slip.alive = False
+    yield from say(p, random.choice(["huh.", "spooky", "accurate", "I'll take it", "...in bed"]), 1.6)
+    yield from leave(show, side)
+
+
+PIPE_COLS = [(0.54, 0.68, 0.96), (0.78, 0.63, 0.96), (0.55, 0.84, 0.79), (0.65, 0.85, 0.58),
+             (0.93, 0.83, 0.62), (0.96, 0.66, 0.5), (0.93, 0.53, 0.59)]
+
+
+def draw_pipes(cr, sp):
+    a = sp.extra.get("a", 1.0)
+    cell = sp.extra["cell"]
+    for col, pts in sp.extra["pipes"]:
+        cr.set_source_rgba(*col, a)
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            if abs(x1 - x0) + abs(y1 - y0) > 1:  # wrapped round the screen edge
+                continue
+            x, y = min(x0, x1) * cell, min(y0, y1) * cell
+            w = abs(x1 - x0) * cell + PX * 2
+            h = abs(y1 - y0) * cell + PX * 2
+            cr.rectangle(round(x - PX), round(y - PX), round(w), round(h))
+        cr.fill()
+
+
+def act_pipes(show):
+    """pipes.sh, live: Tux starts the old screensaver and pipes grow all over the screen."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    yield from say(p, "pipes.sh", 1.2)
+    cell = 4 * PX
+    cols, rows = int(show.w / cell), int(show.ground / cell)
+    sp = Sprite(draw_pipes, 0, 0)
+    sp.extra.update(cell=cell, pipes=[])
+    show.add(sp)
+    heads = []
+    for i in range(6):
+        start = (int(p.x / cell), int((show.ground - 100) / cell))
+        heads.append([start, random.randrange(4), PIPE_COLS[i % len(PIPE_COLS)]])
+        sp.extra["pipes"].append((heads[-1][2], [start]))
+    p.eyes = "wide"
+    t, steps = 0.0, 0
+    while t < 5.0:
+        t += yield
+        while steps < t * 26:
+            steps += 1
+            for i, h in enumerate(heads):
+                (x, y), d, _ = h
+                if random.random() < 0.15:
+                    d = (d + random.choice((1, 3))) % 4
+                dx, dy = ((0, -1), (1, 0), (0, 1), (-1, 0))[d]
+                x, y = (x + dx) % cols, (y + dy) % rows
+                h[0], h[1] = (x, y), d
+                sp.extra["pipes"][i][1].append((x, y))
+    t = 0.0
+    while t < 0.8:
+        t += yield
+        sp.extra["a"] = 1 - t / 0.8
+    sp.alive = False
+    p.eyes = "open"
+    yield from say(p, random.choice(["plumbing!", "it's a series of tubes", "Ctrl+C to exit"]), 1.6)
+    yield from leave(show, side)
+
+
+MATRIX_GLYPHS = "0123456789ABCDEFabcdef$#*+=<>{}[]:;!?%&@"  # cmatrix's own ASCII set: the pixel font has no katakana
+
+
+def draw_rain(cr, sp):
+    a = sp.extra.get("a", 1.0)
+    cr.select_font_face(FONT, cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(20)
+    step = 26
+    for col, (speed, offset, length) in enumerate(sp.extra["cols"]):
+        head = (sp.t * speed + offset) % (sp.extra["h"] / step + length)
+        for k in range(length):
+            row = int(head) - k
+            if row < 0 or row * step > sp.extra["h"]:
+                continue
+            g = MATRIX_GLYPHS[(col * 7 + row * 13 + int(sp.t * 6) * (k % 3 == 0)) % len(MATRIX_GLYPHS)]
+            if k == 0:
+                cr.set_source_rgba(0.85, 1.0, 0.88, a)
+            else:
+                cr.set_source_rgba(0.2, 0.95, 0.4, a * (1 - k / length) * 0.9)
+            cr.move_to(col * step + 4, row * step)
+            cr.show_text(g)
+
+
+def act_cmatrix(show):
+    """cmatrix: digital rain pours down the screen while Tux puts his shades on."""
+    p = show.p
+    side, spot = entry(show)
+    yield from walk_to(p, spot)
+    rain = Sprite(draw_rain, 0, 0)
+    rain.extra.update(h=show.ground, a=0.0,
+                      cols=[(random.uniform(8, 20), random.uniform(0, 40), random.randint(6, 16))
+                            for _ in range(int(show.w / 26) + 1)])
+    show.things.insert(0, rain)  # behind Tux
+    t = 0.0
+    while t < 0.8:
+        t += yield
+        rain.extra["a"] = t / 0.8
+    p.shades = True
+    yield from say(p, "I know kung fu.", 1.8)
+    yield from wait(1.2)
+    yield from say(p, random.choice(["there is no spoon", "follow the white rabbit", f"I use {DISTRO} btw"]), 1.8)
+    t = 0.0
+    while t < 0.8:
+        t += yield
+        rain.extra["a"] = 1 - t / 0.8
+    rain.alive = False
+    yield from leave(show, side, speed=220)
+
+
+ACTS = {
+    "stroll": act_stroll, "dance": act_dance, "slide": act_slide, "backflip": act_backflip,
+    "fish": act_fish, "nap": act_nap, "peek": act_peek, "fly": act_fly,
+    "ufo": act_ufo, "chase": act_chase, "snowball": act_snowball, "cool": act_cool,
+    "doge": act_doge, "nyan": act_nyan, "dab": act_dab, "floss": act_floss, "loading": act_loading,
+    "thisisfine": act_thisisfine, "over9000": act_over9000, "pressf": act_pressf, "snap": act_snap,
+    "coffin": act_coffin, "lava": act_lava, "headout": act_headout, "leeroy": act_leeroy,
+    "cowsay": act_cowsay, "fortune": act_fortune, "pipes": act_pipes, "cmatrix": act_cmatrix,
+}
+
+
+class Show:
+    def __init__(self, act):
+        self.p = Penguin()
+        self.things = []
+        self.w = self.h = 0
+        self.ground = 0
+        self.act = act
+        self.script = None
+        self.last = time.monotonic()
+
+    def add(self, thing):
+        self.things.append(thing)
+
+    def tick(self):
+        now = time.monotonic()
+        dt = min(now - self.last, 0.05)
+        self.last = now
+        if self.w == 0:
+            return True
+        if self.script is None:
+            self.script = self.act(self)
+            next(self.script)
+        done = False
+        try:
+            self.script.send(dt)
+        except StopIteration:
+            done = True
+        self.things = [t for t in self.things if t.update(dt)]
+        self.area.queue_draw()
+        if done and not self.things:
+            self.app.quit()
+            return False
+        return True
+
+    def draw(self, area, cr, w, h):
+        self.w, self.h = w, h
+        self.ground = h - 14
+        self.p.screen_w = w
+        cr.set_operator(cairo.OPERATOR_CLEAR)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_antialias(cairo.ANTIALIAS_NONE)
+        for t in self.things:
+            t.draw(cr)
+        self.p.draw(cr, self.ground)
+
+
+def main():
+    # the fun-CLI acts (cowsay, fortune, pipes.sh, cmatrix) are picked about a third of the time
+    fun = ["cowsay", "fortune", "pipes", "cmatrix"]
+    pick = random.choice(fun) if random.random() < 0.33 else random.choice(list(ACTS))
+    name = sys.argv[1] if len(sys.argv) > 1 else pick
+    if name not in ACTS:
+        sys.exit("acts: " + ", ".join(ACTS))
+
+    # one penguin at a time: a new press sends the old one home
+    try:
+        os.kill(int(open(PIDFILE).read()), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    show = Show(ACTS[name])
+    app = Gtk.Application(application_id=None)
+    show.app = app
+
+    def activate(app):
+        win = Gtk.ApplicationWindow(application=app)
+        Layer.init_for_window(win)
+        Layer.set_namespace(win, "penguin")
+        Layer.set_layer(win, Layer.Layer.OVERLAY)
+        for edge in (Layer.Edge.TOP, Layer.Edge.BOTTOM, Layer.Edge.LEFT, Layer.Edge.RIGHT):
+            Layer.set_anchor(win, edge, True)
+        Layer.set_exclusive_zone(win, -1)
+        Layer.set_keyboard_mode(win, Layer.KeyboardMode.NONE)
+
+        css = Gtk.CssProvider()
+        css.load_from_string("window { background: transparent; }")
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        area = Gtk.DrawingArea()
+        area.set_draw_func(show.draw)
+        show.area = area
+        win.set_child(area)
+        # clicks go straight through to whatever is underneath
+        win.connect("realize", lambda w: w.get_surface().set_input_region(cairo.Region()))
+        win.present()
+        GLib.timeout_add(16, show.tick)
+        GLib.timeout_add_seconds(30, app.quit)  # safety net
+
+    app.connect("activate", activate)
+    GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, app.quit)
+    try:
+        app.run([])
+    finally:
+        try:
+            if open(PIDFILE).read() == str(os.getpid()):
+                os.remove(PIDFILE)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Bluetooth pairing agent: answers the "confirm this code?" questions that pairing asks.
+
+Without one of these running, every pairing attempt (Caelestia's panel, Overskride,
+bluetooth-manager, bluetoothctl) dies with "No agent available" and times out.
+Runs as the systemd user service bluetooth-agent.service and survives bluetoothd restarts.
+"""
+import subprocess
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+BUS = "org.bluez"
+AGENT_IFACE = "org.bluez.Agent1"
+AGENT_PATH = "/dev/mrpythoneer/bluetooth_agent"
+CAPABILITY = "KeyboardDisplay"  # can show codes and confirm them, so every pairing method works
+
+
+class Rejected(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
+
+
+def notify(summary, body="", urgent=False):
+    args = ["notify-send", "-a", "Bluetooth", "-i", "bluetooth"]
+    if urgent:
+        args += ["-u", "critical"]
+    subprocess.Popen(args + [summary, body])
+
+
+class Agent(dbus.service.Object):
+    def __init__(self, bus):
+        super().__init__(bus, AGENT_PATH)
+        self.bus = bus
+
+    def device(self, path):
+        props = dbus.Interface(self.bus.get_object(BUS, path), "org.freedesktop.DBus.Properties")
+        return props.GetAll("org.bluez.Device1")
+
+    def name(self, path):
+        try:
+            d = self.device(path)
+            return str(d.get("Alias") or d.get("Name") or d.get("Address"))
+        except dbus.DBusException:
+            return path.rsplit("/", 1)[-1].removeprefix("dev_").replace("_", ":")
+
+    def adapter_busy_pairing(self, path):
+        """True while the user is actively looking for devices (scan on / discoverable)."""
+        adapter = path.rsplit("/", 1)[0]
+        props = dbus.Interface(self.bus.get_object(BUS, adapter), "org.freedesktop.DBus.Properties")
+        a = props.GetAll("org.bluez.Adapter1")
+        return bool(a.get("Discovering") or a.get("Discoverable"))
+
+    @dbus.service.method(AGENT_IFACE, in_signature="", out_signature="")
+    def Release(self):
+        pass
+
+    @dbus.service.method(AGENT_IFACE, in_signature="", out_signature="")
+    def Cancel(self):
+        pass
+
+    # Numeric comparison (headphones, phones, most modern stuff): accept it.
+    # The adapter is not discoverable, so only a device you are pairing with can get here.
+    @dbus.service.method(AGENT_IFACE, in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        self.trust(device)
+        notify(f"Pairing with {self.name(device)}", f"Code {passkey:06d} accepted")
+
+    # "Just works" pairing started by the other device: only while you are scanning.
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        if not self.adapter_busy_pairing(device):
+            notify("Blocked a pairing request", f"{self.name(device)} tried to pair while you weren't scanning")
+            raise Rejected("not scanning")
+        self.trust(device)
+
+    # A profile (audio, input…) asking to connect: fine for devices you've paired.
+    @dbus.service.method(AGENT_IFACE, in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        try:
+            d = self.device(device)
+        except dbus.DBusException:
+            raise Rejected("unknown device")
+        if not (d.get("Paired") or d.get("Trusted") or d.get("Bonded")):
+            raise Rejected("not paired")
+
+    # Keyboards: the code has to be typed on the keyboard itself.
+    @dbus.service.method(AGENT_IFACE, in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        if entered == 0:
+            notify(f"Type {passkey:06d} on {self.name(device)}", "then press Enter on it", urgent=True)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        notify(f"Type {pincode} on {self.name(device)}", "then press Enter on it", urgent=True)
+
+    # Old devices with a fixed PIN almost always use 0000.
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        self.trust(device)
+        return "0000"
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        self.trust(device)
+        return dbus.UInt32(0)
+
+    def trust(self, device):
+        # Trusted devices may reconnect on their own later (mice, headphones after sleep)
+        try:
+            props = dbus.Interface(self.bus.get_object(BUS, device), "org.freedesktop.DBus.Properties")
+            props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+        except dbus.DBusException:
+            pass
+
+
+def register(bus):
+    try:
+        manager = dbus.Interface(bus.get_object(BUS, "/org/bluez"), "org.bluez.AgentManager1")
+        try:
+            manager.UnregisterAgent(AGENT_PATH)
+        except dbus.DBusException:
+            pass
+        manager.RegisterAgent(AGENT_PATH, CAPABILITY)
+        manager.RequestDefaultAgent(AGENT_PATH)
+    except dbus.DBusException as e:
+        print(f"could not register agent: {e}", flush=True)
+        return
+    make_pairable(bus)
+    print("agent registered", flush=True)
+
+
+def make_pairable(bus):
+    objects = dbus.Interface(bus.get_object(BUS, "/"), "org.freedesktop.DBus.ObjectManager").GetManagedObjects()
+    for path, ifaces in objects.items():
+        if "org.bluez.Adapter1" in ifaces:
+            props = dbus.Interface(bus.get_object(BUS, path), "org.freedesktop.DBus.Properties")
+            try:
+                props.Set("org.bluez.Adapter1", "PairableTimeout", dbus.UInt32(0))
+                props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(True))
+            except dbus.DBusException as e:
+                print(f"could not make {path} pairable: {e}", flush=True)
+
+
+def main():
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    Agent(bus)
+
+    # bluetoothd restarts (or resumes) forget agents: register again every time it appears
+    def owner_changed(new_owner):
+        if new_owner:
+            GLib.timeout_add(500, lambda: register(bus) and False)
+    bus.watch_name_owner(BUS, owner_changed)
+
+    # A new adapter (USB dongle, or the built-in one coming back after rfkill) starts unpairable
+    def iface_added(path, ifaces):
+        if "org.bluez.Adapter1" in ifaces:
+            make_pairable(bus)
+    bus.add_signal_receiver(iface_added, "InterfacesAdded", "org.freedesktop.DBus.ObjectManager", BUS)
+
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

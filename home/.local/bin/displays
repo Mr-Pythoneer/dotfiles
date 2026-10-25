@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""Displays: drag your monitors into place, see which workspaces each one gets, save.
+
+Layouts are saved per set of connected monitors in ~/.config/hypr/display-profiles.lua and
+applied by ~/.config/hypr/displays.lua whenever that set of monitors is plugged in again.
+Opened with F7.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+# gtk4-layer-shell (for the Identify labels) has to be loaded before GTK
+LAYER_LIB = next((p for p in ("/usr/lib/libgtk4-layer-shell.so", "/usr/lib64/libgtk4-layer-shell.so.0",
+                              "/usr/lib64/libgtk4-layer-shell.so") if os.path.exists(p)), "")   # Arch / Fedora
+if LAYER_LIB and LAYER_LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = (LAYER_LIB + " " + os.environ.get("LD_PRELOAD", "")).strip()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+except (ValueError, ImportError):
+    LayerShell = None
+
+PROFILES = os.path.expanduser("~/.config/hypr/display-profiles.lua")
+WORKSPACES = 10
+SCALES = [1.0, 1.25, 1.5, 1.6, 2.0]
+SNAP = 60          # logical px: edges this close snap together
+REVERT_SECS = 15   # mode/scale changes undo themselves unless you keep them
+
+CSS = """
+.ws-badge { font-weight: bold; }
+.identify { background: rgba(12,13,15,0.85); border: 2px solid #8f949c; padding: 28px 48px; }
+.identify-num { font-size: 96px; font-weight: 800; color: #dcdcd8; }
+.identify-name { font-size: 22px; color: #9a9da3; }
+"""
+
+
+# ---------- data ----------
+
+class Mon:
+    def __init__(self, j):
+        self.name = j["name"]
+        self.desc = j["description"]
+        self.builtin = re.match(r"^(eDP|LVDS|DSI)", self.name) is not None
+        self.label = "Laptop screen" if self.builtin else (f'{j["make"]} {j["model"]}'.strip() or self.name)
+        self.modes = []
+        for m in j.get("availableModes", []):
+            m = m.removesuffix("Hz")
+            if m not in self.modes:
+                self.modes.append(m)
+        self.mode = f'{j["width"]}x{j["height"]}@{j["refreshRate"]:.2f}'
+        if self.mode not in self.modes:
+            self.modes.insert(0, self.mode)
+        self.scale = float(j["scale"])
+        self.transform = j["transform"]
+        self.x, self.y = j["x"], j["y"]
+        self.orig = (self.mode, self.scale)
+
+    @property
+    def size(self):  # logical size, the units positions are in
+        w, h = (int(v) for v in self.mode.split("@")[0].split("x"))
+        if self.transform % 2:
+            w, h = h, w
+        return round(w / self.scale), round(h / self.scale)
+
+    @property
+    def w(self):
+        return self.size[0]
+
+    @property
+    def h(self):
+        return self.size[1]
+
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def get_monitors():
+    mons = [Mon(j) for j in json.loads(hyprctl("monitors", "-j"))
+            if not j.get("disabled") and j.get("mirrorOf", "none") == "none"]
+    return mons
+
+
+def setup_key(mons):
+    return " + ".join(sorted(m.desc for m in mons))
+
+
+def workspace_ranges(mons):
+    """Same split as displays.lua: 10 workspaces, left to right, extras to the left."""
+    order = sorted(mons, key=lambda m: (m.x, m.y))
+    n, first, out = len(order), 1, {}
+    for i, m in enumerate(order):
+        count = WORKSPACES // n + (1 if i < WORKSPACES % n else 0)
+        out[m.name] = (first, first + count - 1) if count else None
+        first += count
+    return out
+
+
+def ws_text(r):
+    if not r:
+        return "no workspaces"
+    a, b = r
+    return f"workspace {a % 10}" if a == b else f"workspaces {a}–{b % 10}"
+
+
+def lua_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+ENTRY = re.compile(r'\{\s*desc\s*=\s*"((?:[^"\\]|\\.)*)",\s*mode\s*=\s*"([^"]*)",\s*x\s*=\s*(-?\d+),\s*'
+                   r'y\s*=\s*(-?\d+),\s*scale\s*=\s*([\d.]+)\s*\}')
+KEY = re.compile(r'^\s*\[("(?:[^"\\]|\\.)*")\]\s*=\s*\{\s*$')
+
+
+def unlua(s):
+    return re.sub(r'\\(.)', r'\1', s[1:-1] if s.startswith('"') else s)
+
+
+def load_profiles():
+    profiles, cur = {}, None
+    try:
+        lines = open(PROFILES).read().splitlines()
+    except FileNotFoundError:
+        return profiles
+    for line in lines:
+        k = KEY.match(line)
+        if k:
+            cur = profiles.setdefault(unlua(k.group(1)), [])
+            continue
+        e = ENTRY.search(line)
+        if e and cur is not None:
+            cur.append(dict(desc=unlua('"' + e.group(1) + '"'), mode=e.group(2),
+                            x=int(e.group(3)), y=int(e.group(4)), scale=float(e.group(5))))
+    return profiles
+
+
+def save_profiles(profiles):
+    out = ["-- Saved display layouts, written by ~/.local/bin/displays (F7). One entry per set of connected",
+           '-- monitors; the key is their descriptions, sorted and joined with " + ".',
+           "return {"]
+    for key in sorted(profiles):
+        out.append(f"    [{lua_str(key)}] = {{")
+        for p in profiles[key]:
+            scale = f'{p["scale"]:g}'
+            out.append(f'        {{ desc = {lua_str(p["desc"])}, mode = {lua_str(p["mode"])}, '
+                       f'x = {p["x"]}, y = {p["y"]}, scale = {scale} }},')
+        out.append("    },")
+    out.append("}")
+    tmp = PROFILES + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, PROFILES)
+
+
+# ---------- geometry ----------
+
+def overlaps(a, ax, ay, b):
+    return ax < b.x + b.w and ax + a.w > b.x and ay < b.y + b.h and ay + a.h > b.y
+
+
+def touches(a, ax, ay, b):
+    side = (ax + a.w == b.x or b.x + b.w == ax) and ay < b.y + b.h and ay + a.h > b.y
+    stack = (ay + a.h == b.y or b.y + b.h == ay) and ax < b.x + b.w and ax + a.w > b.x
+    return side or stack
+
+
+def snap_axis(v, size, lo, length):
+    """Snap an edge-aligned coordinate to start/centre/end alignment with a neighbour."""
+    for t in (lo, lo + length - size, lo + (length - size) // 2):
+        if abs(v - t) <= SNAP:
+            return t
+    return min(max(v, lo - size + 1), lo + length - 1)  # keep at least 1px of shared edge
+
+
+def settle(m, others, x, y):
+    """Where a dropped monitor ends up: flush against a neighbour, not overlapping, closest to the drop."""
+    if not others:
+        return 0, 0
+    cands, intended = [], []
+    for o in others:
+        sides = {
+            "left":  (o.x - m.w, snap_axis(y, m.h, o.y, o.h)),
+            "right": (o.x + o.w, snap_axis(y, m.h, o.y, o.h)),
+            "above": (snap_axis(x, m.w, o.x, o.w), o.y - m.h),
+            "below": (snap_axis(x, m.w, o.x, o.w), o.y + o.h),
+        }
+        cands += sides.values()
+        # the side you dragged toward: where the screen's centre sits relative to o's centre
+        dx = (x + m.w / 2 - (o.x + o.w / 2)) / (m.w + o.w)
+        dy = (y + m.h / 2 - (o.y + o.h / 2)) / (m.h + o.h)
+        intended.append(sides[("left" if dx < 0 else "right") if abs(dx) >= abs(dy) else ("above" if dy < 0 else "below")])
+    dist = lambda c: (c[0] - x) ** 2 + (c[1] - y) ** 2  # noqa: E731
+    free = lambda cs: [c for c in cs if not any(overlaps(m, *c, o) for o in others)]  # noqa: E731
+    return min(free(intended) or free(cands) or cands, key=dist)
+
+
+def normalize(mons):
+    dx, dy = min(m.x for m in mons), min(m.y for m in mons)
+    for m in mons:
+        m.x -= dx
+        m.y -= dy
+
+
+# ---------- identify labels ----------
+
+def identify(app, mons):
+    if LayerShell is None or not LayerShell.is_supported():
+        return
+    ranges = workspace_ranges(mons)
+    display = Gdk.Display.get_default()
+    gdk_mons = {gm.get_connector(): gm for gm in display.get_monitors()}
+    order = sorted(mons, key=lambda m: (m.x, m.y))
+    wins = []
+    for i, m in enumerate(order, 1):
+        gm = gdk_mons.get(m.name)
+        if gm is None:
+            continue
+        win = Gtk.Window(application=app)
+        LayerShell.init_for_window(win)
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        LayerShell.set_monitor(win, gm)
+        LayerShell.set_namespace(win, "displays-identify")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.add_css_class("identify")
+        num = Gtk.Label(label=str(i))
+        num.add_css_class("identify-num")
+        name = Gtk.Label(label=f"{m.label}\n{m.name} · {ws_text(ranges.get(m.name))}", justify=Gtk.Justification.CENTER)
+        name.add_css_class("identify-name")
+        box.append(num)
+        box.append(name)
+        win.set_child(box)
+        win.present()
+        wins.append(win)
+    GLib.timeout_add(2500, lambda: [w.destroy() for w in wins] and False)
+
+
+# ---------- UI ----------
+
+class Arranger(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Displays", default_width=820, default_height=560)
+        self.app = app
+        self.mons = get_monitors()
+        self.selected = next((m for m in self.mons if not m.builtin), self.mons[0] if self.mons else None)
+        self.drag = None  # (monitor, start x, start y)
+
+        header = Adw.HeaderBar()
+        ident = Gtk.Button(label="Identify")
+        ident.connect("clicked", lambda *_: identify(app, self.mons))
+        header.pack_start(ident)
+        apply = Gtk.Button(label="Apply")
+        apply.add_css_class("suggested-action")
+        apply.connect("clicked", self.on_apply)
+        header.pack_end(apply)
+
+        self.canvas = Gtk.DrawingArea(hexpand=True, vexpand=True)
+        self.canvas.set_draw_func(self.draw)
+        click = Gtk.GestureClick()
+        click.connect("pressed", self.on_press)
+        self.canvas.add_controller(click)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.on_drag_begin)
+        drag.connect("drag-update", self.on_drag_update)
+        drag.connect("drag-end", self.on_drag_end)
+        self.canvas.add_controller(drag)
+
+        # settings for the selected monitor
+        self.sel_title = Gtk.Label(xalign=0)
+        self.sel_title.add_css_class("heading")
+        self.mode_dd = Gtk.DropDown()
+        self.mode_dd.connect("notify::selected", self.on_mode)
+        self.scale_dd = Gtk.DropDown.new_from_strings([f"{s:g}×" for s in SCALES])
+        self.scale_dd.connect("notify::selected", self.on_scale)
+        self.ws_label = Gtk.Label(xalign=0, wrap=True)
+        self.ws_label.add_css_class("dim-label")
+
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12, margin_bottom=12,
+                       margin_start=12, margin_end=12, width_request=230)
+        side.append(self.sel_title)
+        side.append(Gtk.Label(label="Resolution", xalign=0))
+        side.append(self.mode_dd)
+        side.append(Gtk.Label(label="Scale", xalign=0))
+        side.append(self.scale_dd)
+        hint = Gtk.Label(xalign=0, wrap=True, vexpand=True, valign=Gtk.Align.END, label=(
+            "Drag the screens to match your desk. Workspaces are numbered left to right: "
+            "Super + 1–0 (or the numpad) goes to that workspace on whichever screen owns it."))
+        hint.add_css_class("dim-label")
+        side.append(self.ws_label)
+        side.append(hint)
+
+        self.status = Gtk.Label(xalign=0, margin_start=12, margin_bottom=8, margin_top=4)
+        self.status.add_css_class("dim-label")
+
+        body = Gtk.Box()
+        body.append(self.canvas)
+        body.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        body.append(side)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root.append(header)
+        root.append(body)
+        root.append(self.status)
+        self.set_content(root)
+
+        self.saved = load_profiles().get(setup_key(self.mons)) is not None
+        self.set_status()
+        self.refresh_side()
+
+    # -- helpers --
+    def set_status(self, text=None):
+        if text is None:
+            n = len(self.mons)
+            text = (f"{n} screen{'s' if n != 1 else ''} connected · "
+                    + ("this setup has a saved layout" if self.saved else "no saved layout for this setup yet"))
+        self.status.set_label(text)
+
+    def view(self):
+        """Scale and offset that fit the whole layout in the canvas."""
+        W, H = self.canvas.get_width(), self.canvas.get_height()
+        if not self.mons or W < 10 or H < 10:
+            return 0.1, 0, 0
+        minx = min(m.x for m in self.mons)
+        miny = min(m.y for m in self.mons)
+        maxx = max(m.x + m.w for m in self.mons)
+        maxy = max(m.y + m.h for m in self.mons)
+        # leave room to drag past the edges
+        pad = 0.18
+        k = min(W * (1 - 2 * pad) / (maxx - minx), H * (1 - 2 * pad) / (maxy - miny))
+        ox = (W - (maxx - minx) * k) / 2 - minx * k
+        oy = (H - (maxy - miny) * k) / 2 - miny * k
+        return k, ox, oy
+
+    def hit(self, px, py):
+        k, ox, oy = self.view()
+        for m in reversed(self.mons):
+            if m.x * k + ox <= px <= (m.x + m.w) * k + ox and m.y * k + oy <= py <= (m.y + m.h) * k + oy:
+                return m
+        return None
+
+    def refresh_side(self):
+        m = self.selected
+        if not m:
+            return
+        self._updating = True
+        self.sel_title.set_label(f"{m.label}  ({m.name})")
+        self.mode_dd.set_model(Gtk.StringList.new([s.replace("@", " @ ") + " Hz" for s in m.modes]))
+        self.mode_dd.set_selected(m.modes.index(m.mode))
+        best = min(range(len(SCALES)), key=lambda i: abs(SCALES[i] - m.scale))
+        self.scale_dd.set_selected(best)
+        self.ws_label.set_label("Gets " + ws_text(workspace_ranges(self.mons).get(m.name)))
+        self._updating = False
+
+    # -- drawing --
+    def draw(self, area, cr, W, H):
+        k, ox, oy = self.view()
+        ranges = workspace_ranges(self.mons)
+        order = sorted(self.mons, key=lambda m: (m.x, m.y))
+        for m in self.mons:
+            x, y, w, h = m.x * k + ox, m.y * k + oy, m.w * k, m.h * k
+            sel = m is self.selected
+            cr.set_source_rgb(*((0.23, 0.24, 0.26) if sel else (0.16, 0.17, 0.19)))
+            cr.rectangle(x, y, w, h)
+            cr.fill()
+            cr.set_line_width(3 if sel else 1.5)
+            cr.set_source_rgb(*((0.86, 0.86, 0.85) if sel else (0.56, 0.58, 0.61)))
+            cr.rectangle(x + 1, y + 1, w - 2, h - 2)
+            cr.stroke()
+
+            lines = [(f"{order.index(m) + 1}", 34, True), (m.label, 14, True),
+                     (f"{m.name} · {m.mode.split('@')[0]}" + (f" · {m.scale:g}×" if m.scale != 1 else ""), 11, False),
+                     (ws_text(ranges.get(m.name)), 13, True)]
+            total = sum(s * 1.35 for _, s, _ in lines)
+            ty = y + (h - total) / 2
+            for text, size, bold in lines:
+                cr.select_font_face("Inter", 0, 1 if bold else 0)
+                cr.set_font_size(size)
+                ext = cr.text_extents(text)
+                if ext.width > w - 12:  # too narrow, skip rather than overflow
+                    ty += size * 1.35
+                    continue
+                cr.set_source_rgb(*((0.86, 0.86, 0.85) if bold else (0.6, 0.62, 0.64)))
+                cr.move_to(x + (w - ext.width) / 2 - ext.x_bearing, ty + size)
+                cr.show_text(text)
+                ty += size * 1.35
+
+    # -- input --
+    def on_press(self, gesture, n, px, py):
+        m = self.hit(px, py)
+        if m and m is not self.selected:
+            self.selected = m
+            self.refresh_side()
+            self.canvas.queue_draw()
+
+    def on_drag_begin(self, gesture, px, py):
+        m = self.hit(px, py)
+        if m:
+            self.selected = m
+            self.drag = (m, m.x, m.y, self.view())
+            self.refresh_side()
+
+    def on_drag_update(self, gesture, dx, dy):
+        if not self.drag:
+            return
+        m, sx, sy, (k, _, _) = self.drag  # keep the scale fixed while dragging
+        m.x, m.y = round(sx + dx / k), round(sy + dy / k)
+        self.canvas.queue_draw()
+
+    def on_drag_end(self, gesture, dx, dy):
+        if not self.drag:
+            return
+        m = self.drag[0]
+        self.drag = None
+        others = [o for o in self.mons if o is not m]
+        m.x, m.y = settle(m, others, m.x, m.y)
+        normalize(self.mons)
+        self.refresh_side()
+        self.canvas.queue_draw()
+
+    def on_mode(self, dd, _):
+        if getattr(self, "_updating", False) or not self.selected:
+            return
+        self.selected.mode = self.selected.modes[dd.get_selected()]
+        self.relayout()
+
+    def on_scale(self, dd, _):
+        if getattr(self, "_updating", False) or not self.selected:
+            return
+        self.selected.scale = SCALES[dd.get_selected()]
+        self.relayout()
+
+    def relayout(self):
+        """A size change can open gaps or overlaps; re-seat every screen against the others."""
+        order = sorted(self.mons, key=lambda m: (m.x, m.y))
+        placed = [order[0]]
+        for m in order[1:]:
+            if any(overlaps(m, m.x, m.y, o) for o in placed) or not any(touches(m, m.x, m.y, o) for o in placed):
+                m.x, m.y = settle(m, placed, m.x, m.y)
+            placed.append(m)
+        normalize(self.mons)
+        self.refresh_side()
+        self.canvas.queue_draw()
+
+    # -- saving --
+    def profile(self):
+        return [dict(desc=m.desc, mode=m.mode, x=m.x, y=m.y, scale=m.scale)
+                for m in sorted(self.mons, key=lambda m: (m.x, m.y))]
+
+    def write_and_apply(self, profile):
+        profiles = load_profiles()
+        profiles[setup_key(self.mons)] = profile
+        save_profiles(profiles)
+        hyprctl("repl", "Displays.refresh() return 'ok'")
+
+    def on_apply(self, *_):
+        risky = any((m.mode, m.scale) != m.orig for m in self.mons)
+        self.write_and_apply(self.profile())
+        self.saved = True
+        if not risky:
+            self.set_status("Saved. This layout comes back whenever these screens are connected.")
+            GLib.timeout_add(1200, lambda: identify(self.app, self.mons) and False)
+            return
+        self.confirm_keep()
+
+    def confirm_keep(self):
+        left = [REVERT_SECS]
+        dialog = Adw.AlertDialog(heading="Keep these display settings?",
+                                 body=f"Going back in {left[0]} seconds.")
+        dialog.add_response("revert", "Go back")
+        dialog.add_response("keep", "Keep")
+        dialog.set_response_appearance("keep", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("revert")
+
+        def tick():
+            left[0] -= 1
+            if left[0] <= 0:
+                dialog.close()
+                return False
+            dialog.set_body(f"Going back in {left[0]} seconds.")
+            return True
+        timer = GLib.timeout_add_seconds(1, tick)
+
+        def done(d, response):
+            if left[0] > 0:
+                GLib.source_remove(timer)
+            if response == "keep":
+                for m in self.mons:
+                    m.orig = (m.mode, m.scale)
+                self.set_status("Saved. This layout comes back whenever these screens are connected.")
+                return
+            # old resolution and scale, but keep where the screens were dragged to
+            for m in self.mons:
+                m.mode, m.scale = m.orig
+            self.relayout()
+            self.write_and_apply(self.profile())
+            self.set_status("Went back to the previous resolution and scale.")
+        dialog.connect("response", done)
+        dialog.present(self)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="dev.mrpythoneer.displays")
+
+    def do_activate(self):
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        css = Gtk.CssProvider()
+        css.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        win = self.get_active_window() or Arranger(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    if "--identify" in sys.argv:
+        app = Adw.Application(application_id="dev.mrpythoneer.displays.identify")
+        app.connect("activate", lambda a: (a.hold(), identify(a, get_monitors()),
+                                           GLib.timeout_add(2700, lambda: a.release() or False)))
+        sys.exit(app.run([]))
+    sys.exit(App().run([]))

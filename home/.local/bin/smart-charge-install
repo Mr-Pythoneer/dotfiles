@@ -1,0 +1,77 @@
+#!/bin/sh
+# Root half of smart-charge: lets the user daemon set the battery charge limit
+# and an RTC wake alarm (to start topping up while suspended).
+#   sudo smart-charge-install          install
+#   sudo smart-charge-install --undo   remove (leaves the limit where it is)
+# The daemon writes ~/.local/state/smart-charge/request; a path unit runs the
+# root-owned /usr/local/libexec/smart-charge-apply, which only accepts numbers.
+set -e
+[ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+user=${SUDO_USER:?run with sudo from your user account}
+home=$(getent passwd "$user" | cut -d: -f6)
+req="$home/.local/state/smart-charge/request"
+
+if [ "$1" = --undo ]; then
+    systemctl disable --now smart-charge-apply.path 2>/dev/null || true
+    rm -f /etc/systemd/system/smart-charge-apply.path /etc/systemd/system/smart-charge-apply.service \
+          /usr/local/libexec/smart-charge-apply
+    systemctl daemon-reload
+    echo "smart-charge root helper removed."
+    exit 0
+fi
+
+mkdir -p /usr/local/libexec
+cat > /usr/local/libexec/smart-charge-apply <<EOF
+#!/bin/sh
+req="$req"
+bat=/sys/class/power_supply/BAT0
+rtc=/sys/class/rtc/rtc0/wakealarm
+mine=/run/smart-charge-wake
+limit=\$(sed -n 's/^limit=\([0-9]\{2,3\}\)\$/\1/p' "\$req")
+wake=\$(sed -n 's/^wake=\([0-9]\{1,12\}\)\$/\1/p' "\$req")
+if [ -n "\$limit" ] && [ "\$limit" -ge 50 ] && [ "\$limit" -le 100 ]; then
+    start=\$((limit - 5))
+    # The EC rejects start > end, so order the writes.
+    if [ "\$limit" -ge "\$(cat \$bat/charge_control_end_threshold)" ]; then
+        echo "\$limit" > \$bat/charge_control_end_threshold
+        echo "\$start" > \$bat/charge_control_start_threshold
+    else
+        echo "\$start" > \$bat/charge_control_start_threshold
+        echo "\$limit" > \$bat/charge_control_end_threshold
+    fi
+fi
+if [ -n "\$wake" ] && [ "\$wake" -gt "\$(date +%s)" ]; then
+    echo 0 > \$rtc; echo "\$wake" > \$rtc; echo "\$wake" > \$mine
+elif [ -f \$mine ]; then
+    # Only clear an alarm we set ourselves.
+    [ "\$(cat \$rtc)" = "\$(cat \$mine)" ] && echo 0 > \$rtc
+    rm -f \$mine
+fi
+EOF
+chmod 755 /usr/local/libexec/smart-charge-apply
+
+cat > /etc/systemd/system/smart-charge-apply.service <<EOF
+[Unit]
+Description=Apply smart-charge battery limit
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/smart-charge-apply
+EOF
+
+cat > /etc/systemd/system/smart-charge-apply.path <<EOF
+[Unit]
+Description=Watch for smart-charge requests
+
+[Path]
+PathChanged=$req
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo -u "$user" mkdir -p "$(dirname "$req")"
+systemctl daemon-reload
+systemctl enable --now smart-charge-apply.path
+[ -f "$req" ] && systemctl start smart-charge-apply.service
+echo "smart-charge root helper installed."

@@ -1,0 +1,52 @@
+# Caelestia shell with a movable bar (top / bottom / left / right), built from
+# pull request #2076 (https://github.com/caelestia-dots/shell/pull/2076), pinned to one commit.
+# Swap back to the normal "caelestia-shell" package once that change is merged upstream.
+# bar-visualiser.patch: audio bars in the bar that show up while music plays (local addition).
+
+pkgname='caelestia-shell-topbar'
+pkgver=2.5.0.pr2076
+pkgrel=2
+pkgdesc='Caelestia desktop shell, with the configurable bar position from PR #2076'
+arch=('x86_64')
+url='https://github.com/caelestia-dots/shell'
+license=('GPL-3.0-only')
+depends=(
+    'caelestia-cli' 'quickshell-git' 'glibc' 'gcc-libs'
+    'ddcutil' 'brightnessctl'
+    'libcava' 'networkmanager' 'lm_sensors' 'aubio' 'libpipewire' 'libqalculate' 'power-profiles-daemon'
+    'ttf-material-symbols-variable' 'ttf-rubik-vf' 'ttf-cascadia-code-nerd'
+    'qt6-base' 'qt6-declarative' 'qt6-imageformats' 'qt6-m3shapes-git'
+    'swappy' 'fish' 'bash'
+)
+optdepends=('fprintd: fingerprint unlock for the lock screen')
+makedepends=('git' 'cmake' 'ninja' 'qt6-shadertools')
+options=('!debug')
+provides=('caelestia-shell')
+conflicts=('caelestia-shell' 'caelestia-shell-git')
+_commit=6e75968241e8a47f65fad5c93ac88b180489b991
+source=("caelestia::git+https://github.com/alper-han/caelestia-shell.git#commit=${_commit}"
+        'bar-visualiser.patch')
+sha256sums=('SKIP'
+            'SKIP')
+
+prepare() {
+    cd "${srcdir}/caelestia"
+    patch -Np1 -i "${srcdir}/bar-visualiser.patch"
+}
+
+build() {
+    cd "${srcdir}/caelestia"
+    cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_INSTALL_PREFIX=/ \
+        -DVERSION=2.5.0 \
+        -DGIT_REVISION="${_commit}" \
+        -DDISTRIBUTOR="local build of PR 2076"
+    cmake --build build
+}
+
+package() {
+    cd "${srcdir}/caelestia"
+    DESTDIR="$pkgdir" cmake --install build
+    install -Dm644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+}
